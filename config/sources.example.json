@@ -1,0 +1,42 @@
+[
+  {
+    "name": "我的行业 RSS",
+    "source_type": "rss",
+    "platform": "rss",
+    "url": "https://example.com/feed.xml",
+    "config": {"role": "demand", "limit": 30},
+    "enabled": true
+  },
+  {
+    "name": "RSSHub - B站热搜",
+    "source_type": "rsshub",
+    "platform": "bilibili_hot_search",
+    "url": "/bilibili/hot-search",
+    "config": {"role": "trend", "limit": 50},
+    "enabled": false
+  },
+  {
+    "name": "小红书真实需求",
+    "source_type": "agent_reach",
+    "platform": "xiaohongshu",
+    "query": "求 Excel 模板",
+    "config": {"role": "demand", "limit": 30},
+    "enabled": false
+  },
+  {
+    "name": "Reddit真实需求",
+    "source_type": "agent_reach",
+    "platform": "reddit",
+    "query": "looking for spreadsheet template small business",
+    "config": {"role": "demand", "limit": 30},
+    "enabled": false
+  },
+  {
+    "name": "GitHub供给情报",
+    "source_type": "github",
+    "platform": "github",
+    "query": "automation template in:name,description",
+    "config": {"role": "supply", "mode": "repositories", "limit": 50},
+    "enabled": true
+  }
+]

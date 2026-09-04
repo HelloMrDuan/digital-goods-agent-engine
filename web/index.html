@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>数字商品自动经营系统</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">DG</div>
+      <div><div class="brand-title">Digital Goods</div><div class="brand-sub">真实数据经营中台</div></div>
+    </div>
+    <nav id="nav">
+      <button class="nav-item active" data-view="dashboard"><span>⌂</span>工作台</button>
+      <button class="nav-item" data-view="sources"><span>◉</span>采集中心</button>
+      <button class="nav-item" data-view="evidence"><span>▤</span>真实证据</button>
+      <button class="nav-item" data-view="opportunities"><span>◇</span>商机中心</button>
+      <button class="nav-item" data-view="trends"><span>↗</span>需求趋势</button>
+      <button class="nav-item" data-view="quality"><span>✓</span>数据质量</button>
+      <button class="nav-item" data-view="products"><span>▣</span>商品中心</button>
+      <button class="nav-item" data-view="cost"><span>¥</span>AI 成本</button>
+      <button class="nav-item" data-view="settings"><span>⚙</span>系统状态</button>
+    </nav>
+    <div class="truth-card">
+      <div class="truth-dot"></div>
+      <div><strong>REAL DATA ONLY</strong><p>无数据就显示 0<br>失败就显示原因</p></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">工作台</h1>
+        <p id="page-desc">真实采集、真实证据、AI 只负责判断。</p>
+      </div>
+      <div class="top-actions">
+        <span id="health-pill" class="pill neutral">检查中</span>
+        <button class="btn secondary" onclick="refreshCurrent()">刷新</button>
+      </div>
+    </header>
+
+    <section id="view-dashboard" class="view active"></section>
+    <section id="view-sources" class="view"></section>
+    <section id="view-evidence" class="view"></section>
+    <section id="view-opportunities" class="view"></section>
+    <section id="view-trends" class="view"></section>
+    <section id="view-quality" class="view"></section>
+    <section id="view-products" class="view"></section>
+    <section id="view-cost" class="view"></section>
+    <section id="view-settings" class="view"></section>
+  </main>
+</div>
+
+<div id="drawer" class="drawer-backdrop hidden" onclick="closeDrawer(event)">
+  <aside class="drawer" onclick="event.stopPropagation()">
+    <div class="drawer-head"><div><div class="eyebrow">详情</div><h2 id="drawer-title">详情</h2></div><button class="icon-btn" onclick="closeDrawer()">×</button></div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

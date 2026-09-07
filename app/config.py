@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     high_risk_threshold: int = 80
     daily_ai_budget_cny: float = 5.0
 
+    # V1.2 deterministic commercial validation. This gate runs before paid AI.
+    commercial_validation_min_signals: int = 2
+    commercial_validation_min_authors: int = 2
+    commercial_validation_min_quality: float = 55.0
+    commercial_validation_min_timestamp_coverage: float = 50.0
+    commercial_validation_min_score: float = 65.0
+
     github_token: str = ""
     rsshub_base_url: str = ""
     agent_reach_bridge_url: str = ""
@@ -58,6 +65,14 @@ class Settings(BaseSettings):
     @property
     def is_sensenova_configured(self) -> bool:
         return bool(self.sensenova_api_token and self.sensenova_model)
+
+    @property
+    def is_qiniu_configured(self) -> bool:
+        return bool(self.qiniu_api_token and self.qiniu_base_url and self.qiniu_model)
+
+    @property
+    def is_llm_configured(self) -> bool:
+        return self.is_qiniu_configured or self.is_sensenova_configured
 
 
 settings = Settings()

@@ -565,6 +565,8 @@ def rebuild_clusters() -> dict[str, Any]:
                     row = c.execute("SELECT analysis_json,status,candidate_key FROM opportunities WHERE id=?", (oid,)).fetchone()
                     changed = old_ids != set(evidence_ids)
                     stale = 1 if changed and row and row["analysis_json"] else 0
+                    if changed:
+                        c.execute("UPDATE opportunities SET validation_status='STALE' WHERE id=?", (oid,))
                     owner = c.execute("SELECT id FROM opportunities WHERE candidate_key=?", (candidate_key,)).fetchone()
                     safe_key = candidate_key if not owner or int(owner["id"]) == oid else row["candidate_key"]
                     title = rep.get("title") if not (row and row["analysis_json"]) else None

@@ -153,7 +153,7 @@ ANALYZE_SYSTEM = """你是数字商品商机分析师。你只能依据输入中
 所有评分都是“基于当前证据的 AI 判断”，不是事实数据。只输出一个 JSON 对象，不要 Markdown。"""
 
 
-def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, Any]], *, chat=chat_json) -> dict[str, Any]:
     snippets = []
     for e in evidence[:40]:
         snippets.append({
@@ -190,7 +190,7 @@ def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, An
             "compliance": "string",
         },
     }
-    result = chat_json(operation="opportunity_analysis", entity_type="opportunity", entity_id=int(opportunity["id"]), system=ANALYZE_SYSTEM, payload=payload, max_new_tokens=1900)
+    result = chat(operation="opportunity_analysis", entity_type="opportunity", entity_id=int(opportunity["id"]), system=ANALYZE_SYSTEM, payload=payload, max_new_tokens=1900)
     return result
 
 
@@ -200,7 +200,7 @@ PRODUCT_SYSTEM = """你是数字商品产品经理。只根据输入的真实需
 只输出一个 JSON 对象，不要 Markdown。"""
 
 
-def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]], analysis: dict[str, Any]) -> dict[str, Any]:
+def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]], analysis: dict[str, Any], *, chat=chat_json) -> dict[str, Any]:
     payload = {
         "opportunity": {k: opportunity.get(k) for k in ("id", "title", "normalized_need", "category", "overall_score", "suggested_product")},
         "analysis": {k: analysis.get(k) for k in ("normalized_need", "category", "reason", "uncertainty", "compliance", "evidence_ids_used")},
@@ -221,4 +221,4 @@ def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]]
             "compliance_notes": "string",
         },
     }
-    return chat_json(operation="product_draft", entity_type="opportunity", entity_id=int(opportunity["id"]), system=PRODUCT_SYSTEM, payload=payload, max_new_tokens=1800)
+    return chat(operation="product_draft", entity_type="opportunity", entity_id=int(opportunity["id"]), system=PRODUCT_SYSTEM, payload=payload, max_new_tokens=1800)

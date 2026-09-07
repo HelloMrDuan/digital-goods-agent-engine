@@ -209,6 +209,21 @@ def init_db() -> None:
                 FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS commercial_validation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opportunity_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                score REAL NOT NULL,
+                policy_version TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                reasons_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_commercial_validation_opp
+                ON commercial_validation_runs(opportunity_id, id DESC);
+
             CREATE TABLE IF NOT EXISTS ai_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 operation TEXT NOT NULL,
@@ -380,6 +395,11 @@ def init_db() -> None:
             "explicit_demand_count": "INTEGER NOT NULL DEFAULT 0",
             "probable_demand_count": "INTEGER NOT NULL DEFAULT 0",
             "comment_demand_count": "INTEGER NOT NULL DEFAULT 0",
+            "validation_status": "TEXT NOT NULL DEFAULT 'NOT_VALIDATED'",
+            "validation_score": "REAL",
+            "validation_snapshot_hash": "TEXT",
+            "validated_at": "TEXT",
+            "validation_json": "TEXT",
         }.items():
             _ensure_column(c, "opportunities", name, ddl)
 

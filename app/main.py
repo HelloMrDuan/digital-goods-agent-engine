@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -20,23 +21,24 @@ from .services.sources import bootstrap_sources, collect_source, create_source, 
 from .services.scheduler import run_cycle as scheduler_run_cycle, scheduler_status, start_scheduler, stop_scheduler
 from .services.quality import data_quality_report
 from .services.ingest import backfill_intents
-from .services.opportunity_analyzer import analyze_one_opportunity
+from .services.validation import get_validation, require_current_validation, validate_active_opportunities, validate_opportunity
 
-app = FastAPI(title=settings.app_name, version="1.1.3.2-windows-utf8-cli")
 WEB_DIR = BASE_DIR / "web"
-app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     init_db()
     backfill_intents()
     start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
 
 
-@app.on_event("shutdown")
-def shutdown() -> None:
-    stop_scheduler()
+app = FastAPI(title=settings.app_name, version="1.2.0-commercial-validation", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
 @app.get("/")
@@ -51,8 +53,12 @@ def health() -> dict[str, Any]:
         "mode": "REAL_DATA_ONLY",
         "mock_data": False,
         "mock_ai": False,
+        "llm_configured": settings.is_llm_configured,
+        "qiniu_configured": settings.is_qiniu_configured,
+        "qiniu_model": settings.qiniu_model if settings.is_qiniu_configured else None,
         "sensenova_configured": settings.is_sensenova_configured,
         "sensenova_model": settings.sensenova_model or None,
+        "primary_llm_provider": "Qiniu" if settings.is_qiniu_configured else "SenseNova" if settings.is_sensenova_configured else None,
         "daily_ai_budget_cny": settings.daily_ai_budget_cny,
         "rsshub_configured": bool(settings.rsshub_base_url),
         "cluster_method": "real_evidence_tfidf_v5_content_intent_gate",
@@ -62,6 +68,7 @@ def health() -> dict[str, Any]:
         "cluster_similarity_threshold": settings.cluster_similarity_threshold,
         "auto_collect_enabled": settings.auto_collect_enabled,
         "auto_collect_interval_minutes": settings.auto_collect_interval_minutes,
+        "commercial_validation_policy": "commercial-validation-v1-real-demand",
         "db": settings.db_path,
     }
 
@@ -80,9 +87,10 @@ def dashboard() -> dict[str, Any]:
             "cross_source_opportunities": c.execute("SELECT COUNT(*) c FROM opportunities WHERE cluster_active=1 AND platform_count>=2").fetchone()["c"],
             "products": c.execute("SELECT COUNT(*) c FROM products").fetchone()["c"],
             "approved": c.execute("SELECT COUNT(*) c FROM products WHERE status='APPROVED'").fetchone()["c"],
+            "validation_passed": c.execute("SELECT COUNT(*) c FROM opportunities WHERE cluster_active=1 AND validation_status='PASSED'").fetchone()["c"],
         }
         spend = c.execute("SELECT coalesce(sum(estimated_cost_cny),0) s FROM ai_runs WHERE status='SUCCESS' AND substr(created_at,1,10)=?", (today,)).fetchone()["s"]
-        top = c.execute("SELECT id,title,category,evidence_count,effective_signal_count,explicit_demand_count,probable_demand_count,comment_demand_count,platform_count,current_7d,previous_7d,growth_7d_pct,acceleration_pct,trend_score,trend_confidence,trusted_trend_score,data_quality_score,overall_score,suggested_product,status FROM opportunities WHERE cluster_active=1 ORDER BY coalesce(trusted_trend_score,0) DESC,coalesce(trend_score,0) DESC,coalesce(overall_score,-1) DESC LIMIT 8").fetchall()
+        top = c.execute("SELECT id,title,category,evidence_count,effective_signal_count,explicit_demand_count,probable_demand_count,comment_demand_count,platform_count,current_7d,previous_7d,growth_7d_pct,acceleration_pct,trend_score,trend_confidence,trusted_trend_score,data_quality_score,validation_status,validation_score,overall_score,suggested_product,status FROM opportunities WHERE cluster_active=1 ORDER BY coalesce(trusted_trend_score,0) DESC,coalesce(trend_score,0) DESC,coalesce(overall_score,-1) DESC LIMIT 8").fetchall()
         source_health = c.execute("SELECT id,name,platform,status,last_item_count,last_success_at,last_error,failure_streak,empty_streak,next_retry_at,avg_duration_ms FROM sources ORDER BY status DESC,id LIMIT 12").fetchall()
         recent_runs = c.execute("SELECT cr.*,s.name source_name,s.platform FROM collection_runs cr JOIN sources s ON s.id=cr.source_id ORDER BY cr.id DESC LIMIT 10").fetchall()
     return {
@@ -107,7 +115,7 @@ def _run_analysis_task(task_id: int, opportunity_id: int):
             c.execute("UPDATE analysis_tasks SET progress=35,stage='整理证据',message='正在汇总需求证据',updated_at=? WHERE id=?", (now_iso(), task_id))
         with conn() as c:
             c.execute("UPDATE analysis_tasks SET progress=55,stage='AI分析',message='正在调用 Qiniu qwen/qwen3.5-plus',updated_at=? WHERE id=?", (now_iso(), task_id))
-        result = analyze_one_opportunity(opportunity_id)
+        result = analyze_one(opportunity_id)
         with conn() as c:
             c.execute("UPDATE analysis_tasks SET status='SUCCESS',progress=100,stage='完成',message='分析完成',result_json=?,updated_at=? WHERE id=?", (dumps(result), now_iso(), task_id))
     except Exception as exc:
@@ -115,18 +123,14 @@ def _run_analysis_task(task_id: int, opportunity_id: int):
             c.execute("UPDATE analysis_tasks SET status='FAILED',progress=100,message=?,error=?,updated_at=? WHERE id=?", (str(exc), str(exc), now_iso(), task_id))
 
 
-@app.post("/api/opportunities/{opportunity_id}/analyze")
-def opportunities_analyze(opportunity_id: int):
-    try:
-        return analyze_one_opportunity(opportunity_id)
-    except ValueError as exc:
-        raise HTTPException(404, str(exc))
-
-
 @app.post("/api/opportunities/{opportunity_id}/analyze/start")
 def opportunities_analyze_start(opportunity_id: int):
     if not get_opportunity(opportunity_id):
         raise HTTPException(404, "opportunity not found")
+    try:
+        require_current_validation(opportunity_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     with conn() as c:
         cur = c.execute(
             "INSERT INTO analysis_tasks(opportunity_id,status,progress,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
@@ -472,7 +476,31 @@ def opportunity_detail(opportunity_id: int):
     opp["analysis"] = loads(opp.get("analysis_json"), {})
     opp["trend"] = trend_detail(opportunity_id)
     opp["evidence"] = get_evidence_for_opportunity(opportunity_id, 100)
+    opp["validation"] = get_validation(opportunity_id)
     return opp
+
+
+@app.get("/api/opportunities/{opportunity_id}/validation")
+def opportunity_validation_get(opportunity_id: int):
+    try:
+        return get_validation(opportunity_id)
+    except KeyError:
+        raise HTTPException(404, "opportunity not found")
+
+
+@app.post("/api/opportunities/{opportunity_id}/validation")
+def opportunity_validation_run(opportunity_id: int):
+    try:
+        return validate_opportunity(opportunity_id)
+    except KeyError:
+        raise HTTPException(404, "opportunity not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/opportunities/batch/validate")
+def opportunities_validate_batch(limit: int = Query(default=100, ge=1, le=500)):
+    return validate_active_opportunities(limit)
 
 
 @app.post("/api/opportunities/{opportunity_id}/analyze")
@@ -526,9 +554,14 @@ def products_list(limit: int = Query(default=100, ge=1, le=500)):
 @app.post("/api/products/{product_id}/approve")
 def product_approve(product_id: int):
     with conn() as c:
-        row = c.execute("SELECT id FROM products WHERE id=?", (product_id,)).fetchone()
+        row = c.execute("SELECT id,opportunity_id FROM products WHERE id=?", (product_id,)).fetchone()
         if not row:
             raise HTTPException(404, "product not found")
+    try:
+        require_current_validation(int(row["opportunity_id"]))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    with conn() as c:
         c.execute("UPDATE products SET status='APPROVED',updated_at=? WHERE id=?", (now_iso(), product_id))
     return {"id": product_id, "status": "APPROVED"}
 

@@ -7,7 +7,9 @@ from typing import Any
 from ..config import settings
 from ..db import conn, dumps, now_iso
 from .opportunities import get_evidence_for_opportunity, get_opportunity
+from .llm import chat_json as provider_chat_json
 from .sensenova import analyze_opportunity, generate_product
+from .validation import require_current_validation
 
 
 def _score(value: Any, default: int = 0) -> int:
@@ -21,10 +23,11 @@ def analyze_one(opportunity_id: int) -> dict[str, Any]:
     opp = get_opportunity(opportunity_id)
     if not opp:
         raise KeyError("opportunity not found")
+    require_current_validation(opportunity_id)
     evidence = get_evidence_for_opportunity(opportunity_id, 80)
     if len(evidence) < settings.min_evidence_for_analysis:
         raise ValueError(f"At least {settings.min_evidence_for_analysis} real evidence item(s) required; found {len(evidence)}")
-    result = analyze_opportunity(opp, evidence)
+    result = analyze_opportunity(opp, evidence, chat=provider_chat_json)
     demand = _score(result.get("demand_score"))
     purchase = _score(result.get("purchase_intent"))
     competition = _score(result.get("competition"), 50)
@@ -61,7 +64,8 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     opp = get_opportunity(opportunity_id)
     if not opp:
         raise KeyError("opportunity not found")
-    if opp.get("overall_score") is None:
+    require_current_validation(opportunity_id)
+    if opp.get("overall_score") is None or int(opp.get("analysis_stale") or 0):
         raise ValueError("opportunity must be analyzed first")
     if int(opp.get("overall_score") or 0) < settings.min_score_for_product:
         raise ValueError(f"overall score below MIN_SCORE_FOR_PRODUCT={settings.min_score_for_product}")
@@ -69,7 +73,7 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
         raise ValueError("high copyright/compliance risk; product generation blocked")
     evidence = get_evidence_for_opportunity(opportunity_id, 50)
     analysis = json.loads(opp.get("analysis_json") or "{}")
-    product = generate_product(opp, evidence, analysis)
+    product = generate_product(opp, evidence, analysis, chat=provider_chat_json)
     sku = f"DG-{opportunity_id:06d}-{secrets.token_hex(2).upper()}"
     now = now_iso()
     with conn() as c:

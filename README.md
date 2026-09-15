@@ -13,10 +13,12 @@
 
 商业验证不调用 AI，不生成测试业务数据。证据变化后，旧验证自动进入 `STALE`，必须重新验证。多 Agent 运行会记录 provider、model、token、耗时、状态和错误。
 
+批量商机重建默认使用 **3 个商机并发**；单个商机内部六个 Agent 仍保持依赖顺序串行执行。为降低单次 LLM 延迟与 token 消耗，默认 evidence 摘要缩减为 14 条、每条 420 字符，单 Agent 最大输出 800 tokens。可通过 `.env` 的 `AGENT_REBUILD_CONCURRENCY`、`AGENT_DIGEST_SNIPPETS`、`AGENT_SNIPPET_CHARS`、`AGENT_MAX_NEW_TOKENS` 调整。
+
 ## 主要 API
 
-- `POST /api/opportunities/rebuild?analyze=true&limit=8`：使用已有真实 evidence 重建候选并批量执行多 Agent。
-- `GET /api/opportunities/rebuild/tasks/{task_id}`：查看持久化重建进度和当前 Agent 阶段。
+- `POST /api/opportunities/rebuild?analyze=true&limit=8`：使用已有真实 evidence 重建候选并批量执行多 Agent；响应会返回当前并发数。
+- `GET /api/opportunities/rebuild/tasks/{task_id}`：查看持久化重建进度、并发数和当前 Agent 阶段。
 - `GET /api/opportunity-cards`：获取商机卡列表。
 - `GET /api/opportunity-cards/{card_id}`：获取商机卡、证据和 Agent 执行记录。
 - `GET /api/opportunities/{opportunity_id}/agent-runs`：查看某商机的 Agent 运行明细。

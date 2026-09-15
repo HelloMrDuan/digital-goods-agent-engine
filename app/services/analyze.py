@@ -8,62 +8,35 @@ from ..config import settings
 from ..db import conn, dumps, now_iso
 from .opportunities import get_evidence_for_opportunity, get_opportunity
 from .llm import chat_json as provider_chat_json
-from .sensenova import analyze_opportunity, generate_product
+from .opportunity_agent import run_opportunity_agent_workflow
+from .sensenova import generate_product
 from .validation import require_current_validation
 
 
-def _score(value: Any, default: int = 0) -> int:
-    try:
-        return max(0, min(100, int(round(float(value)))))
-    except Exception:
-        return default
-
-
 def analyze_one(opportunity_id: int) -> dict[str, Any]:
-    opp = get_opportunity(opportunity_id)
-    if not opp:
-        raise KeyError("opportunity not found")
-    require_current_validation(opportunity_id)
-    evidence = get_evidence_for_opportunity(opportunity_id, 80)
-    if len(evidence) < settings.min_evidence_for_analysis:
-        raise ValueError(f"At least {settings.min_evidence_for_analysis} real evidence item(s) required; found {len(evidence)}")
-    result = analyze_opportunity(opp, evidence, chat=provider_chat_json)
-    demand = _score(result.get("demand_score"))
-    purchase = _score(result.get("purchase_intent"))
-    competition = _score(result.get("competition"), 50)
-    production = _score(result.get("production_cost"), 50)
-    after_sales = _score(result.get("after_sales_cost"), 50)
-    risk = _score(result.get("copyright_risk"), 50)
-    automation = _score(result.get("automation_fit"), 50)
-    overall = round(
-        demand * 0.25 + purchase * 0.20 + (100 - competition) * 0.15 +
-        (100 - production) * 0.10 + automation * 0.10 +
-        (100 - after_sales) * 0.10 + (100 - risk) * 0.10
-    )
-    if risk >= settings.high_risk_threshold:
-        overall = 0
-        status = "REJECTED_RISK"
-    else:
-        status = "ANALYZED"
-    result["overall_score"] = overall
-    result["real_evidence_count"] = len(evidence)
-    now = now_iso()
-    with conn() as c:
-        c.execute(
-            """UPDATE opportunities SET normalized_need=?, category=?, status=?, demand_score=?,purchase_intent=?,competition=?,production_cost=?,after_sales_cost=?,copyright_risk=?,automation_fit=?,overall_score=?,suggested_product=?,ai_reason=?,analysis_json=?,evidence_count=?,analysis_stale=0,updated_at=? WHERE id=?""",
-            (
-                result.get("normalized_need") or opp.get("normalized_need") or opp.get("title"),
-                result.get("category"), status, demand, purchase, competition, production, after_sales, risk, automation,
-                overall, result.get("suggested_product"), result.get("reason"), dumps(result), len(evidence), now, opportunity_id,
-            ),
-        )
-    return {"id": opportunity_id, "status": status, "analysis": result}
+    """Run the V1.2 evidence-first multi-Agent workflow.
+
+    Commercial validation is still calculated and included in the card, but it no longer
+    blocks the analysis itself. This lets Signal/Pain/Market agents inspect a real evidence
+    candidate and safely return WATCH/DROP instead of silently discarding it before AI.
+    Product generation remains protected by the deterministic validation gate below.
+    """
+    result = run_opportunity_agent_workflow(opportunity_id)
+    card = result.get("card") or {}
+    return {
+        "id": opportunity_id,
+        "status": "ANALYZED" if card.get("decision") != "DROP" else "REJECTED_RISK",
+        "analysis": card,
+        "card_id": result.get("card_id"),
+    }
 
 
 def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     opp = get_opportunity(opportunity_id)
     if not opp:
         raise KeyError("opportunity not found")
+    # Product generation is a consequential action, so it stays behind the deterministic
+    # current-snapshot commercial validation gate even though discovery analysis is broader.
     require_current_validation(opportunity_id)
     if opp.get("overall_score") is None or int(opp.get("analysis_stale") or 0):
         raise ValueError("opportunity must be analyzed first")
@@ -81,10 +54,21 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
             """INSERT INTO products(opportunity_id,sku,name,category,audience,price_suggestion,title,description,keywords_json,deliverables_json,faq_json,compliance_notes,status,created_at,updated_at)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                opportunity_id, sku, product.get("name") or opp.get("suggested_product") or opp.get("title"),
-                product.get("category"), product.get("audience"), float(product.get("price_suggestion") or 0), product.get("title"),
-                product.get("description"), dumps(product.get("keywords") or []), dumps(product.get("deliverables") or []),
-                dumps(product.get("faq") or []), product.get("compliance_notes"), "DRAFT", now, now,
+                opportunity_id,
+                sku,
+                product.get("name") or opp.get("suggested_product") or opp.get("title"),
+                product.get("category"),
+                product.get("audience"),
+                float(product.get("price_suggestion") or 0),
+                product.get("title"),
+                product.get("description"),
+                dumps(product.get("keywords") or []),
+                dumps(product.get("deliverables") or []),
+                dumps(product.get("faq") or []),
+                product.get("compliance_notes"),
+                "DRAFT",
+                now,
+                now,
             ),
         )
         pid = int(cur.lastrowid)

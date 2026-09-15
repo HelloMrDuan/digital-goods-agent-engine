@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from typing import Any
 
@@ -18,6 +18,14 @@ from .services.opportunity_agent import (
 )
 
 router = APIRouter()
+_MAX_REBUILD_CONCURRENCY = 6
+
+
+def _rebuild_worker_count(total: int) -> int:
+    if total <= 0:
+        return 0
+    configured = max(1, int(getattr(settings, "agent_rebuild_concurrency", 3) or 1))
+    return min(configured, _MAX_REBUILD_CONCURRENCY, total)
 
 
 def _ensure_rebuild_schema() -> None:
@@ -82,6 +90,17 @@ def _analysis_task_finish(task_id: int, result: dict[str, Any] | None = None, er
             )
 
 
+def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict[str, Any]:
+    try:
+        result = analyze_one(opportunity_id)
+        _analysis_task_finish(analysis_task_id, result=result)
+        return {"opportunity_id": opportunity_id, "status": "SUCCESS", "result": result}
+    except Exception as exc:
+        message = str(exc)
+        _analysis_task_finish(analysis_task_id, error=message)
+        return {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
+
+
 def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
     results: list[dict[str, Any]] = []
     try:
@@ -112,34 +131,58 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
             ).fetchall()
         ids = [int(row["id"]) for row in rows]
         total = len(ids)
-        _update_rebuild(task_id, progress=12, stage="准备 Agent", message=f"待分析 {total} 个商机", total=total)
+        worker_count = _rebuild_worker_count(total)
+        _update_rebuild(
+            task_id,
+            progress=12,
+            stage="准备 Agent",
+            message=f"待分析 {total} 个商机；并发 {worker_count} 路",
+            total=total,
+            current_opportunity_id=ids[0] if ids else None,
+        )
 
         succeeded = 0
         failed = 0
-        for index, opportunity_id in enumerate(ids, start=1):
-            progress = 12 + int((index - 1) / max(1, total) * 83)
-            _update_rebuild(
-                task_id,
-                progress=progress,
-                stage=f"多 Agent {index}/{total}",
-                message=f"正在分析商机 #{opportunity_id}",
-                current_opportunity_id=opportunity_id,
-                processed=index - 1,
-                succeeded=succeeded,
-                failed=failed,
-            )
-            analysis_task_id = _analysis_task_start(opportunity_id)
-            try:
-                result = analyze_one(opportunity_id)
-                succeeded += 1
-                results.append({"opportunity_id": opportunity_id, "status": "SUCCESS", "result": result})
-                _analysis_task_finish(analysis_task_id, result=result)
-            except Exception as exc:
-                failed += 1
-                message = str(exc)
-                results.append({"opportunity_id": opportunity_id, "status": "FAILED", "error": message})
-                _analysis_task_finish(analysis_task_id, error=message)
-            _update_rebuild(task_id, processed=index, succeeded=succeeded, failed=failed)
+        if total:
+            # Create progress rows up front so every worker has an isolated progress record.
+            analysis_task_ids = {opportunity_id: _analysis_task_start(opportunity_id) for opportunity_id in ids}
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="opportunity-agent") as pool:
+                future_map = {
+                    pool.submit(_run_rebuild_opportunity, opportunity_id, analysis_task_ids[opportunity_id]): opportunity_id
+                    for opportunity_id in ids
+                }
+                processed = 0
+                for future in as_completed(future_map):
+                    opportunity_id = future_map[future]
+                    try:
+                        item = future.result()
+                    except Exception as exc:
+                        message = str(exc)
+                        _analysis_task_finish(analysis_task_ids[opportunity_id], error=message)
+                        item = {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
+                    results.append(item)
+                    processed += 1
+                    if item.get("status") == "SUCCESS":
+                        succeeded += 1
+                    else:
+                        failed += 1
+
+                    active_ids = [
+                        oid
+                        for pending_future, oid in future_map.items()
+                        if not pending_future.done()
+                    ]
+                    progress = 12 + int(processed / max(1, total) * 83)
+                    _update_rebuild(
+                        task_id,
+                        progress=progress,
+                        stage=f"多 Agent 并发 {processed}/{total}",
+                        message=f"已完成 {processed}/{total}；成功 {succeeded}，失败 {failed}；并发 {worker_count} 路",
+                        current_opportunity_id=active_ids[0] if active_ids else None,
+                        processed=processed,
+                        succeeded=succeeded,
+                        failed=failed,
+                    )
 
         if total == 0 or failed == 0:
             status = "SUCCESS"
@@ -147,13 +190,19 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
             status = "PARTIAL"
         else:
             status = "FAILED"
-        payload = {"cluster_run": cluster_result, "agent_analysis": results}
+        result_by_id = {int(item["opportunity_id"]): item for item in results}
+        ordered_results = [result_by_id[opportunity_id] for opportunity_id in ids if opportunity_id in result_by_id]
+        payload = {
+            "cluster_run": cluster_result,
+            "agent_analysis": ordered_results,
+            "concurrency": worker_count,
+        }
         _update_rebuild(
             task_id,
             status=status,
             progress=100,
             stage="完成" if status != "FAILED" else "失败",
-            message=f"处理 {total} 个商机：成功 {succeeded}，失败 {failed}",
+            message=f"处理 {total} 个商机：成功 {succeeded}，失败 {failed}；并发 {worker_count} 路",
             current_opportunity_id=None,
             processed=total,
             succeeded=succeeded,
@@ -182,6 +231,7 @@ def _rebuild_task_payload(task_id: int) -> dict[str, Any]:
     data = row_to_dict(row) or {}
     data["analyze_enabled"] = bool(data.get("analyze_enabled"))
     data["result"] = loads(data.pop("result_json", None), None)
+    data["concurrency"] = _rebuild_worker_count(int(data.get("total") or data.get("requested_limit") or 0)) if data["analyze_enabled"] else 0
     current_id = data.get("current_opportunity_id")
     data["current_analysis"] = None
     if current_id:
@@ -213,7 +263,13 @@ def opportunities_rebuild(
         )
     task_id = int(cur.lastrowid)
     threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit), daemon=True).start()
-    return {"task_id": task_id, "status": "PENDING", "analyze": analyze, "limit": limit}
+    return {
+        "task_id": task_id,
+        "status": "PENDING",
+        "analyze": analyze,
+        "limit": limit,
+        "concurrency": _rebuild_worker_count(limit) if analyze else 0,
+    }
 
 
 @router.get("/api/opportunities/rebuild/tasks/{task_id}")

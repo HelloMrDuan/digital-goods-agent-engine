@@ -1,13 +1,13 @@
-const state = { current: "dashboard", health: null };
+const state = { current: "dashboard", health: null, rebuildTaskId: null };
 
 const views = {
-  dashboard: ["工作台", "真实采集、真实证据、商业验证后才调用 AI。"],
+  dashboard: ["工作台", "真实采集、真实证据、真实 Agent 分析。"],
   sources: ["采集中心", "只采集真实平台数据；失败、空结果和退避状态原样展示。"],
   evidence: ["真实证据", "每条需求都可回到原帖、作者、时间和意图判断。"],
-  opportunities: ["商机中心", "先通过 V1.2 商业验证 Gate，再进行付费 AI 分析。"],
+  opportunities: ["商机中心", "Evidence → Signal → Pain → Market → Product → Risk → Judge → Opportunity Card。"],
   trends: ["需求趋势", "趋势只由真实 evidence 时间戳和独立信号计算。"],
   quality: ["数据质量", "检查来源覆盖、时效性和失败原因。"],
-  products: ["商品中心", "仅从已验证、已分析、低风险商机生成原创商品草稿。"],
+  products: ["商品中心", "仅从通过约束的商机生成原创商品草稿。"],
   cost: ["AI 成本", "展示真实模型调用记录和预算占用。"],
   settings: ["系统状态", "运行模式、采集通道和验证策略。"],
 };
@@ -35,9 +35,9 @@ function date(value) {
 
 function statusClass(value) {
   const status = String(value || "").toUpperCase();
-  if (["READY", "SUCCESS", "PASSED", "APPROVED", "DELIVERED", "ANALYZED"].includes(status)) return "good";
-  if (["FAILED", "ERROR", "REJECTED_RISK", "DISABLED"].includes(status)) return "bad";
-  if (["STALE", "BACKOFF", "EMPTY", "PENDING", "RUNNING", "NOT_VALIDATED"].includes(status)) return "warn";
+  if (["READY", "SUCCESS", "PASSED", "APPROVED", "DELIVERED", "ANALYZED", "BUILD"].includes(status)) return "good";
+  if (["FAILED", "ERROR", "REJECTED_RISK", "DISABLED", "DROP"].includes(status)) return "bad";
+  if (["STALE", "BACKOFF", "EMPTY", "PENDING", "RUNNING", "NOT_VALIDATED", "WATCH", "PARTIAL"].includes(status)) return "warn";
   return "neutral";
 }
 
@@ -72,24 +72,16 @@ function showToast(message, bad = false) {
   const toast = document.getElementById("toast");
   toast.textContent = message;
   toast.className = `toast ${bad ? "bad" : "good"}`;
-  setTimeout(() => toast.classList.add("hidden"), 3200);
+  setTimeout(() => toast.classList.add("hidden"), 3600);
 }
 
 function loading(view) {
   document.getElementById(`view-${view}`).innerHTML = '<div class="panel"><div class="panel-body muted">正在读取真实数据…</div></div>';
 }
 
-function empty(message) {
-  return `<div class="empty">${esc(message)}</div>`;
-}
-
-function stat(label, value, foot = "") {
-  return `<article class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div><div class="stat-foot">${esc(foot)}</div></article>`;
-}
-
-function panel(title, body, action = "") {
-  return `<section class="panel"><div class="panel-head"><h3>${esc(title)}</h3>${action}</div><div class="panel-body">${body}</div></section>`;
-}
+function empty(message) { return `<div class="empty">${esc(message)}</div>`; }
+function stat(label, value, foot = "") { return `<article class="stat-card"><div class="stat-label">${esc(label)}</div><div class="stat-value">${esc(value)}</div><div class="stat-foot">${esc(foot)}</div></article>`; }
+function panel(title, body, action = "") { return `<section class="panel"><div class="panel-head"><h3>${esc(title)}</h3>${action}</div><div class="panel-body">${body}</div></section>`; }
 
 async function checkHealth() {
   const node = document.getElementById("health-pill");
@@ -97,7 +89,7 @@ async function checkHealth() {
     state.health = await api("/health");
     node.textContent = "REAL DATA ONLY";
     node.className = "pill good";
-  } catch (error) {
+  } catch (_) {
     node.textContent = "服务异常";
     node.className = "pill bad";
   }
@@ -107,28 +99,19 @@ async function renderDashboard() {
   const data = await api("/api/dashboard");
   const stats = [
     stat("真实证据", data.evidence, `今日 +${data.evidence_today}`),
-    stat("有效商机", data.opportunities, `跨来源 ${data.cross_source_opportunities}`),
-    stat("验证通过", data.validation_passed || 0, "V1.2 商业 Gate"),
+    stat("候选商机", data.opportunities, `跨来源 ${data.cross_source_opportunities}`),
+    stat("验证通过", data.validation_passed || 0, "确定性商业 Gate"),
     stat("商品草稿", data.products, `已批准 ${data.approved}`),
     stat("今日 AI 成本", `¥${n(data.ai_spend_today_cny, 4)}`, `预算 ¥${n(data.ai_budget_today_cny, 2)}`),
   ].join("");
   const opportunities = (data.top_opportunities || []).map((item) => `
     <div class="evidence-card">
       <div class="source-top"><strong>${esc(item.title)}</strong>${pill(item.validation_status || "NOT_VALIDATED")}</div>
-      <div class="metric-row">
-        <span class="metric-chip">信号 ${n(item.effective_signal_count)}</span>
-        <span class="metric-chip">明确需求 ${n(item.explicit_demand_count)}</span>
-        <span class="metric-chip">平台 ${n(item.platform_count)}</span>
-        <span class="metric-chip">可信趋势 ${n(item.trusted_trend_score, 1)}</span>
-      </div>
+      <div class="metric-row"><span class="metric-chip">信号 ${n(item.effective_signal_count)}</span><span class="metric-chip">明确需求 ${n(item.explicit_demand_count)}</span><span class="metric-chip">平台 ${n(item.platform_count)}</span><span class="metric-chip">可信趋势 ${n(item.trusted_trend_score, 1)}</span></div>
       <button class="btn ghost" onclick="openOpportunity(${Number(item.id)})">查看证据</button>
     </div>`).join("");
-  const runs = (data.recent_runs || []).map((run) => `
-    <div class="progress-row"><span>${esc(run.source_name)}</span>${pill(run.status)}<span class="muted">抓取 ${n(run.fetched_count)} / 新增 ${n(run.inserted_count)}</span></div>`).join("");
-  document.getElementById("view-dashboard").innerHTML = `
-    <div class="truth-banner"><strong>REAL DATA ONLY</strong><span>${esc(data.truth_policy)}</span></div>
-    <div class="grid-stats">${stats}</div>
-    <div class="split">${panel("优先商机", opportunities || empty("尚无通过意图 Gate 的真实需求"))}${panel("最近采集", runs || empty("尚无采集记录"))}</div>`;
+  const runs = (data.recent_runs || []).map((run) => `<div class="progress-row"><span>${esc(run.source_name)}</span>${pill(run.status)}<span class="muted">抓取 ${n(run.fetched_count)} / 新增 ${n(run.inserted_count)}</span></div>`).join("");
+  document.getElementById("view-dashboard").innerHTML = `<div class="truth-banner"><strong>REAL DATA ONLY</strong><span>${esc(data.truth_policy)}</span></div><div class="grid-stats">${stats}</div><div class="split">${panel("优先商机", opportunities || empty("尚无真实需求候选"))}${panel("最近采集", runs || empty("尚无采集记录"))}</div>`;
 }
 
 async function renderSources() {
@@ -157,31 +140,49 @@ async function renderEvidence() {
   document.getElementById("view-evidence").innerHTML = panel("证据库", body || empty("暂无真实证据"));
 }
 
+function priceText(range) {
+  if (!range || typeof range !== "object") return "—";
+  const currency = range.currency || "CNY";
+  const min = range.min ?? "?";
+  const max = range.max ?? "?";
+  return `${currency} ${min} - ${max}`;
+}
+
+function opportunityCardHtml(card) {
+  const users = (card.target_users || []).slice(0, 3).map((x) => esc(typeof x === "string" ? x : JSON.stringify(x))).join("、") || "—";
+  const pains = (card.pain_points || []).slice(0, 3).map((x) => esc(typeof x === "string" ? x : (x.pain || JSON.stringify(x)))).join("；") || "—";
+  const product = card.card?.primary_product || card.recommended_products?.[0]?.name || "—";
+  return `<article class="evidence-card">
+    <div class="source-top"><div><div class="opportunity-title">${esc(card.title)}</div><div class="source-meta">${esc(card.category || "未分类")} · ${esc((card.source_platforms || []).join(" / ") || "未知来源")}</div></div>${pill(card.decision)}</div>
+    <div class="metric-row"><span class="metric-chip">最终分 ${n(card.final_score, 1)}</span><span class="metric-chip">市场 ${n(card.market_score, 1)}</span><span class="metric-chip">风险 ${n(card.risk_score, 1)}</span><span class="metric-chip">购买意愿 ${n(card.purchase_intent, 1)}</span><span class="metric-chip">置信度 ${n(card.confidence, 1)}</span><span class="metric-chip">证据 ${n(card.evidence_count)}</span></div>
+    ${card.stale ? '<div class="source-error">证据已变化：该商机卡需要重新分析</div>' : ""}
+    <p><strong>目标用户：</strong>${users}</p><p><strong>核心痛点：</strong>${pains}</p><p><strong>优先商品：</strong>${esc(product)} · ${esc(priceText(card.price_range))}</p>
+    <div class="toolbar"><button class="btn primary" onclick="openCard(${Number(card.id)})">查看商机卡</button><button class="btn secondary" onclick="analyzeOpportunity(${Number(card.opportunity_id)})">重新分析</button><button class="btn secondary" onclick="generateProduct(${Number(card.opportunity_id)})">生成商品草稿</button></div>
+  </article>`;
+}
+
+function candidateHtml(item) {
+  return `<article class="evidence-card">
+    <div class="source-top"><div><div class="opportunity-title">${esc(item.title)}</div><div class="source-meta">${esc(item.category || "待 Agent 判断")} · ${esc(item.status)}</div></div>${pill(item.validation_status || "NOT_VALIDATED")}</div>
+    <div class="metric-row"><span class="metric-chip">独立需求 ${n(item.effective_signal_count)}</span><span class="metric-chip">明确 ${n(item.explicit_demand_count)}</span><span class="metric-chip">平台 ${n(item.platform_count)}</span><span class="metric-chip">质量 ${n(item.data_quality_score, 1)}</span><span class="metric-chip">可信趋势 ${n(item.trusted_trend_score, 1)}</span></div>
+    <div class="toolbar"><button class="btn ghost" onclick="openOpportunity(${Number(item.id)})">证据详情</button><button class="btn secondary" onclick="validateOpportunity(${Number(item.id)})">商业验证</button><button class="btn primary" onclick="analyzeOpportunity(${Number(item.id)})">多 Agent 分析</button></div>
+  </article>`;
+}
+
 async function renderOpportunities() {
-  const rows = await api("/api/opportunities?limit=200");
-  const body = rows.map((item) => `
-    <article class="evidence-card">
-      <div class="source-top"><div><div class="opportunity-title">${esc(item.title)}</div><div class="source-meta">${esc(item.category || "待分析")} · ${esc(item.status)}</div></div>${pill(item.validation_status || "NOT_VALIDATED")}</div>
-      <div class="metric-row">
-        <span class="metric-chip">独立需求 ${n(item.effective_signal_count)}</span>
-        <span class="metric-chip">明确 ${n(item.explicit_demand_count)}</span>
-        <span class="metric-chip">平台 ${n(item.platform_count)}</span>
-        <span class="metric-chip">质量 ${n(item.data_quality_score, 1)}</span>
-        <span class="metric-chip">验证分 ${n(item.validation_score, 1)}</span>
-        <span class="metric-chip">综合分 ${n(item.overall_score)}</span>
-      </div>
-      <div class="toolbar"><button class="btn ghost" onclick="openOpportunity(${Number(item.id)})">详情</button><button class="btn secondary" onclick="validateOpportunity(${Number(item.id)})">商业验证</button><button class="btn primary" onclick="analyzeOpportunity(${Number(item.id)})">AI 分析</button><button class="btn secondary" onclick="generateProduct(${Number(item.id)})">生成商品草稿</button></div>
-    </article>`).join("");
-  const actions = '<div class="toolbar"><button class="btn secondary" onclick="opportunityAction(\'/api/opportunities/build\')">重建商机</button><button class="btn primary" onclick="opportunityAction(\'/api/opportunities/batch/validate\')">批量商业验证</button></div>';
-  document.getElementById("view-opportunities").innerHTML = panel("真实需求商机", body || empty("暂无商机；先在采集中心获取真实需求"), actions);
+  const [cards, rows] = await Promise.all([api("/api/opportunity-cards?limit=200"), api("/api/opportunities?limit=200")]);
+  const carded = new Set((cards || []).map((x) => Number(x.opportunity_id)));
+  const cardBody = (cards || []).map(opportunityCardHtml).join("");
+  const candidateBody = (rows || []).filter((x) => !carded.has(Number(x.id))).map(candidateHtml).join("");
+  const actions = '<div class="toolbar"><button class="btn primary" onclick="startRebuild(true)">一键重建 + Agent分析</button><button class="btn secondary" onclick="startRebuild(false)">只重建候选</button><button class="btn secondary" onclick="opportunityAction(\'/api/opportunities/batch/validate\')">批量商业验证</button></div>';
+  const progress = '<div id="rebuild-progress" class="muted">未运行批量重建</div>';
+  document.getElementById("view-opportunities").innerHTML = `${panel("V1.2 Opportunity Cards", cardBody || empty("暂无商机卡；点击“一键重建 + Agent分析”生成"), actions + progress)}${panel("待分析候选", candidateBody || empty("没有未分析候选"))}`;
+  if (state.rebuildTaskId) pollRebuildTask(state.rebuildTaskId, false);
 }
 
 async function renderTrends() {
   const rows = await api("/api/trends?limit=100");
-  const body = rows.map((item) => `
-    <article class="evidence-card"><div class="source-top"><strong>${esc(item.title)}</strong><span class="score">${n(item.trusted_trend_score, 1)}</span></div>
-      <div class="metric-row"><span class="metric-chip">近 7 天 ${n(item.current_7d)}</span><span class="metric-chip">前 7 天 ${n(item.previous_7d)}</span><span class="metric-chip">趋势 ${n(item.trend_score, 1)}</span><span class="metric-chip">置信度 ${n(item.trend_confidence, 1)}</span><span class="metric-chip">平台 ${n(item.platform_count)}</span></div>
-    </article>`).join("");
+  const body = rows.map((item) => `<article class="evidence-card"><div class="source-top"><strong>${esc(item.title)}</strong><span class="score">${n(item.trusted_trend_score, 1)}</span></div><div class="metric-row"><span class="metric-chip">近 7 天 ${n(item.current_7d)}</span><span class="metric-chip">前 7 天 ${n(item.previous_7d)}</span><span class="metric-chip">趋势 ${n(item.trend_score, 1)}</span><span class="metric-chip">置信度 ${n(item.trend_confidence, 1)}</span><span class="metric-chip">平台 ${n(item.platform_count)}</span></div></article>`).join("");
   document.getElementById("view-trends").innerHTML = panel("可信需求趋势", body || empty("暂无趋势数据"));
 }
 
@@ -192,11 +193,7 @@ async function renderQuality() {
 
 async function renderProducts() {
   const rows = await api("/api/products?limit=200");
-  const body = rows.map((item) => `
-    <article class="evidence-card"><div class="source-top"><div><strong>${esc(item.name)}</strong><div class="source-meta mono">${esc(item.sku)}</div></div>${pill(item.status)}</div>
-      <p>${esc(item.description || "")}</p><div class="metric-row"><span class="metric-chip">建议价 ¥${n(item.price_suggestion, 2)}</span><span class="metric-chip">交付物 ${(item.deliverables || []).length}</span></div>
-      ${item.status === "DRAFT" ? `<button class="btn primary" onclick="approveProduct(${Number(item.id)})">人工批准</button>` : ""}
-    </article>`).join("");
+  const body = rows.map((item) => `<article class="evidence-card"><div class="source-top"><div><strong>${esc(item.name)}</strong><div class="source-meta mono">${esc(item.sku)}</div></div>${pill(item.status)}</div><p>${esc(item.description || "")}</p><div class="metric-row"><span class="metric-chip">建议价 ¥${n(item.price_suggestion, 2)}</span><span class="metric-chip">交付物 ${(item.deliverables || []).length}</span></div>${item.status === "DRAFT" ? `<button class="btn primary" onclick="approveProduct(${Number(item.id)})">人工批准</button>` : ""}</article>`).join("");
   document.getElementById("view-products").innerHTML = panel("商品草稿", body || empty("暂无商品草稿"));
 }
 
@@ -222,11 +219,7 @@ async function selectView(view) {
   document.getElementById("page-title").textContent = views[view][0];
   document.getElementById("page-desc").textContent = views[view][1];
   loading(view);
-  try {
-    await renderers[view]();
-  } catch (error) {
-    document.getElementById(`view-${view}`).innerHTML = panel("加载失败", `<div class="source-error">${esc(error.message)}</div>`);
-  }
+  try { await renderers[view](); } catch (error) { document.getElementById(`view-${view}`).innerHTML = panel("加载失败", `<div class="source-error">${esc(error.message)}</div>`); }
 }
 
 async function refreshCurrent() { await checkHealth(); await selectView(state.current); }
@@ -236,18 +229,62 @@ async function mutate(path, success, options = {}) {
     await api(path, { method: "POST", ...options });
     showToast(success);
     await selectView(state.current);
-  } catch (error) {
-    showToast(error.message, true);
-  }
+  } catch (error) { showToast(error.message, true); }
 }
 
 async function sourceAction(path) { await mutate(path, "操作完成"); }
 async function opportunityAction(path) { await mutate(path, "商机已更新"); }
 async function collectSource(id) { await mutate(`/api/sources/${id}/collect?force=true`, "采集完成"); }
 async function validateOpportunity(id) { await mutate(`/api/opportunities/${id}/validation`, "商业验证完成"); }
-async function analyzeOpportunity(id) { await mutate(`/api/opportunities/${id}/analyze`, "AI 分析完成"); }
 async function generateProduct(id) { await mutate(`/api/products/from-opportunity/${id}`, "商品草稿已生成"); }
 async function approveProduct(id) { await mutate(`/api/products/${id}/approve`, "商品已批准"); }
+
+async function analyzeOpportunity(id) {
+  try {
+    const started = await api(`/api/opportunities/${id}/analyze/start`, { method: "POST" });
+    showToast(`多 Agent 分析已启动，任务 #${started.task_id}`);
+    await pollAnalysisTask(started.task_id);
+  } catch (error) { showToast(error.message, true); }
+}
+
+async function pollAnalysisTask(taskId) {
+  for (;;) {
+    const task = await api(`/api/analysis/tasks/${taskId}`);
+    showToast(`${task.stage || "Agent"} ${n(task.progress)}% · ${task.message || ""}`, task.status === "FAILED");
+    if (["SUCCESS", "FAILED"].includes(task.status)) {
+      if (state.current === "opportunities") await renderOpportunities();
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1400));
+  }
+}
+
+async function startRebuild(analyze) {
+  try {
+    const task = await api(`/api/opportunities/rebuild?analyze=${analyze ? "true" : "false"}&limit=8`, { method: "POST" });
+    state.rebuildTaskId = task.task_id;
+    showToast(`重建任务 #${task.task_id} 已启动`);
+    await pollRebuildTask(task.task_id, true);
+  } catch (error) { showToast(error.message, true); }
+}
+
+async function pollRebuildTask(taskId, loop = true) {
+  for (;;) {
+    const task = await api(`/api/opportunities/rebuild/tasks/${taskId}`);
+    const current = task.current_analysis;
+    const stage = current ? `${task.stage} / ${current.stage || "Agent"}` : task.stage;
+    const progress = current && task.status === "RUNNING" ? `${task.progress}%（当前商机 ${current.progress}%）` : `${task.progress}%`;
+    const node = document.getElementById("rebuild-progress");
+    if (node) node.innerHTML = `<strong>${esc(stage || task.status)}</strong> · ${esc(progress)} · ${esc(task.message || "")} · 成功 ${n(task.succeeded)} / 失败 ${n(task.failed)}`;
+    if (["SUCCESS", "PARTIAL", "FAILED"].includes(task.status)) {
+      showToast(task.message || `任务 ${task.status}`, task.status === "FAILED");
+      if (loop && state.current === "opportunities") await renderOpportunities();
+      return;
+    }
+    if (!loop) return;
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+}
 
 async function openOpportunity(id) {
   try {
@@ -255,14 +292,22 @@ async function openOpportunity(id) {
     document.getElementById("drawer-title").textContent = item.title;
     const validation = item.validation || {};
     const evidence = (item.evidence || []).map((row) => `<article class="evidence-card"><strong>${esc(row.title)}</strong><div class="source-meta">${esc(row.platform)} · ${esc(row.author || "作者未知")} · ${date(row.published_at)}</div>${row.source_url ? `<a class="evidence-link" target="_blank" rel="noreferrer" href="${esc(safeUrl(row.source_url))}">原帖</a>` : ""}</article>`).join("");
-    document.getElementById("drawer-body").innerHTML = `
-      <div class="detail-grid"><div class="detail-box"><span>商业验证</span>${pill(validation.status)}</div><div class="detail-box"><span>验证分</span><strong>${n(validation.score, 1)}</strong></div><div class="detail-box"><span>综合分</span><strong>${n(item.overall_score)}</strong></div><div class="detail-box"><span>真实证据</span><strong>${n(item.evidence_count)}</strong></div></div>
-      ${validation.reason_codes && validation.reason_codes.length ? `<div class="source-error">${esc(validation.reason_codes.join("、"))}</div>` : ""}
-      <h3 class="section-title">证据</h3>${evidence || empty("无关联证据")}`;
+    document.getElementById("drawer-body").innerHTML = `<div class="detail-grid"><div class="detail-box"><span>商业验证</span>${pill(validation.status)}</div><div class="detail-box"><span>验证分</span><strong>${n(validation.score, 1)}</strong></div><div class="detail-box"><span>综合分</span><strong>${n(item.overall_score)}</strong></div><div class="detail-box"><span>真实证据</span><strong>${n(item.evidence_count)}</strong></div></div>${validation.reason_codes && validation.reason_codes.length ? `<div class="source-error">${esc(validation.reason_codes.join("、"))}</div>` : ""}<h3 class="section-title">证据</h3>${evidence || empty("无关联证据")}`;
     document.getElementById("drawer").classList.remove("hidden");
-  } catch (error) {
-    showToast(error.message, true);
-  }
+  } catch (error) { showToast(error.message, true); }
+}
+
+async function openCard(cardId) {
+  try {
+    const card = await api(`/api/opportunity-cards/${cardId}`);
+    document.getElementById("drawer-title").textContent = card.title;
+    const pains = (card.pain_points || []).map((x) => `<li>${esc(typeof x === "string" ? x : (x.pain || JSON.stringify(x)))}</li>`).join("");
+    const products = (card.recommended_products || []).map((x) => `<li><strong>${esc(x.name || "未命名商品")}</strong> · ${esc(x.format || "")}</li>`).join("");
+    const warnings = (card.warnings || []).map((x) => `<li>${esc(typeof x === "string" ? x : JSON.stringify(x))}</li>`).join("");
+    const runs = (card.agent_runs || []).slice().reverse().map((x) => `<div class="progress-row"><span>${esc(x.agent_name)}</span>${pill(x.status)}<span>${esc(x.provider || "—")} / ${esc(x.model || "—")}</span><span>${n(x.duration_ms)}ms · ${n(x.total_tokens)} tokens</span></div>`).join("");
+    document.getElementById("drawer-body").innerHTML = `<div class="detail-grid"><div class="detail-box"><span>决策</span>${pill(card.decision)}</div><div class="detail-box"><span>最终分</span><strong>${n(card.final_score, 1)}</strong></div><div class="detail-box"><span>市场分</span><strong>${n(card.market_score, 1)}</strong></div><div class="detail-box"><span>风险分</span><strong>${n(card.risk_score, 1)}</strong></div></div><p><strong>目标用户：</strong>${esc((card.target_users || []).join("、") || "—")}</p><p><strong>价格：</strong>${esc(priceText(card.price_range))}</p><h3 class="section-title">痛点</h3><ul>${pains || "<li>—</li>"}</ul><h3 class="section-title">推荐商品</h3><ul>${products || "<li>—</li>"}</ul><h3 class="section-title">风险提示</h3><ul>${warnings || "<li>—</li>"}</ul><h3 class="section-title">Judge 结论</h3><p>${esc(card.reasoning || "—")}</p><h3 class="section-title">Agent 执行记录</h3>${runs || empty("暂无 Agent 记录")}`;
+    document.getElementById("drawer").classList.remove("hidden");
+  } catch (error) { showToast(error.message, true); }
 }
 
 function closeDrawer(event) {
@@ -281,6 +326,8 @@ window.analyzeOpportunity = analyzeOpportunity;
 window.generateProduct = generateProduct;
 window.approveProduct = approveProduct;
 window.openOpportunity = openOpportunity;
+window.openCard = openCard;
+window.startRebuild = startRebuild;
 
 checkHealth();
 selectView("dashboard");

@@ -79,7 +79,7 @@ def _opportunity_id() -> int:
     return int(list_opportunities()[0]["id"])
 
 
-def test_single_signal_is_rejected_before_paid_ai_analysis():
+def test_single_signal_fails_commercial_validation():
     source = _source()
     _insert(source, "one", "buyer-one")
     opportunity_id = _opportunity_id()
@@ -153,24 +153,35 @@ def test_product_generation_requires_current_passed_validation(monkeypatch):
     assert result["product_id"] > 0
 
 
-def test_failed_validation_blocks_ai_before_provider_call(monkeypatch):
+def test_failed_validation_still_allows_discovery_agent(monkeypatch):
     from app.services.analyze import analyze_one
 
     source = _source()
     _insert(source, "only", "buyer-one")
     opportunity_id = _opportunity_id()
-    validate_opportunity(opportunity_id)
+    assert validate_opportunity(opportunity_id)["status"] == "FAILED"
     called = False
 
-    def fake_chat(**kwargs):
+    def fake_workflow(candidate_id: int):
         nonlocal called
         called = True
-        return {}
+        assert candidate_id == opportunity_id
+        return {
+            "card_id": 7,
+            "card": {
+                "decision": "WATCH",
+                "risk_score": 25,
+                "final_score": 58,
+                "commercial_validation": {"status": "FAILED"},
+            },
+        }
 
-    monkeypatch.setattr("app.services.analyze.provider_chat_json", fake_chat)
-    with pytest.raises(ValueError, match="commercial validation"):
-        analyze_one(opportunity_id)
-    assert called is False
+    monkeypatch.setattr("app.services.analyze.run_opportunity_agent_workflow", fake_workflow)
+    result = analyze_one(opportunity_id)
+    assert called is True
+    assert result["card_id"] == 7
+    assert result["analysis"]["decision"] == "WATCH"
+    assert result["status"] == "ANALYZED"
 
 
 def test_approved_product_is_blocked_after_validation_becomes_stale(monkeypatch):

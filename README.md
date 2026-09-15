@@ -2,15 +2,24 @@
 
 本地自托管的数字商品需求发现与经营辅助系统。系统坚持 `REAL DATA ONLY`：业务数据只能来自真实采集，失败显示真实原因，AI 不得补造搜索量、销量、用户数或趋势。
 
-## V1.2 主流程
+## V1.2.1 主流程
 
 1. 通过 OpenCLI/Agent-Reach、RSS、GitHub、Bilibili、YouTube 等来源采集真实内容。
-2. 内容级意图 Gate 只保留 `explicit_demand` / `probable_demand` 需求证据。
-3. 聚类与趋势计算去除镜像重复，并保留原帖、作者、时间、来源和评论关系。
+2. 明确/高概率需求作为确定性 demand；高质量核心来源 discussion 可作为 `context` 进入商机候选，但不会抬高需求数量、趋势分或商业验证分。
+3. TF-IDF 聚类与趋势计算去除镜像重复，并保留原帖、作者、时间、来源和证据关系。
 4. 商业验证 Gate 使用真实需求数量、作者/平台多样性、证据质量、时间覆盖和近 30 天需求做确定性判断。
-5. 只有当前证据快照验证通过，才允许调用付费 AI 分析、生成原创商品草稿或批准商品。
+5. 商机发现阶段运行多 Agent：`Signal → Pain → Market → Product → Risk → Judge`，生成 `Opportunity Card` 和 `BUILD / WATCH / DROP` 决策。
+6. 商品生成/批准仍要求当前商业验证通过，避免低证据或高风险候选直接进入经营链路。
 
-商业验证不调用 AI，不生成测试业务数据。证据变化后，旧验证自动进入 `STALE`，必须重新验证。
+商业验证不调用 AI，不生成测试业务数据。证据变化后，旧验证自动进入 `STALE`，必须重新验证。多 Agent 运行会记录 provider、model、token、耗时、状态和错误。
+
+## 主要 API
+
+- `POST /api/opportunities/rebuild?analyze=true&limit=8`：使用已有真实 evidence 重建候选并批量执行多 Agent。
+- `GET /api/opportunities/rebuild/tasks/{task_id}`：查看持久化重建进度和当前 Agent 阶段。
+- `GET /api/opportunity-cards`：获取商机卡列表。
+- `GET /api/opportunity-cards/{card_id}`：获取商机卡、证据和 Agent 执行记录。
+- `GET /api/opportunities/{opportunity_id}/agent-runs`：查看某商机的 Agent 运行明细。
 
 ## 启动
 

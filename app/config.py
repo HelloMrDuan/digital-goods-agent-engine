@@ -17,8 +17,11 @@ class Settings(BaseSettings):
 
     # Production never falls back to fake AI or fake data.
     qiniu_api_token: str = ""
-    qiniu_model: str = "qwen3.5-plus"
-    qiniu_base_url: str = ""
+    qiniu_model: str = "qwen/qwen3.5-plus"
+    qiniu_base_url: str = "https://api.qnaigc.com/v1"
+    # Keep at zero unless the account price is explicitly configured.
+    qiniu_input_price_per_million: float = 0.0
+    qiniu_output_price_per_million: float = 0.0
 
     sensenova_api_token: str = ""
     sensenova_model: str = ""
@@ -32,12 +35,24 @@ class Settings(BaseSettings):
     high_risk_threshold: int = 80
     daily_ai_budget_cny: float = 5.0
 
-    # V1.2 deterministic commercial validation. This gate runs before paid AI.
+    # V1.2 deterministic commercial validation. This gate protects product generation,
+    # but the opportunity Agent workflow may still evaluate failed candidates as WATCH/DROP
+    # so deterministic keyword rules do not silently erase potentially useful real evidence.
     commercial_validation_min_signals: int = 2
     commercial_validation_min_authors: int = 2
     commercial_validation_min_quality: float = 55.0
     commercial_validation_min_timestamp_coverage: float = 50.0
     commercial_validation_min_score: float = 65.0
+
+    # V1.2 Opportunity Agent Engine. Evidence is compacted once, then structured results
+    # flow through Signal -> Pain -> Market -> Product -> Risk -> Judge to limit token cost.
+    agent_evidence_limit: int = 80
+    agent_digest_snippets: int = 18
+    agent_snippet_chars: int = 520
+    agent_max_new_tokens: int = 1200
+    agent_build_score: float = 75.0
+    agent_build_market_score: float = 65.0
+    agent_watch_score: float = 50.0
 
     github_token: str = ""
     rsshub_base_url: str = ""

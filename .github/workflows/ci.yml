@@ -26,3 +26,13 @@ jobs:
         run: python -m pytest -q
       - name: Frontend syntax
         run: node --check web/app.js
+      - name: Package source
+        run: |
+          zip -r digital-goods-v1.2.1-opportunity-agent-engine.zip . \
+            -x ".git/*" ".env" "data/*.db" "*/__pycache__/*" "*.pyc"
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digital-goods-v1.2.1-opportunity-agent-engine
+          path: digital-goods-v1.2.1-opportunity-agent-engine.zip
+          if-no-files-found: error

@@ -23,9 +23,11 @@ def analyze_one(opportunity_id: int) -> dict[str, Any]:
     """
     result = run_opportunity_agent_workflow(opportunity_id)
     card = result.get("card") or {}
+    risk_score = float(card.get("risk_score") or 0)
+    status = "REJECTED_RISK" if risk_score >= settings.high_risk_threshold else "ANALYZED"
     return {
         "id": opportunity_id,
-        "status": "ANALYZED" if card.get("decision") != "DROP" else "REJECTED_RISK",
+        "status": status,
         "analysis": card,
         "card_id": result.get("card_id"),
     }

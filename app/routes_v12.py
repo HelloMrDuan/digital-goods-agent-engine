@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 import threading
 from typing import Any
 
@@ -9,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from .config import settings
 from .db import conn, dumps, loads, now_iso, row_to_dict
 from .services.analyze import analyze_one
+from .services.demand_discovery import run_demand_discovery
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity
 from .services.opportunity_agent import (
     get_card_for_opportunity,
@@ -19,6 +21,7 @@ from .services.opportunity_agent import (
 
 router = APIRouter()
 _MAX_REBUILD_CONCURRENCY = 6
+_RECENT_DEMAND_DAYS = 30
 
 
 def _rebuild_worker_count(total: int) -> int:
@@ -40,6 +43,7 @@ def _ensure_rebuild_schema() -> None:
                 message TEXT,
                 current_opportunity_id INTEGER,
                 analyze_enabled INTEGER NOT NULL DEFAULT 1,
+                refresh_enabled INTEGER NOT NULL DEFAULT 1,
                 requested_limit INTEGER NOT NULL DEFAULT 8,
                 total INTEGER NOT NULL DEFAULT 0,
                 processed INTEGER NOT NULL DEFAULT 0,
@@ -52,6 +56,9 @@ def _ensure_rebuild_schema() -> None:
             )
             """
         )
+        columns = {str(row["name"]) for row in c.execute("PRAGMA table_info(opportunity_rebuild_tasks)").fetchall()}
+        if "refresh_enabled" not in columns:
+            c.execute("ALTER TABLE opportunity_rebuild_tasks ADD COLUMN refresh_enabled INTEGER NOT NULL DEFAULT 1")
 
 
 def _update_rebuild(task_id: int, **values: Any) -> None:
@@ -101,42 +108,71 @@ def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict
         return {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
 
 
-def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
+def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enabled: bool) -> None:
     results: list[dict[str, Any]] = []
+    discovery_result: dict[str, Any] | None = None
     try:
-        _update_rebuild(task_id, status="RUNNING", progress=5, stage="重建候选", message="正在从现有真实 evidence 重建商机候选")
+        if refresh_enabled:
+            _update_rebuild(
+                task_id,
+                status="RUNNING",
+                progress=3,
+                stage="刷新真实需求",
+                message="正在用高意图关键词矩阵刷新小红书/Reddit最近30天真实需求",
+            )
+            discovery_result = run_demand_discovery()
+            _update_rebuild(
+                task_id,
+                progress=10,
+                stage="需求刷新完成",
+                message=(
+                    f"保留近期证据 {int(discovery_result.get('retained_recent') or 0)} 条；"
+                    f"直接需求信号 {int(discovery_result.get('direct_demand_signals') or 0)} 条"
+                ),
+            )
+
+        _update_rebuild(task_id, status="RUNNING", progress=12, stage="重建候选", message="正在从最新真实 evidence 重建商机候选")
         cluster_result = build_from_unlinked_evidence()
         if not analyze_enabled:
-            payload = {"cluster_run": cluster_result, "agent_analysis": []}
+            payload = {
+                "demand_discovery": discovery_result,
+                "cluster_run": cluster_result,
+                "agent_analysis": [],
+            }
             _update_rebuild(
                 task_id,
                 status="SUCCESS",
                 progress=100,
                 stage="完成",
-                message="候选重建完成；未执行付费 AI",
+                message="真实需求刷新和候选重建完成；未执行付费 AI",
                 result_json=dumps(payload),
             )
             return
 
+        recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=_RECENT_DEMAND_DAYS)).isoformat(timespec="seconds")
         with conn() as c:
             rows = c.execute(
                 """SELECT id FROM opportunities
                    WHERE cluster_active=1
-                   ORDER BY coalesce(analysis_stale,0) DESC,
+                     AND coalesce(last_seen_at,'')>=?
+                     AND (coalesce(explicit_demand_count,0)+coalesce(probable_demand_count,0))>0
+                   ORDER BY CASE WHEN validation_status='PASSED' THEN 1 ELSE 0 END DESC,
+                            coalesce(effective_signal_count,0) DESC,
+                            coalesce(platform_count,0) DESC,
                             coalesce(trusted_trend_score,0) DESC,
                             coalesce(data_quality_score,0) DESC,
                             evidence_count DESC,id DESC
                    LIMIT ?""",
-                (limit,),
+                (recent_cutoff, limit),
             ).fetchall()
         ids = [int(row["id"]) for row in rows]
         total = len(ids)
         worker_count = _rebuild_worker_count(total)
         _update_rebuild(
             task_id,
-            progress=12,
+            progress=15,
             stage="准备 Agent",
-            message=f"待分析 {total} 个商机；并发 {worker_count} 路",
+            message=f"最近 {_RECENT_DEMAND_DAYS} 天有效需求候选 {total} 个；并发 {worker_count} 路",
             total=total,
             current_opportunity_id=ids[0] if ids else None,
         )
@@ -144,7 +180,6 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
         succeeded = 0
         failed = 0
         if total:
-            # Create progress rows up front so every worker has an isolated progress record.
             analysis_task_ids = {opportunity_id: _analysis_task_start(opportunity_id) for opportunity_id in ids}
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="opportunity-agent") as pool:
                 future_map = {
@@ -172,7 +207,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
                         for pending_future, oid in future_map.items()
                         if not pending_future.done()
                     ]
-                    progress = 12 + int(processed / max(1, total) * 83)
+                    progress = 15 + int(processed / max(1, total) * 80)
                     _update_rebuild(
                         task_id,
                         progress=progress,
@@ -193,16 +228,27 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
         result_by_id = {int(item["opportunity_id"]): item for item in results}
         ordered_results = [result_by_id[opportunity_id] for opportunity_id in ids if opportunity_id in result_by_id]
         payload = {
+            "demand_discovery": discovery_result,
             "cluster_run": cluster_result,
             "agent_analysis": ordered_results,
             "concurrency": worker_count,
+            "selection_policy": {
+                "recent_demand_days": _RECENT_DEMAND_DAYS,
+                "requires_explicit_or_probable_demand": True,
+                "order": "validation, signal_count, platform_diversity, trusted_trend, data_quality",
+            },
         }
+        final_message = (
+            f"最近 {_RECENT_DEMAND_DAYS} 天没有可进入 Agent 的真实需求候选"
+            if total == 0
+            else f"处理 {total} 个商机：成功 {succeeded}，失败 {failed}；并发 {worker_count} 路"
+        )
         _update_rebuild(
             task_id,
             status=status,
             progress=100,
             stage="完成" if status != "FAILED" else "失败",
-            message=f"处理 {total} 个商机：成功 {succeeded}，失败 {failed}；并发 {worker_count} 路",
+            message=final_message,
             current_opportunity_id=None,
             processed=total,
             succeeded=succeeded,
@@ -218,7 +264,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int) -> None:
             stage="失败",
             message=str(exc),
             error=str(exc),
-            result_json=dumps({"agent_analysis": results}),
+            result_json=dumps({"demand_discovery": discovery_result, "agent_analysis": results}),
         )
 
 
@@ -230,6 +276,7 @@ def _rebuild_task_payload(task_id: int) -> dict[str, Any]:
         raise KeyError("rebuild task not found")
     data = row_to_dict(row) or {}
     data["analyze_enabled"] = bool(data.get("analyze_enabled"))
+    data["refresh_enabled"] = bool(data.get("refresh_enabled"))
     data["result"] = loads(data.pop("result_json", None), None)
     data["concurrency"] = _rebuild_worker_count(int(data.get("total") or data.get("requested_limit") or 0)) if data["analyze_enabled"] else 0
     current_id = data.get("current_opportunity_id")
@@ -248,6 +295,7 @@ def _rebuild_task_payload(task_id: int) -> dict[str, Any]:
 @router.post("/api/opportunities/rebuild")
 def opportunities_rebuild(
     analyze: bool = True,
+    refresh: bool = True,
     limit: int = Query(default=8, ge=1, le=20),
 ):
     _ensure_rebuild_schema()
@@ -257,16 +305,17 @@ def opportunities_rebuild(
     with conn() as c:
         cur = c.execute(
             """INSERT INTO opportunity_rebuild_tasks(
-                   status,progress,stage,message,analyze_enabled,requested_limit,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,?,?)""",
-            ("PENDING", 0, "排队", "等待重建", 1 if analyze else 0, limit, now, now),
+                   status,progress,stage,message,analyze_enabled,refresh_enabled,requested_limit,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            ("PENDING", 0, "排队", "等待刷新真实需求并重建", 1 if analyze else 0, 1 if refresh else 0, limit, now, now),
         )
     task_id = int(cur.lastrowid)
-    threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit), daemon=True).start()
+    threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit, refresh), daemon=True).start()
     return {
         "task_id": task_id,
         "status": "PENDING",
         "analyze": analyze,
+        "refresh": refresh,
         "limit": limit,
         "concurrency": _rebuild_worker_count(limit) if analyze else 0,
     }

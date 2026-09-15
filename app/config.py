@@ -47,9 +47,12 @@ class Settings(BaseSettings):
     # V1.2 Opportunity Agent Engine. Evidence is compacted once, then structured results
     # flow through Signal -> Pain -> Market -> Product -> Risk -> Judge to limit token cost.
     agent_evidence_limit: int = 80
-    agent_digest_snippets: int = 18
-    agent_snippet_chars: int = 520
-    agent_max_new_tokens: int = 1200
+    agent_digest_snippets: int = 14
+    agent_snippet_chars: int = 420
+    agent_max_new_tokens: int = 800
+    # Different opportunities are independent, so batch rebuilds can safely process a few
+    # in parallel while each opportunity still keeps its six dependent agents sequential.
+    agent_rebuild_concurrency: int = 3
     agent_build_score: float = 75.0
     agent_build_market_score: float = 65.0
     agent_watch_score: float = 50.0

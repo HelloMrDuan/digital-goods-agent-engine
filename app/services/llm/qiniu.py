@@ -24,11 +24,12 @@ _PUBLIC_PRICE_PER_MILLION: dict[str, tuple[float, float]] = {
     "qwen3.5-plus": (0.8, 4.8),
 }
 
-# All worker threads in one API process share a single request-start pacer. This preserves
-# opportunity-level concurrency while preventing a burst of 6-agent workflows from exceeding
-# Qiniu account RPM quotas.
-_RATE_LOCK = threading.Lock()
+# All worker threads in one API process share one scheduler. A condition variable is used
+# rather than a plain lock so an RPM 429 can extend the cooldown while other workers are
+# already waiting for their next request slot.
+_RATE_CONDITION = threading.Condition()
 _LAST_REQUEST_STARTED_AT = 0.0
+_RATE_LIMIT_BLOCKED_UNTIL = 0.0
 
 
 def _resolved_prices() -> tuple[float, float, str]:
@@ -88,21 +89,34 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
 def _wait_for_request_slot() -> None:
     global _LAST_REQUEST_STARTED_AT
     interval = max(0.0, float(settings.qiniu_min_request_interval_seconds or 0.0))
-    if interval <= 0:
+    with _RATE_CONDITION:
+        while True:
+            now = time.monotonic()
+            earliest = max(_LAST_REQUEST_STARTED_AT + interval, _RATE_LIMIT_BLOCKED_UNTIL)
+            wait_seconds = max(0.0, earliest - now)
+            if wait_seconds <= 0:
+                _LAST_REQUEST_STARTED_AT = now
+                return
+            _RATE_CONDITION.wait(timeout=wait_seconds)
+
+
+def _set_global_rate_limit_cooldown(seconds: float) -> None:
+    global _RATE_LIMIT_BLOCKED_UNTIL
+    delay = max(0.0, float(seconds or 0.0))
+    if delay <= 0:
         return
-    with _RATE_LOCK:
-        now = time.monotonic()
-        wait_seconds = max(0.0, (_LAST_REQUEST_STARTED_AT + interval) - now)
-        if wait_seconds > 0:
-            time.sleep(wait_seconds)
-        _LAST_REQUEST_STARTED_AT = time.monotonic()
+    with _RATE_CONDITION:
+        _RATE_LIMIT_BLOCKED_UNTIL = max(_RATE_LIMIT_BLOCKED_UNTIL, time.monotonic() + delay)
+        _RATE_CONDITION.notify_all()
 
 
 def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
     try:
         raw = response.headers.get("Retry-After")
         if raw not in (None, ""):
-            return max(0.0, float(raw))
+            parsed = float(raw)
+            if parsed > 0:
+                return parsed
     except Exception:
         pass
     base = max(0.0, float(settings.qiniu_rate_limit_backoff_seconds or 0.0))
@@ -121,9 +135,11 @@ def _post_with_rate_limit_retry(url: str, headers: dict[str, str], body: dict[st
             return response
         if attempt >= retries:
             return response
-        delay = _retry_after_seconds(response, attempt)
-        if delay > 0:
-            time.sleep(delay)
+        delay = max(
+            _retry_after_seconds(response, attempt),
+            max(0.0, float(settings.qiniu_rate_limit_global_cooldown_seconds or 0.0)),
+        )
+        _set_global_rate_limit_cooldown(delay)
     assert last_response is not None
     return last_response
 

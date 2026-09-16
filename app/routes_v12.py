@@ -138,7 +138,6 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
 
             discovery_result = run_demand_discovery(
                 max_queries_per_probe=refresh_queries_per_probe,
-                query_timeout_seconds=60,
                 progress_callback=refresh_progress,
             )
             _update_rebuild(

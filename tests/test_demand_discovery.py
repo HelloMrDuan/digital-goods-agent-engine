@@ -93,3 +93,29 @@ def test_run_demand_discovery_uses_fanout_and_only_recent_items(monkeypatch):
     assert result["retained_recent"] > 0
     assert result["direct_demand_signals"] > 0
     assert counter["n"] > 20
+
+
+def test_run_demand_discovery_reports_query_progress_and_respects_cap(monkeypatch):
+    monkeypatch.setattr(demand_discovery, "agent_reach_doctor", lambda: {
+        "opencli": {"connected": True},
+        "channels": {},
+    })
+    calls = []
+    progress = []
+
+    def fake_collect(platform, query, limit=20, **kwargs):
+        calls.append((platform, query))
+        return [_item(f"{platform}-{len(calls)}", f"author-{len(calls)}", 1, platform=platform)]
+
+    monkeypatch.setattr(demand_discovery, "collect_agent_reach", fake_collect)
+    result = demand_discovery.run_demand_discovery(
+        max_queries_per_probe=2,
+        progress_callback=progress.append,
+    )
+
+    assert result["total_queries"] == 8
+    assert result["max_queries_per_probe"] == 2
+    assert len(calls) == 8
+    assert len(progress) == 8
+    assert sorted(event["completed_queries"] for event in progress) == list(range(1, 9))
+    assert all(event["total_queries"] == 8 for event in progress)

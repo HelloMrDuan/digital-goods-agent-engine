@@ -12,14 +12,22 @@ POLICY_VERSION = "commercial-validation-v1-real-demand"
 
 
 def _parse_datetime(value: Any) -> datetime | None:
-    if not value:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
         return None
     try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if text.isdigit():
+            raw = int(text)
+            if raw > 10_000_000_000:
+                raw = raw / 1000
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc)
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
-    except (TypeError, ValueError):
+    except (OverflowError, OSError, TypeError, ValueError):
         return None
 
 
@@ -63,10 +71,14 @@ def current_snapshot(opportunity_id: int) -> tuple[str, list[dict[str, Any]]]:
 
 
 def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    fingerprints = {
-        str(row.get("content_fingerprint") or row.get("canonical_key") or row.get("id"))
-        for row in rows
-    }
+    # The same request text from two independent real authors is two demand signals.
+    # Repeated observations from the same author/content remain one signal.
+    signal_keys = set()
+    for row in rows:
+        fingerprint = str(row.get("content_fingerprint") or row.get("canonical_key") or row.get("id"))
+        author = str(row.get("author") or "").strip().lower()
+        platform = str(row.get("platform") or "").strip().lower()
+        signal_keys.add(f"{platform}:{author}:{fingerprint}" if author else fingerprint)
     authors = {
         f"{row.get('platform')}:{str(row.get('author')).strip().lower()}"
         for row in rows
@@ -91,7 +103,7 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             recent_30d += 1
     return {
         "real_demand_count": len(rows),
-        "effective_signal_count": len(fingerprints),
+        "effective_signal_count": len(signal_keys),
         "unique_authors": len(authors),
         "platform_count": len(platforms),
         "explicit_demand_count": int(explicit_count),

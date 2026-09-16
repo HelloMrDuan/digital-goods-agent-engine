@@ -237,3 +237,40 @@ def test_existing_v1133_database_is_migrated_in_place():
         "validation_json",
     }.issubset(columns)
     assert validation_table is not None
+
+
+def test_unix_timestamp_is_counted_as_recent_demand():
+    source = _source()
+    published_epoch = int((datetime.now(timezone.utc) - timedelta(days=2)).timestamp())
+    insert_evidence(
+        source,
+        CollectedItem(
+            platform="reddit",
+            source_type="agent_reach_reddit",
+            source_item_id="unix-recent",
+            source_url="https://www.reddit.com/comments/unix-recent/",
+            title="Need a payroll attendance spreadsheet template",
+            content="I need a payroll attendance spreadsheet that calculates overtime automatically.",
+            author="buyer-unix",
+            published_at=str(published_epoch),
+            engagement={"score": 3},
+            raw={"id": "unix-recent", "author": "buyer-unix"},
+        ),
+    )
+    opportunity_id = _opportunity_id()
+    result = validate_opportunity(opportunity_id)
+    assert result["metrics"]["recent_30d_count"] == 1
+    assert "no_recent_demand" not in result["reason_codes"]
+
+
+def test_same_text_from_two_real_authors_counts_as_two_independent_signals():
+    source = _source()
+    _insert(source, "same-one", "buyer-one")
+    _insert(source, "same-two", "buyer-two")
+    opportunity_id = _opportunity_id()
+
+    result = validate_opportunity(opportunity_id)
+
+    assert result["metrics"]["effective_signal_count"] == 2
+    assert result["metrics"]["unique_authors"] == 2
+    assert result["status"] == "PASSED"

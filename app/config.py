@@ -19,9 +19,12 @@ class Settings(BaseSettings):
     qiniu_api_token: str = ""
     qiniu_model: str = "qwen/qwen3.5-plus"
     qiniu_base_url: str = "https://api.qnaigc.com/v1"
-    # Keep at zero unless the account price is explicitly configured.
+    # Explicit prices override built-in public list-price estimates. Zero means auto-resolve
+    # for known models; unknown models remain unpriced rather than inventing a cost.
     qiniu_input_price_per_million: float = 0.0
     qiniu_output_price_per_million: float = 0.0
+    qiniu_enable_thinking: bool = False
+    qiniu_json_mode: bool = True
 
     sensenova_api_token: str = ""
     sensenova_model: str = ""

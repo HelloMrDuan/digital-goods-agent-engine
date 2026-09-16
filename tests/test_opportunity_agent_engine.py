@@ -173,13 +173,22 @@ def test_multi_agent_workflow_persists_card_and_six_runs(monkeypatch):
 
 
 def test_failed_deterministic_validation_no_longer_blocks_discovery_agent(monkeypatch):
+    from app.services.analyze import analyze_one
+
     opportunity_id = _opportunity_id(1)
     monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", _fake_chat)
 
-    result = opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+    result = analyze_one(opportunity_id)
 
-    assert result["card"]["commercial_validation"]["status"] == "FAILED"
-    assert result["card"]["decision"] in {"BUILD", "WATCH", "DROP"}
+    assert result["analysis"]["commercial_validation"]["status"] == "FAILED"
+    # Discovery AI can still inspect weak real evidence, but a failed deterministic Gate
+    # must never surface BUILD to the operator.
+    assert result["analysis"]["decision"] == "WATCH"
+    assert result["analysis"]["decision_guard"] == "commercial_validation_not_passed"
+    card = opportunity_agent.get_card_for_opportunity(opportunity_id)
+    assert card is not None
+    assert card["decision"] == "WATCH"
+    assert card["card"]["decision_guard"] == "commercial_validation_not_passed"
     with conn() as c:
         row = c.execute("SELECT COUNT(*) count FROM agent_runs WHERE opportunity_id=?", (opportunity_id,)).fetchone()
     assert int(row["count"]) == 6

@@ -13,6 +13,50 @@ from .sensenova import generate_product
 from .validation import require_current_validation
 
 
+def _apply_commercial_decision_guard(opportunity_id: int, result: dict[str, Any]) -> dict[str, Any]:
+    """Never expose BUILD unless the deterministic current-snapshot Gate passed.
+
+    Discovery Agents are intentionally allowed to inspect weak real evidence, but the operator-facing
+    Opportunity Card must not contradict the product-generation Gate.
+    """
+    card = result.get("card") or {}
+    validation = card.get("commercial_validation") or {}
+    validation_passed = str(validation.get("status") or "").upper() == "PASSED"
+    card["decision_guard"] = (
+        "commercial_validation_passed" if validation_passed else "commercial_validation_not_passed"
+    )
+    if not validation_passed and str(card.get("decision") or "").upper() == "BUILD":
+        final_score = float(card.get("final_score") or 0)
+        risk_score = float(card.get("risk_score") or 0)
+        card["decision"] = (
+            "WATCH"
+            if risk_score < settings.high_risk_threshold and final_score >= settings.agent_watch_score
+            else "DROP"
+        )
+        blockers = list(card.get("blockers") or [])
+        if "commercial_validation_not_passed" not in blockers:
+            blockers.append("commercial_validation_not_passed")
+        card["blockers"] = blockers
+
+    now = now_iso()
+    card_id = result.get("card_id")
+    with conn() as c:
+        card_table = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='opportunity_cards'"
+        ).fetchone()
+        if card_id and card_table:
+            c.execute(
+                "UPDATE opportunity_cards SET decision=?,card_json=?,updated_at=? WHERE id=?",
+                (card.get("decision"), dumps(card), now, int(card_id)),
+            )
+        c.execute(
+            "UPDATE opportunities SET analysis_json=?,updated_at=? WHERE id=?",
+            (dumps(card), now, opportunity_id),
+        )
+    result["card"] = card
+    return card
+
+
 def analyze_one(opportunity_id: int) -> dict[str, Any]:
     """Run the V1.2 evidence-first multi-Agent workflow.
 
@@ -22,7 +66,7 @@ def analyze_one(opportunity_id: int) -> dict[str, Any]:
     Product generation remains protected by the deterministic validation gate below.
     """
     result = run_opportunity_agent_workflow(opportunity_id)
-    card = result.get("card") or {}
+    card = _apply_commercial_decision_guard(opportunity_id, result)
     risk_score = float(card.get("risk_score") or 0)
     status = "REJECTED_RISK" if risk_score >= settings.high_risk_threshold else "ANALYZED"
     return {

@@ -15,6 +15,26 @@ class QiniuError(RuntimeError):
     pass
 
 
+# Qiniu public model-plaza list price, CNY per 1M tokens. Explicit .env prices always win.
+# Keep this deliberately small: unknown models stay unpriced instead of receiving a fake estimate.
+_PUBLIC_PRICE_PER_MILLION: dict[str, tuple[float, float]] = {
+    "qwen/qwen3.5-plus": (0.8, 4.8),
+    "qwen3.5-plus": (0.8, 4.8),
+}
+
+
+def _resolved_prices() -> tuple[float, float, str]:
+    configured_in = float(settings.qiniu_input_price_per_million or 0)
+    configured_out = float(settings.qiniu_output_price_per_million or 0)
+    if configured_in > 0 and configured_out > 0:
+        return configured_in, configured_out, "configured"
+    model = str(settings.qiniu_model or "").strip().lower()
+    prices = _PUBLIC_PRICE_PER_MILLION.get(model)
+    if prices:
+        return prices[0], prices[1], "qiniu_public_list_price"
+    return 0.0, 0.0, "unknown"
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     raw = str(text or "").strip()
     if raw.startswith("```"):
@@ -49,9 +69,10 @@ def _daily_spend() -> float:
 
 
 def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    input_price, output_price, _ = _resolved_prices()
     return round(
-        prompt_tokens / 1_000_000 * settings.qiniu_input_price_per_million
-        + completion_tokens / 1_000_000 * settings.qiniu_output_price_per_million,
+        prompt_tokens / 1_000_000 * input_price
+        + completion_tokens / 1_000_000 * output_price,
         6,
     )
 
@@ -83,7 +104,11 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
         "model": settings.qiniu_model,
         "messages": messages,
         "temperature": 0.2,
+        # Opportunity extraction needs compact structured output, not long hidden reasoning.
+        "enable_thinking": bool(settings.qiniu_enable_thinking),
     }
+    if settings.qiniu_json_mode:
+        body["response_format"] = {"type": "json_object"}
     max_new_tokens = kwargs.get("max_new_tokens")
     if max_new_tokens:
         body["max_tokens"] = int(max_new_tokens)
@@ -112,6 +137,7 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
         completion_tokens = int(usage.get("completion_tokens") or 0)
         total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
         cost = _estimate_cost(prompt_tokens, completion_tokens)
+        _, _, pricing_source = _resolved_prices()
         with conn() as c:
             c.execute(
                 """INSERT INTO ai_runs(operation,entity_type,entity_id,provider,model,status,prompt_tokens,completion_tokens,total_tokens,estimated_cost_cny,created_at)
@@ -138,6 +164,8 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
                 "estimated_cost_cny": cost,
+                "pricing_source": pricing_source,
+                "thinking_enabled": bool(settings.qiniu_enable_thinking),
             },
         }
         return result, meta

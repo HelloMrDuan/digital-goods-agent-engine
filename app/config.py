@@ -27,10 +27,13 @@ class Settings(BaseSettings):
     qiniu_json_mode: bool = True
     # Qiniu accounts can have a low requests-per-minute quota. Opportunity rebuilds may
     # run several opportunities concurrently, so all Qiniu calls share one process-level
-    # pacer. 6.5s keeps request starts below ~10 RPM while preserving rebuild concurrency.
-    qiniu_min_request_interval_seconds: float = 6.5
+    # pacer. 8s keeps request starts at <=7.5 RPM and leaves headroom for rolling windows.
+    qiniu_min_request_interval_seconds: float = 8.0
     qiniu_rate_limit_retries: int = 4
     qiniu_rate_limit_backoff_seconds: float = 15.0
+    # Any RPM 429 opens a process-wide cooldown. This is intentionally a full minute so
+    # concurrent Agent workers cannot keep the provider's rolling RPM window permanently hot.
+    qiniu_rate_limit_global_cooldown_seconds: float = 60.0
     # Structured responses normally use AGENT_MAX_NEW_TOKENS. If a response clearly starts
     # as JSON but is cut off by the output limit, retry once with this larger cap.
     qiniu_json_retry_max_tokens: int = 1600

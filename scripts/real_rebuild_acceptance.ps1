@@ -65,7 +65,7 @@ if (-not $opencliConnected -and $InspectTaskId -eq 0) {
 }
 
 $preCost = $null
-try { $preCost = Invoke-JsonApi -Method GET -Path "/api/ai/cost?limit=1" } catch { Write-Warning $_.Exception.Message }
+try { $preCost = Invoke-JsonApi -Method GET -Path "/api/ai/cost?limit=200" } catch { Write-Warning $_.Exception.Message }
 
 Write-Host "`n[3/6] Start/inspect real refresh + rebuild + multi-agent" -ForegroundColor Yellow
 if ($InspectTaskId -gt 0) {
@@ -130,7 +130,7 @@ foreach ($item in $analysisItems) {
     try {
         $runs = @(Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/agent-runs?limit=20")
     } catch {
-        Write-Warning "Cannot read agent runs for opportunity $oid: $($_.Exception.Message)"
+        Write-Warning "Cannot read agent runs for opportunity ${oid}: $($_.Exception.Message)"
     }
     foreach ($run in $runs) {
         $runRows += [pscustomobject]@{

@@ -108,6 +108,7 @@ def qiniu_env(tmp_path: Path):
         "qiniu_min_request_interval_seconds": settings.qiniu_min_request_interval_seconds,
         "qiniu_rate_limit_retries": settings.qiniu_rate_limit_retries,
         "qiniu_rate_limit_backoff_seconds": settings.qiniu_rate_limit_backoff_seconds,
+        "qiniu_rate_limit_global_cooldown_seconds": settings.qiniu_rate_limit_global_cooldown_seconds,
         "qiniu_json_retry_max_tokens": settings.qiniu_json_retry_max_tokens,
         "daily_ai_budget_cny": settings.daily_ai_budget_cny,
     }
@@ -121,12 +122,15 @@ def qiniu_env(tmp_path: Path):
     settings.qiniu_min_request_interval_seconds = 0
     settings.qiniu_rate_limit_retries = 2
     settings.qiniu_rate_limit_backoff_seconds = 0
+    settings.qiniu_rate_limit_global_cooldown_seconds = 0
     settings.qiniu_json_retry_max_tokens = 1600
     settings.daily_ai_budget_cny = 5
     qiniu._LAST_REQUEST_STARTED_AT = 0.0
+    qiniu._RATE_LIMIT_BLOCKED_UNTIL = 0.0
     init_db()
     yield
     qiniu._LAST_REQUEST_STARTED_AT = 0.0
+    qiniu._RATE_LIMIT_BLOCKED_UNTIL = 0.0
     for key, value in old.items():
         setattr(settings, key, value)
 
@@ -153,7 +157,6 @@ def test_qiniu_agent_call_disables_thinking_uses_json_mode_and_public_price(monk
 def test_qiniu_retries_rpm_429_before_failing_over(monkeypatch, qiniu_env):
     _RetryClient.calls = 0
     monkeypatch.setattr(qiniu.httpx, "Client", _RetryClient)
-    monkeypatch.setattr(qiniu.time, "sleep", lambda _: None)
 
     result, meta = qiniu.chat_json_with_meta(
         operation="test-rate-limit",
@@ -165,6 +168,22 @@ def test_qiniu_retries_rpm_429_before_failing_over(monkeypatch, qiniu_env):
     assert result == {"ok": True}
     assert _RetryClient.calls == 2
     assert meta["provider"] == "Qiniu"
+
+
+def test_qiniu_429_sets_process_wide_cooldown(monkeypatch, qiniu_env):
+    clock = {"now": 100.0}
+    monkeypatch.setattr(qiniu.time, "monotonic", lambda: clock["now"])
+    settings.qiniu_rate_limit_global_cooldown_seconds = 60
+
+    qiniu._set_global_rate_limit_cooldown(60)
+
+    assert qiniu._RATE_LIMIT_BLOCKED_UNTIL == pytest.approx(160.0)
+
+
+def test_qiniu_retry_after_zero_falls_back_to_configured_backoff(qiniu_env):
+    settings.qiniu_rate_limit_backoff_seconds = 15
+    assert qiniu._retry_after_seconds(_RateLimitedResponse(), 0) == pytest.approx(15.0)
+    assert qiniu._retry_after_seconds(_RateLimitedResponse(), 1) == pytest.approx(30.0)
 
 
 def test_qiniu_retries_clearly_truncated_json_with_larger_token_cap(monkeypatch, qiniu_env):

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +23,12 @@ _PUBLIC_PRICE_PER_MILLION: dict[str, tuple[float, float]] = {
     "qwen/qwen3.5-plus": (0.8, 4.8),
     "qwen3.5-plus": (0.8, 4.8),
 }
+
+# All worker threads in one API process share a single request-start pacer. This preserves
+# opportunity-level concurrency while preventing a burst of 6-agent workflows from exceeding
+# Qiniu account RPM quotas.
+_RATE_LOCK = threading.Lock()
+_LAST_REQUEST_STARTED_AT = 0.0
 
 
 def _resolved_prices() -> tuple[float, float, str]:
@@ -77,6 +85,49 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
     )
 
 
+def _wait_for_request_slot() -> None:
+    global _LAST_REQUEST_STARTED_AT
+    interval = max(0.0, float(settings.qiniu_min_request_interval_seconds or 0.0))
+    if interval <= 0:
+        return
+    with _RATE_LOCK:
+        now = time.monotonic()
+        wait_seconds = max(0.0, (_LAST_REQUEST_STARTED_AT + interval) - now)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        _LAST_REQUEST_STARTED_AT = time.monotonic()
+
+
+def _retry_after_seconds(response: httpx.Response, attempt: int) -> float:
+    try:
+        raw = response.headers.get("Retry-After")
+        if raw not in (None, ""):
+            return max(0.0, float(raw))
+    except Exception:
+        pass
+    base = max(0.0, float(settings.qiniu_rate_limit_backoff_seconds or 0.0))
+    return min(60.0, base * (2**attempt))
+
+
+def _post_with_rate_limit_retry(url: str, headers: dict[str, str], body: dict[str, Any]) -> httpx.Response:
+    retries = max(0, int(settings.qiniu_rate_limit_retries or 0))
+    last_response: httpx.Response | None = None
+    for attempt in range(retries + 1):
+        _wait_for_request_slot()
+        with httpx.Client(timeout=120, trust_env=False) as client:
+            response = client.post(url, headers=headers, json=body)
+        last_response = response
+        if response.status_code != 429:
+            return response
+        if attempt >= retries:
+            return response
+        delay = _retry_after_seconds(response, attempt)
+        if delay > 0:
+            time.sleep(delay)
+    assert last_response is not None
+    return last_response
+
+
 def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     if not settings.is_qiniu_configured:
         raise QiniuError("Qiniu is not configured. Set QINIU_API_TOKEN/QINIU_BASE_URL/QINIU_MODEL.")
@@ -118,8 +169,7 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     entity_id = kwargs.get("entity_id")
     created_at = now_iso()
     try:
-        with httpx.Client(timeout=120, trust_env=False) as client:
-            response = client.post(url, headers=headers, json=body)
+        response = _post_with_rate_limit_retry(url, headers, body)
         if response.status_code != 200:
             raise QiniuError(f"Qiniu HTTP {response.status_code}: {response.text}")
         try:

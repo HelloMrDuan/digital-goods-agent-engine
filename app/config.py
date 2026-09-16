@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     qiniu_output_price_per_million: float = 0.0
     qiniu_enable_thinking: bool = False
     qiniu_json_mode: bool = True
+    # Qiniu accounts can have a low requests-per-minute quota. Opportunity rebuilds may
+    # run several opportunities concurrently, so all Qiniu calls share one process-level
+    # pacer. 6.5s keeps request starts below ~10 RPM while preserving rebuild concurrency.
+    qiniu_min_request_interval_seconds: float = 6.5
+    qiniu_rate_limit_retries: int = 4
+    qiniu_rate_limit_backoff_seconds: float = 15.0
 
     sensenova_api_token: str = ""
     sensenova_model: str = ""
@@ -53,8 +59,8 @@ class Settings(BaseSettings):
     agent_digest_snippets: int = 14
     agent_snippet_chars: int = 420
     agent_max_new_tokens: int = 800
-    # Different opportunities are independent, so batch rebuilds can safely process a few
-    # in parallel while each opportunity still keeps its six dependent agents sequential.
+    # Different opportunities are independent. Provider-side pacing below prevents these
+    # workers from turning into an RPM burst against Qiniu.
     agent_rebuild_concurrency: int = 3
     agent_build_score: float = 75.0
     agent_build_market_score: float = 65.0

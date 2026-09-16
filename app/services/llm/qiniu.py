@@ -128,6 +128,48 @@ def _post_with_rate_limit_retry(url: str, headers: dict[str, str], body: dict[st
     return last_response
 
 
+def _decode_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, str]:
+    if response.status_code != 200:
+        raise QiniuError(f"Qiniu HTTP {response.status_code}: {response.text}")
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise QiniuError(f"Qiniu invalid json response: {response.text[:800]}") from exc
+    try:
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+    except Exception as exc:
+        raise QiniuError(f"Qiniu response format invalid: {str(data)[:800]}") from exc
+    finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+    return data, str(content), finish_reason
+
+
+def _usage_numbers(data: dict[str, Any]) -> tuple[int, int, int]:
+    usage = data.get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def _looks_like_truncated_json(content: str, finish_reason: str) -> bool:
+    if finish_reason in {"length", "max_tokens", "max_token", "token_limit"}:
+        return True
+    raw = str(content or "").strip()
+    if raw.startswith("```json"):
+        raw = raw[7:].lstrip()
+    elif raw.startswith("```"):
+        raw = raw[3:].lstrip()
+    # Qiniu/OpenAI-compatible models may return finish_reason inconsistently. A JSON object
+    # that clearly starts but never closes is safe to classify as truncation for one retry.
+    return raw.startswith("{") and not raw.rstrip().endswith("}")
+
+
+def _expanded_json_retry_tokens(original: int) -> int:
+    configured = max(1, int(settings.qiniu_json_retry_max_tokens or 1600))
+    return min(configured, max(int(original) * 2, 1200))
+
+
 def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     if not settings.is_qiniu_configured:
         raise QiniuError("Qiniu is not configured. Set QINIU_API_TOKEN/QINIU_BASE_URL/QINIU_MODEL.")
@@ -170,22 +212,34 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     created_at = now_iso()
     try:
         response = _post_with_rate_limit_retry(url, headers, body)
-        if response.status_code != 200:
-            raise QiniuError(f"Qiniu HTTP {response.status_code}: {response.text}")
+        data, content, finish_reason = _decode_completion_response(response)
+        usage_parts = [_usage_numbers(data)]
+        json_length_retry = False
         try:
-            data = response.json()
-        except Exception as exc:
-            raise QiniuError(f"Qiniu invalid json response: {response.text[:800]}") from exc
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except Exception as exc:
-            raise QiniuError(f"Qiniu response format invalid: {str(data)[:800]}") from exc
+            result = _extract_json(content)
+        except QiniuError:
+            original_limit = int(max_new_tokens or body.get("max_tokens") or 0)
+            if not original_limit or not _looks_like_truncated_json(content, finish_reason):
+                raise
+            retry_body = dict(body)
+            retry_body["max_tokens"] = _expanded_json_retry_tokens(original_limit)
+            retry_response = _post_with_rate_limit_retry(url, headers, retry_body)
+            retry_data, retry_content, retry_finish_reason = _decode_completion_response(retry_response)
+            usage_parts.append(_usage_numbers(retry_data))
+            try:
+                result = _extract_json(retry_content)
+            except QiniuError as exc:
+                raise QiniuError(
+                    f"Qiniu JSON remained invalid after truncation retry "
+                    f"({original_limit}->{retry_body['max_tokens']} tokens, finish_reason={retry_finish_reason or 'unknown'}): {exc}"
+                ) from exc
+            data = retry_data
+            finish_reason = retry_finish_reason
+            json_length_retry = True
 
-        result = _extract_json(str(content))
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        prompt_tokens = sum(part[0] for part in usage_parts)
+        completion_tokens = sum(part[1] for part in usage_parts)
+        total_tokens = sum(part[2] for part in usage_parts)
         cost = _estimate_cost(prompt_tokens, completion_tokens)
         _, _, pricing_source = _resolved_prices()
         with conn() as c:
@@ -216,6 +270,8 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                 "estimated_cost_cny": cost,
                 "pricing_source": pricing_source,
                 "thinking_enabled": bool(settings.qiniu_enable_thinking),
+                "json_length_retry": json_length_retry,
+                "finish_reason": finish_reason or None,
             },
         }
         return result, meta

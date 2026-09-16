@@ -14,7 +14,6 @@ from .ingest import ingest_items
 STRATEGY_VERSION = "demand-discovery-v3-intent-fanout"
 MAX_AGE_DAYS = 30
 MAX_WORKERS = 2
-DEFAULT_QUERY_TIMEOUT_SECONDS = 60
 
 # Do not search product categories first. Search the language people use when they have
 # an unmet need or payment intent, then let clustering discover the product category.
@@ -236,7 +235,6 @@ def _collect_probe(
     probe: dict[str, Any],
     *,
     queries: tuple[str, ...] | list[str] | None = None,
-    query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     source = _source_for_probe(probe)
@@ -262,7 +260,6 @@ def _collect_probe(
                 str(query),
                 limit=int(probe["per_query_limit"]),
                 enrich=False,
-                command_timeout_seconds=query_timeout_seconds,
             )
             fetched = len(items)
             raw_items.extend(items)
@@ -331,7 +328,6 @@ def _collect_probe(
 def run_demand_discovery(
     *,
     max_queries_per_probe: int | None = None,
-    query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Refresh current high-intent demand before opportunity clustering/Agent analysis.
@@ -374,7 +370,6 @@ def run_demand_discovery(
                 _collect_probe,
                 probe,
                 queries=query_plan[str(probe["name"])],
-                query_timeout_seconds=query_timeout_seconds,
                 progress_callback=emit_query_progress,
             ): probe
             for probe in probes
@@ -407,7 +402,6 @@ def run_demand_discovery(
         "status": "SUCCESS" if len(successful) == len(results) else "PARTIAL",
         "strategy": STRATEGY_VERSION,
         "max_age_days": MAX_AGE_DAYS,
-        "query_timeout_seconds": query_timeout_seconds,
         "max_queries_per_probe": max_queries_per_probe,
         "total_queries": total_queries,
         "ready_platforms": sorted(ready_platforms),

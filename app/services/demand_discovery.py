@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from ..collectors import agent_reach_doctor, collect_agent_reach
 from ..collectors.base import CollectedItem
@@ -13,6 +14,7 @@ from .ingest import ingest_items
 STRATEGY_VERSION = "demand-discovery-v3-intent-fanout"
 MAX_AGE_DAYS = 30
 MAX_WORKERS = 2
+DEFAULT_QUERY_TIMEOUT_SECONDS = 60
 
 # Do not search product categories first. Search the language people use when they have
 # an unmet need or payment intent, then let clustering discover the product category.
@@ -230,7 +232,13 @@ def _intent_counts(evidence_ids: list[int]) -> dict[str, int]:
     return result
 
 
-def _collect_probe(probe: dict[str, Any]) -> dict[str, Any]:
+def _collect_probe(
+    probe: dict[str, Any],
+    *,
+    queries: tuple[str, ...] | list[str] | None = None,
+    query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     source = _source_for_probe(probe)
     started = now_iso()
     t0 = time.monotonic()
@@ -243,18 +251,36 @@ def _collect_probe(probe: dict[str, Any]) -> dict[str, Any]:
 
     raw_items: list[CollectedItem] = []
     query_errors: list[str] = []
-    for query in probe["queries"]:
+    selected_queries = list(queries if queries is not None else probe["queries"])
+    for query_index, query in enumerate(selected_queries, start=1):
+        query_started = time.monotonic()
+        fetched = 0
+        error: str | None = None
         try:
-            raw_items.extend(
-                collect_agent_reach(
-                    str(probe["platform"]),
-                    str(query),
-                    limit=int(probe["per_query_limit"]),
-                    enrich=False,
-                )
+            items = collect_agent_reach(
+                str(probe["platform"]),
+                str(query),
+                limit=int(probe["per_query_limit"]),
+                enrich=False,
+                command_timeout_seconds=query_timeout_seconds,
             )
+            fetched = len(items)
+            raw_items.extend(items)
         except Exception as exc:
-            query_errors.append(f"{query}: {exc}")
+            error = str(exc)
+            query_errors.append(f"{query}: {error}")
+        finally:
+            if progress_callback is not None:
+                progress_callback({
+                    "source_name": probe["name"],
+                    "platform": probe["platform"],
+                    "query": str(query),
+                    "query_index": query_index,
+                    "query_total": len(selected_queries),
+                    "fetched": fetched,
+                    "error": error,
+                    "duration_ms": int((time.monotonic() - query_started) * 1000),
+                })
 
     retained = _prepare_items(raw_items, int(probe["limit"]))
     stats = ingest_items(source, retained)
@@ -289,7 +315,7 @@ def _collect_probe(probe: dict[str, Any]) -> dict[str, Any]:
         "source_name": probe["name"],
         "platform": probe["platform"],
         "status": status,
-        "queries": len(probe["queries"]),
+        "queries": len(selected_queries),
         "query_failures": len(query_errors),
         "raw_fetched": len(raw_items),
         "retained_recent": len(retained),
@@ -302,8 +328,18 @@ def _collect_probe(probe: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_demand_discovery() -> dict[str, Any]:
-    """Refresh current high-intent demand before opportunity clustering/Agent analysis."""
+def run_demand_discovery(
+    *,
+    max_queries_per_probe: int | None = None,
+    query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Refresh current high-intent demand before opportunity clustering/Agent analysis.
+
+    ``max_queries_per_probe`` bounds interactive rebuild latency without fabricating
+    data. Pass ``None`` to run the complete query matrix. Progress is emitted after
+    each real query so callers can distinguish slow collection from a stuck worker.
+    """
     install = install_sources()
     doctor = agent_reach_doctor()
     ready_platforms = {platform for platform in {"xiaohongshu", "reddit"} if _channel_ready(doctor, platform)}
@@ -311,9 +347,38 @@ def run_demand_discovery() -> dict[str, Any]:
         raise RuntimeError("fresh demand discovery unavailable: Xiaohongshu/Reddit OpenCLI channels are not ready")
 
     probes = [probe for probe in _PROBES if probe["platform"] in ready_platforms]
+    if max_queries_per_probe is not None:
+        max_queries_per_probe = max(1, int(max_queries_per_probe))
+    query_plan = {
+        str(probe["name"]): tuple(probe["queries"][:max_queries_per_probe]) if max_queries_per_probe is not None else tuple(probe["queries"])
+        for probe in probes
+    }
+    total_queries = sum(len(queries) for queries in query_plan.values())
+    completed_queries = 0
+    progress_lock = threading.Lock()
+
+    def emit_query_progress(event: dict[str, Any]) -> None:
+        nonlocal completed_queries
+        with progress_lock:
+            completed_queries += 1
+            payload = dict(event)
+            payload["completed_queries"] = completed_queries
+            payload["total_queries"] = total_queries
+        if progress_callback is not None:
+            progress_callback(payload)
+
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(probes))), thread_name_prefix="demand-discovery") as pool:
-        futures = {pool.submit(_collect_probe, probe): probe for probe in probes}
+        futures = {
+            pool.submit(
+                _collect_probe,
+                probe,
+                queries=query_plan[str(probe["name"])],
+                query_timeout_seconds=query_timeout_seconds,
+                progress_callback=emit_query_progress,
+            ): probe
+            for probe in probes
+        }
         for future in as_completed(futures):
             probe = futures[future]
             try:
@@ -342,6 +407,9 @@ def run_demand_discovery() -> dict[str, Any]:
         "status": "SUCCESS" if len(successful) == len(results) else "PARTIAL",
         "strategy": STRATEGY_VERSION,
         "max_age_days": MAX_AGE_DAYS,
+        "query_timeout_seconds": query_timeout_seconds,
+        "max_queries_per_probe": max_queries_per_probe,
+        "total_queries": total_queries,
         "ready_platforms": sorted(ready_platforms),
         "probes": results,
         "probe_count": len(results),

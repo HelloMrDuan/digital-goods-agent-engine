@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     qiniu_min_request_interval_seconds: float = 6.5
     qiniu_rate_limit_retries: int = 4
     qiniu_rate_limit_backoff_seconds: float = 15.0
+    # Structured responses normally use AGENT_MAX_NEW_TOKENS. If a response clearly starts
+    # as JSON but is cut off by the output limit, retry once with this larger cap.
+    qiniu_json_retry_max_tokens: int = 1600
 
     sensenova_api_token: str = ""
     sensenova_model: str = ""

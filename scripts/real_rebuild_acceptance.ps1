@@ -4,7 +4,8 @@ param(
     [ValidateRange(1, 8)] [int]$RefreshQueriesPerProbe = 3,
     [ValidateRange(1, 30)] [int]$PollSeconds = 3,
     [ValidateRange(30, 1800)] [int]$TimeoutSeconds = 900,
-    [ValidateRange(0, 2147483647)] [int]$InspectTaskId = 0
+    [ValidateRange(0, 2147483647)] [int]$InspectTaskId = 0,
+    [switch]$SkipRefresh
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,8 +42,14 @@ function To-Number($Value) {
     return [double]$Value
 }
 
+function To-FlatArray($Value) {
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [System.Array]) { return @($Value | ForEach-Object { $_ }) }
+    return @($Value)
+}
+
 Write-Host "===== DIGITAL GOODS V1.2.1 REAL REBUILD ACCEPTANCE =====" -ForegroundColor Cyan
-Write-Host "BaseUrl=$BaseUrl Limit=$Limit RefreshQueriesPerProbe=$RefreshQueriesPerProbe InspectTaskId=$InspectTaskId"
+Write-Host "BaseUrl=$BaseUrl Limit=$Limit RefreshQueriesPerProbe=$RefreshQueriesPerProbe InspectTaskId=$InspectTaskId SkipRefresh=$SkipRefresh"
 
 Write-Host "`n[1/6] Service identity + health" -ForegroundColor Yellow
 $openapi = Invoke-JsonApi -Method GET -Path "/openapi.json"
@@ -60,22 +67,23 @@ $doctor = Invoke-JsonApi -Method GET -Path "/api/agent-reach/doctor"
 $doctor | ConvertTo-Json -Depth 20
 $opencliConnected = $false
 if ($null -ne $doctor.opencli) { $opencliConnected = [bool]$doctor.opencli.connected }
-if (-not $opencliConnected -and $InspectTaskId -eq 0) {
+if (-not $opencliConnected -and $InspectTaskId -eq 0 -and -not $SkipRefresh) {
     throw "OpenCLI Browser Bridge is NOT_CONNECTED. Real refresh was NOT started. Connect the Chrome/Chromium extension first; if needed run 'opencli daemon restart', then rerun this script."
 }
 
 $preCost = $null
 try { $preCost = Invoke-JsonApi -Method GET -Path "/api/ai/cost?limit=200" } catch { Write-Warning $_.Exception.Message }
 
-Write-Host "`n[3/6] Start/inspect real refresh + rebuild + multi-agent" -ForegroundColor Yellow
+Write-Host "`n[3/6] Start/inspect rebuild + multi-agent" -ForegroundColor Yellow
 if ($InspectTaskId -gt 0) {
     $taskId = $InspectTaskId
     $task = Invoke-JsonApi -Method GET -Path "/api/opportunities/rebuild/tasks/$taskId"
     Write-Host "inspect existing task_id=$taskId status=$($task.status)"
 } else {
-    $rebuild = Invoke-JsonApi -Method POST -Path "/api/opportunities/rebuild?analyze=true&refresh=true&limit=$Limit&refresh_queries_per_probe=$RefreshQueriesPerProbe"
+    $refreshValue = if ($SkipRefresh) { "false" } else { "true" }
+    $rebuild = Invoke-JsonApi -Method POST -Path "/api/opportunities/rebuild?analyze=true&refresh=$refreshValue&limit=$Limit&refresh_queries_per_probe=$RefreshQueriesPerProbe"
     $taskId = [int]$rebuild.task_id
-    Write-Host "task_id=$taskId concurrency=$($rebuild.concurrency)"
+    Write-Host "task_id=$taskId concurrency=$($rebuild.concurrency) refresh=$refreshValue"
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
@@ -92,19 +100,19 @@ $discovery = $result.demand_discovery
 $cluster = $result.cluster_run
 $summary = [pscustomobject]@{
     TaskId=$taskId; Status=$task.status
-    RetainedRecent=$discovery.retained_recent
-    DirectDemandSignals=$discovery.direct_demand_signals
-    SuccessfulProbes=$discovery.successful_probes
-    ProbeCount=$discovery.probe_count
-    CandidateGroups=$cluster.candidate_groups
-    DemandEvidence=$cluster.processed_evidence
-    ContextEvidence=$cluster.context_evidence_considered
+    RetainedRecent=if ($discovery) { $discovery.retained_recent } else { $null }
+    DirectDemandSignals=if ($discovery) { $discovery.direct_demand_signals } else { $null }
+    SuccessfulProbes=if ($discovery) { $discovery.successful_probes } else { $null }
+    ProbeCount=if ($discovery) { $discovery.probe_count } else { $null }
+    CandidateGroups=if ($cluster) { $cluster.candidate_groups } else { $null }
+    DemandEvidence=if ($cluster) { $cluster.processed_evidence } else { $null }
+    ContextEvidence=if ($cluster) { $cluster.context_evidence_considered } else { $null }
     AgentTotal=$task.total; AgentSucceeded=$task.succeeded; AgentFailed=$task.failed
     Concurrency=$task.concurrency
 }
 $summary | Format-List
 
-$analysisItems = @($result.agent_analysis)
+$analysisItems = @(To-FlatArray $result.agent_analysis)
 $analysisFailures = @(
     $analysisItems |
         Where-Object { $_.status -eq "FAILED" -or -not [string]::IsNullOrWhiteSpace([string]$_.error) } |
@@ -128,20 +136,21 @@ foreach ($item in $analysisItems) {
 
     $runs = @()
     try {
-        $runs = @(Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/agent-runs?limit=20")
+        $rawRuns = Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/agent-runs?limit=20"
+        $runs = @(To-FlatArray $rawRuns)
     } catch {
         Write-Warning "Cannot read agent runs for opportunity ${oid}: $($_.Exception.Message)"
     }
     foreach ($run in $runs) {
         $runRows += [pscustomobject]@{
-            OpportunityId=$oid; Agent=$run.agent_name; Status=$run.status
-            Provider=$run.provider; Model=$run.model
-            PromptTokens=$run.prompt_tokens; CompletionTokens=$run.completion_tokens
-            TotalTokens=$run.total_tokens; DurationMs=$run.duration_ms; Error=$run.error
+            OpportunityId=$oid; Agent=[string]$run.agent_name; Status=[string]$run.status
+            Provider=[string]$run.provider; Model=[string]$run.model
+            PromptTokens=To-Number $run.prompt_tokens; CompletionTokens=To-Number $run.completion_tokens
+            TotalTokens=To-Number $run.total_tokens; DurationMs=To-Number $run.duration_ms; Error=[string]$run.error
         }
         if ($run.status -eq "FAILED" -or -not [string]::IsNullOrWhiteSpace([string]$run.error)) {
             $agentFailures += [pscustomobject]@{
-                OpportunityId=$oid; Agent=$run.agent_name; Error=$run.error; DurationMs=$run.duration_ms
+                OpportunityId=$oid; Agent=[string]$run.agent_name; Error=[string]$run.error; DurationMs=To-Number $run.duration_ms
             }
         }
     }
@@ -187,7 +196,9 @@ if ($agentFailures.Count) {
 if ($runRows.Count) {
     Write-Host "`nLatest agent usage:" -ForegroundColor DarkYellow
     $runRows | Select-Object OpportunityId,Agent,Status,Provider,Model,PromptTokens,CompletionTokens,TotalTokens,DurationMs | Format-Table -AutoSize
-    Write-Host "agent_tokens_total=$(($runRows | Measure-Object TotalTokens -Sum).Sum) agent_duration_sum_ms=$(($runRows | Measure-Object DurationMs -Sum).Sum)"
+    $tokenTotal = ($runRows | ForEach-Object { To-Number $_.TotalTokens } | Measure-Object -Sum).Sum
+    $durationTotalMs = ($runRows | ForEach-Object { To-Number $_.DurationMs } | Measure-Object -Sum).Sum
+    Write-Host "agent_tokens_total=$tokenTotal agent_duration_sum_ms=$durationTotalMs"
 }
 
 Write-Host "`n[6/6] AI cost delta + report" -ForegroundColor Yellow

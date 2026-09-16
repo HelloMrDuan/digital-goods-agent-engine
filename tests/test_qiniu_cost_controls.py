@@ -16,7 +16,7 @@ class _Response:
 
     def json(self):
         return {
-            "choices": [{"message": {"content": '{"ok": true}'}}],
+            "choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
         }
 
@@ -28,6 +28,30 @@ class _RateLimitedResponse:
 
     def json(self):
         return {"error": {"code": "rate_limit_rpm_exceeded"}}
+
+
+class _TruncatedResponse:
+    status_code = 200
+    text = ""
+    headers = {}
+
+    def json(self):
+        return {
+            "choices": [{"message": {"content": '{"recommended_products":[{"name":"starter"}'}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 700, "completion_tokens": 800, "total_tokens": 1500},
+        }
+
+
+class _ExpandedResponse:
+    status_code = 200
+    text = ""
+    headers = {}
+
+    def json(self):
+        return {
+            "choices": [{"message": {"content": '{"recommended_products":[{"name":"starter"}]}'}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 700, "completion_tokens": 300, "total_tokens": 1000},
+        }
 
 
 class _Client:
@@ -58,6 +82,19 @@ class _RetryClient(_Client):
         return _Response()
 
 
+class _TruncationRetryClient(_Client):
+    calls = 0
+    bodies = []
+
+    def post(self, url, headers=None, json=None):
+        type(self).calls += 1
+        type(self).bodies.append(dict(json or {}))
+        _Client.last_json = json
+        if type(self).calls == 1:
+            return _TruncatedResponse()
+        return _ExpandedResponse()
+
+
 @pytest.fixture()
 def qiniu_env(tmp_path: Path):
     old = {
@@ -71,6 +108,7 @@ def qiniu_env(tmp_path: Path):
         "qiniu_min_request_interval_seconds": settings.qiniu_min_request_interval_seconds,
         "qiniu_rate_limit_retries": settings.qiniu_rate_limit_retries,
         "qiniu_rate_limit_backoff_seconds": settings.qiniu_rate_limit_backoff_seconds,
+        "qiniu_json_retry_max_tokens": settings.qiniu_json_retry_max_tokens,
         "daily_ai_budget_cny": settings.daily_ai_budget_cny,
     }
     settings.db_path = str(tmp_path / "qiniu.db")
@@ -83,6 +121,7 @@ def qiniu_env(tmp_path: Path):
     settings.qiniu_min_request_interval_seconds = 0
     settings.qiniu_rate_limit_retries = 2
     settings.qiniu_rate_limit_backoff_seconds = 0
+    settings.qiniu_json_retry_max_tokens = 1600
     settings.daily_ai_budget_cny = 5
     qiniu._LAST_REQUEST_STARTED_AT = 0.0
     init_db()
@@ -108,6 +147,7 @@ def test_qiniu_agent_call_disables_thinking_uses_json_mode_and_public_price(monk
     assert _Client.last_json["max_tokens"] == 800
     assert meta["usage"]["pricing_source"] == "qiniu_public_list_price"
     assert meta["usage"]["estimated_cost_cny"] == pytest.approx(0.0032)
+    assert meta["usage"]["json_length_retry"] is False
 
 
 def test_qiniu_retries_rpm_429_before_failing_over(monkeypatch, qiniu_env):
@@ -125,3 +165,25 @@ def test_qiniu_retries_rpm_429_before_failing_over(monkeypatch, qiniu_env):
     assert result == {"ok": True}
     assert _RetryClient.calls == 2
     assert meta["provider"] == "Qiniu"
+
+
+def test_qiniu_retries_clearly_truncated_json_with_larger_token_cap(monkeypatch, qiniu_env):
+    _TruncationRetryClient.calls = 0
+    _TruncationRetryClient.bodies = []
+    monkeypatch.setattr(qiniu.httpx, "Client", _TruncationRetryClient)
+
+    result, meta = qiniu.chat_json_with_meta(
+        operation="opportunity_agent_product",
+        system="Return JSON",
+        payload={"hello": "world"},
+        max_new_tokens=800,
+    )
+
+    assert result == {"recommended_products": [{"name": "starter"}]}
+    assert _TruncationRetryClient.calls == 2
+    assert _TruncationRetryClient.bodies[0]["max_tokens"] == 800
+    assert _TruncationRetryClient.bodies[1]["max_tokens"] == 1600
+    assert meta["usage"]["json_length_retry"] is True
+    assert meta["usage"]["prompt_tokens"] == 1400
+    assert meta["usage"]["completion_tokens"] == 1100
+    assert meta["usage"]["total_tokens"] == 2500

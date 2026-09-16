@@ -1,6 +1,7 @@
 param(
     [string]$BaseUrl = "http://127.0.0.1:8080",
     [ValidateRange(1, 20)] [int]$Limit = 8,
+    [ValidateRange(1, 8)] [int]$RefreshQueriesPerProbe = 3,
     [ValidateRange(1, 30)] [int]$PollSeconds = 3,
     [ValidateRange(30, 1800)] [int]$TimeoutSeconds = 900
 )
@@ -9,13 +10,29 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
+Add-Type -AssemblyName System.Net.Http
+$script:HttpClient = New-Object System.Net.Http.HttpClient
+
 function Invoke-JsonApi {
     param([ValidateSet("GET", "POST")][string]$Method, [string]$Path)
     $uri = "$BaseUrl$Path"
+    $httpMethod = if ($Method -eq "POST") { [System.Net.Http.HttpMethod]::Post } else { [System.Net.Http.HttpMethod]::Get }
+    $request = New-Object System.Net.Http.HttpRequestMessage($httpMethod, $uri)
     if ($Method -eq "POST") {
-        return Invoke-RestMethod -Method Post -Uri $uri -ContentType "application/json"
+        $request.Content = New-Object System.Net.Http.StringContent("", [System.Text.Encoding]::UTF8, "application/json")
     }
-    return Invoke-RestMethod -Method Get -Uri $uri
+    try {
+        $response = $script:HttpClient.SendAsync($request).GetAwaiter().GetResult()
+        $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        if (-not $response.IsSuccessStatusCode) {
+            throw "HTTP $([int]$response.StatusCode) $($response.ReasonPhrase): $text"
+        }
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        return $text | ConvertFrom-Json
+    } finally {
+        $request.Dispose()
+    }
 }
 
 function To-Number($Value) {
@@ -24,7 +41,7 @@ function To-Number($Value) {
 }
 
 Write-Host "===== DIGITAL GOODS V1.2.1 REAL REBUILD ACCEPTANCE =====" -ForegroundColor Cyan
-Write-Host "BaseUrl=$BaseUrl Limit=$Limit"
+Write-Host "BaseUrl=$BaseUrl Limit=$Limit RefreshQueriesPerProbe=$RefreshQueriesPerProbe"
 
 Write-Host "`n[1/6] Service identity + health" -ForegroundColor Yellow
 $openapi = Invoke-JsonApi -Method GET -Path "/openapi.json"
@@ -50,7 +67,7 @@ $preCost = $null
 try { $preCost = Invoke-JsonApi -Method GET -Path "/api/ai/cost?limit=1" } catch { Write-Warning $_.Exception.Message }
 
 Write-Host "`n[3/6] Start real refresh + rebuild + multi-agent" -ForegroundColor Yellow
-$rebuild = Invoke-JsonApi -Method POST -Path "/api/opportunities/rebuild?analyze=true&refresh=true&limit=$Limit"
+$rebuild = Invoke-JsonApi -Method POST -Path "/api/opportunities/rebuild?analyze=true&refresh=true&limit=$Limit&refresh_queries_per_probe=$RefreshQueriesPerProbe"
 $taskId = [int]$rebuild.task_id
 Write-Host "task_id=$taskId concurrency=$($rebuild.concurrency)"
 

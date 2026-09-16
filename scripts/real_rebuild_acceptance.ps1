@@ -48,6 +48,13 @@ function To-FlatArray($Value) {
     return @($Value)
 }
 
+function Try-Parse-DateTimeOffset($Value) {
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse([string]$Value, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
 Write-Host "===== DIGITAL GOODS V1.2.1 REAL REBUILD ACCEPTANCE =====" -ForegroundColor Cyan
 Write-Host "BaseUrl=$BaseUrl Limit=$Limit RefreshQueriesPerProbe=$RefreshQueriesPerProbe InspectTaskId=$InspectTaskId SkipRefresh=$SkipRefresh"
 
@@ -94,6 +101,9 @@ if ($InspectTaskId -gt 0) {
     } while ($task.status -in @("PENDING", "RUNNING"))
 }
 
+$taskStartedAt = Try-Parse-DateTimeOffset $task.created_at
+$taskEndedAt = Try-Parse-DateTimeOffset $task.updated_at
+
 Write-Host "`n[4/6] Rebuild result" -ForegroundColor Yellow
 $result = $task.result
 $discovery = $result.demand_discovery
@@ -136,8 +146,16 @@ foreach ($item in $analysisItems) {
 
     $runs = @()
     try {
-        $rawRuns = Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/agent-runs?limit=20"
+        $rawRuns = Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/agent-runs?limit=50"
         $runs = @(To-FlatArray $rawRuns)
+        if ($null -ne $taskStartedAt -and $null -ne $taskEndedAt) {
+            $runs = @(
+                $runs | Where-Object {
+                    $created = Try-Parse-DateTimeOffset $_.created_at
+                    ($null -eq $created) -or ($created -ge $taskStartedAt -and $created -le $taskEndedAt.AddSeconds(2))
+                }
+            )
+        }
     } catch {
         Write-Warning "Cannot read agent runs for opportunity ${oid}: $($_.Exception.Message)"
     }
@@ -194,7 +212,7 @@ if ($agentFailures.Count) {
     $agentFailures | Sort-Object OpportunityId,Agent | Format-Table -Wrap -AutoSize
 }
 if ($runRows.Count) {
-    Write-Host "`nLatest agent usage:" -ForegroundColor DarkYellow
+    Write-Host "`nLatest agent usage (current rebuild task only):" -ForegroundColor DarkYellow
     $runRows | Select-Object OpportunityId,Agent,Status,Provider,Model,PromptTokens,CompletionTokens,TotalTokens,DurationMs | Format-Table -AutoSize
     $tokenTotal = ($runRows | ForEach-Object { To-Number $_.TotalTokens } | Measure-Object -Sum).Sum
     $durationTotalMs = ($runRows | ForEach-Object { To-Number $_.DurationMs } | Measure-Object -Sum).Sum

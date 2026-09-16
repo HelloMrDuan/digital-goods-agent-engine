@@ -108,7 +108,7 @@ def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict
         return {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
 
 
-def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enabled: bool) -> None:
+def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enabled: bool, refresh_queries_per_probe: int) -> None:
     results: list[dict[str, Any]] = []
     discovery_result: dict[str, Any] | None = None
     try:
@@ -120,7 +120,27 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 stage="刷新真实需求",
                 message="正在用高意图关键词矩阵刷新小红书/Reddit最近30天真实需求",
             )
-            discovery_result = run_demand_discovery()
+            def refresh_progress(event: dict[str, Any]) -> None:
+                completed = int(event.get("completed_queries") or 0)
+                total_queries = max(1, int(event.get("total_queries") or 1))
+                progress = min(9, 3 + int(completed / total_queries * 6))
+                platform = str(event.get("platform") or "")
+                query = str(event.get("query") or "")
+                fetched = int(event.get("fetched") or 0)
+                error = event.get("error")
+                status_text = f"失败: {str(error)[:100]}" if error else f"返回 {fetched} 条"
+                _update_rebuild(
+                    task_id,
+                    progress=progress,
+                    stage=f"刷新真实需求 {completed}/{total_queries}",
+                    message=f"{platform} | {query} | {status_text}",
+                )
+
+            discovery_result = run_demand_discovery(
+                max_queries_per_probe=refresh_queries_per_probe,
+                query_timeout_seconds=60,
+                progress_callback=refresh_progress,
+            )
             _update_rebuild(
                 task_id,
                 progress=10,
@@ -297,6 +317,7 @@ def opportunities_rebuild(
     analyze: bool = True,
     refresh: bool = True,
     limit: int = Query(default=8, ge=1, le=20),
+    refresh_queries_per_probe: int = Query(default=3, ge=1, le=8),
 ):
     _ensure_rebuild_schema()
     if analyze and not settings.is_llm_configured:
@@ -310,13 +331,14 @@ def opportunities_rebuild(
             ("PENDING", 0, "排队", "等待刷新真实需求并重建", 1 if analyze else 0, 1 if refresh else 0, limit, now, now),
         )
     task_id = int(cur.lastrowid)
-    threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit, refresh), daemon=True).start()
+    threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit, refresh, refresh_queries_per_probe), daemon=True).start()
     return {
         "task_id": task_id,
         "status": "PENDING",
         "analyze": analyze,
         "refresh": refresh,
         "limit": limit,
+        "refresh_queries_per_probe": refresh_queries_per_probe,
         "concurrency": _rebuild_worker_count(limit) if analyze else 0,
     }
 

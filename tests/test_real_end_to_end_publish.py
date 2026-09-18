@@ -275,3 +275,48 @@ def test_publish_refuses_currency_mismatch_without_explicit_price(monkeypatch):
 
     with pytest.raises(ValueError, match="differs from Etsy shop currency"):
         publishing.publish_to_etsy(product_id, client=_FakeEtsyClient())
+
+
+
+class _FakeXianyuBridge:
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        assert url.endswith("/xianyu/publish")
+        payload = kwargs["json"]
+        assert payload["price"] == 29.0
+        assert payload["condition"] == "全新"
+        assert payload["category"] == "办公模板"
+        assert payload["images_base64"]
+        assert "虚拟数字商品" in payload["description"]
+        return _FakeResponse({"status": "SUCCESS", "result": {"item_id": 1234567890123}})
+
+
+def test_approved_real_package_publishes_to_real_xianyu_bridge(monkeypatch):
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    assert evaluate_gate_b(product_id)["decision"] == "PASS"
+    assert approve_product(product_id)["status"] == "APPROVED"
+
+    monkeypatch.setattr(settings, "agent_reach_bridge_url", "http://host.docker.internal:8765")
+    monkeypatch.setattr(settings, "xianyu_publish_category", "办公模板")
+    monkeypatch.setattr(settings, "xianyu_publish_condition", "全新")
+    fake = _FakeXianyuBridge()
+
+    result = publishing.publish_to_xianyu(product_id, client=fake)
+
+    assert result["status"] == "SUCCESS"
+    assert result["platform"] == "xianyu"
+    assert result["external_id"] == "1234567890123"
+    assert result["external_url"].endswith("id=1234567890123")
+    with conn() as c:
+        product = c.execute(
+            "SELECT status,published_platform,external_listing_id FROM products WHERE id=?",
+            (product_id,),
+        ).fetchone()
+    assert product["status"] == "PUBLISHED"
+    assert product["published_platform"] == "xianyu"
+    assert product["external_listing_id"] == "1234567890123"

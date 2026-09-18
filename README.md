@@ -63,3 +63,13 @@ node --check web/app.js
 ```
 
 关键配置见 [.env.example](.env.example)，升级步骤见 [UPGRADE_FROM_V1133.md](UPGRADE_FROM_V1133.md)。
+
+
+## 闲鱼真实市场与上架
+
+- Market Intel 使用 OpenCLI 的 Xianyu Browser Adapter，要求 Chrome 已登录 `goofish.com`。
+- 系统先执行真实搜索，再读取商品详情；只有详情明确出现“虚拟商品 / 电子版 / 无需物流 / 数字下载”等数字交付证据的商品才进入 Market Intel。
+- 闲鱼搜索结果位置记录为真实搜索排名；价格、想要数等只在页面明确暴露时记录，不推测销量。
+- 真上架通过本机 Agent-Reach Bridge 调用 `opencli xianyu publish`。默认桥接器只读；要允许发布必须在运行 bridge 的主机显式设置 `AGENT_REACH_BRIDGE_ALLOW_WRITES=true`。
+- 服务端还必须配置 `XIANYU_PUBLISH_CATEGORY`，否则发布接口明确拒绝，不伪造成功。
+- 闲鱼官方 TOP 订单/虚拟发货能力属于定向合作方能力，官方要求对应 AppKey/API 权限及聚石塔部署；未具备这些条件时系统只报告 NOT_CONFIGURED，不冒充自动发货已接通。

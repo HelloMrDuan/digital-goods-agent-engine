@@ -99,3 +99,15 @@ def test_full_flow_readiness_route_is_exposed():
         for method in route.methods
     }
     assert ("/api/flow/readiness", "GET") in paths
+
+
+
+def test_xianyu_market_and_publish_routes_are_exposed():
+    paths = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert ("/api/publish/xianyu/status", "GET") in paths
+    assert ("/api/products/{product_id}/publish/xianyu", "POST") in paths

@@ -28,7 +28,7 @@ from .services.product_lifecycle import approve_product, evaluate_gate_b, get_ga
 from .services.asset_registry import create_source_asset, get_source_asset, link_product_asset, list_product_assets, list_source_assets, product_asset_readiness, unlink_product_asset, update_source_asset
 from .services.market_intel import list_market_intel, market_intel_for_opportunity, market_intel_summary, rematch_market_intel
 from .services.product_builder import build_product_artifact, latest_successful_bundle, list_product_builds
-from .services.publishing import etsy_status, list_publish_runs, publish_to_etsy
+from .services.publishing import etsy_status, list_publish_runs, publish_to_etsy, publish_to_xianyu, xianyu_status
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -87,6 +87,7 @@ def health() -> dict[str, Any]:
         "market_intel_high_sales_score": settings.market_intel_high_sales_score,
         "artifact_generation_enabled": True,
         "etsy_publishing": etsy_status(),
+        "xianyu_publishing": xianyu_status(),
         "db": settings.db_path,
     }
 
@@ -119,6 +120,7 @@ def flow_readiness() -> dict[str, Any]:
         published_products = int(c.execute("SELECT COUNT(*) c FROM products WHERE status='PUBLISHED'").fetchone()["c"])
 
     etsy = etsy_status()
+    xianyu = xianyu_status()
     stages = {
         "real_demand": {
             "configured": bool(enabled_p0),
@@ -146,13 +148,20 @@ def flow_readiness() -> dict[str, Any]:
             **etsy,
             "published_product_count": published_products,
         },
+        "xianyu_publish": {
+            **xianyu,
+            "published_product_count": published_products,
+        },
     }
     return {
         "auto_collect_enabled": settings.auto_collect_enabled,
         "auto_collect_interval_minutes": settings.auto_collect_interval_minutes,
         "stages": stages,
         "discovery_ready": bool(enabled_p0 and market_sources and settings.is_llm_configured),
-        "full_publish_ready": bool(enabled_p0 and market_sources and settings.is_llm_configured and etsy.get("configured")),
+        "full_publish_ready": bool(
+            enabled_p0 and market_sources and settings.is_llm_configured
+            and (etsy.get("configured") or xianyu.get("configured"))
+        ),
         "truth_policy": "A stage is not marked configured/ready when its real login, provider, or publishing credentials are missing.",
     }
 
@@ -857,6 +866,11 @@ def publish_etsy_status():
     return etsy_status()
 
 
+@app.get("/api/publish/xianyu/status")
+def publish_xianyu_status():
+    return xianyu_status()
+
+
 @app.get("/api/products/{product_id}/publish-runs")
 def product_publish_runs(product_id: int, limit: int = Query(default=20, ge=1, le=100)):
     if not get_product(product_id):
@@ -889,6 +903,26 @@ def product_publish_etsy(
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:2000] if exc.response is not None else str(exc)
         raise HTTPException(502, f"Etsy API error: {detail}")
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/products/{product_id}/publish/xianyu")
+def product_publish_xianyu(
+    product_id: int,
+    price: float | None = Query(default=None, gt=0),
+    category: str | None = Query(default=None, min_length=1, max_length=100),
+    condition: str | None = Query(default=None, min_length=2, max_length=20),
+):
+    try:
+        return publish_to_xianyu(product_id, price=price, category=category, condition=condition)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        raise HTTPException(502, f"Xianyu bridge error: {detail}")
     except Exception as exc:
         raise HTTPException(502, str(exc))
 

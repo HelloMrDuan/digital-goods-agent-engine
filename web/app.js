@@ -222,7 +222,7 @@ async function renderMarket() {
     return `<article class="evidence-card">
       <div class="source-top"><div><strong>${esc(item.title)}</strong><div class="source-meta">${esc(item.marketplace)} · ${esc(item.seller || "seller unknown")}</div></div><div>${badges}</div></div>
       <div class="metric-row"><span class="metric-chip">热度 ${n(item.heat_score,1)}</span><span class="metric-chip">销量分 ${item.sales_score == null ? "—" : n(item.sales_score,1)}</span><span class="metric-chip">销量 ${sales}</span><span class="metric-chip">榜单 #${n(item.rank_position)}</span><span class="metric-chip">市场分 ${n(item.market_score,1)}</span></div>
-      <div class="source-meta">评论 ${n(item.review_count)} · 收藏 ${n(item.favorites_count)} · 浏览 ${n(item.views_count)} · 评分 ${item.metric_availability?.rating ? n(item.rating,1) : "未公开"} · 评分基础 ${esc(item.score_basis || "heat_only")}</div>
+      <div class="source-meta">评论 ${n(item.review_count)} · 收藏 ${n(item.favorites_count)} · 想要 ${n(item.metrics?.want_count)} · 浏览 ${n(item.views_count)} · 评分 ${item.metric_availability?.rating ? n(item.rating,1) : "未公开"} · 评分基础 ${esc(item.score_basis || "heat_only")}</div>
       ${item.source_url ? `<a class="evidence-link" href="${esc(safeUrl(item.source_url))}" target="_blank" rel="noreferrer">打开市场商品</a>` : ""}
     </article>`;
   }).join("");
@@ -255,7 +255,7 @@ async function renderProducts() {
       ? `<button class="btn primary" onclick="approveProduct(${Number(item.id)})">人工批准</button>`
       : "";
     const publish = ["APPROVED", "PUBLISH_DRAFT"].includes(String(item.status || "").toUpperCase())
-      ? `<button class="btn primary" onclick="publishEtsy(${Number(item.id)})">发布 Etsy</button>`
+      ? `<button class="btn primary" onclick="publishEtsy(${Number(item.id)})">发布 Etsy</button><button class="btn primary" onclick="publishXianyu(${Number(item.id)})">发布闲鱼</button>`
       : "";
     const download = latestBuild?.status === "SUCCESS"
       ? `<button class="btn ghost" onclick="downloadArtifact(${Number(item.id)})">下载商品包</button>`
@@ -351,6 +351,7 @@ async function runGateB(id) { await mutate(`/api/products/${id}/gate-b`, "Gate B
 async function approveProduct(id) { await mutate(`/api/products/${id}/approve`, "商品已批准"); }
 async function buildArtifact(id) { await mutate(`/api/products/${id}/build-artifact`, "真实商品包已生成"); }
 async function publishEtsy(id) { await mutate(`/api/products/${id}/publish/etsy`, "Etsy 商品已发布"); }
+async function publishXianyu(id) { await mutate(`/api/products/${id}/publish/xianyu`, "闲鱼商品已发布"); }
 function downloadArtifact(id) { window.open(`/api/products/${id}/artifact/download`, "_blank"); }
 
 async function analyzeOpportunity(id) {
@@ -458,6 +459,7 @@ window.runGateB = runGateB;
 window.approveProduct = approveProduct;
 window.buildArtifact = buildArtifact;
 window.publishEtsy = publishEtsy;
+window.publishXianyu = publishXianyu;
 window.downloadArtifact = downloadArtifact;
 window.openOpportunity = openOpportunity;
 window.openProduct = openProduct;

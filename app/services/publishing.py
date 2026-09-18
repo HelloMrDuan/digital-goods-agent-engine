@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import textwrap
@@ -13,6 +14,7 @@ from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .product_builder import latest_successful_bundle
 from .product_lifecycle import get_product, require_approved_current_product
+from ..collectors.agent_reach import doctor as agent_reach_doctor, publish_xianyu_listing
 
 
 ETSY_BASE_URL = "https://api.etsy.com/v3/application"
@@ -281,3 +283,215 @@ def publish_to_etsy(
     finally:
         if own_client:
             http.close()
+
+
+
+def _extract_xianyu_item_id(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("item_id", "itemId", "id"):
+            raw = value.get(key)
+            if raw not in (None, "") and str(raw).isdigit():
+                return str(raw)
+        for child in value.values():
+            found = _extract_xianyu_item_id(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _extract_xianyu_item_id(child)
+            if found:
+                return found
+    return None
+
+
+def xianyu_partner_order_status() -> dict[str, Any]:
+    values = {
+        "XIANYU_TOP_APP_KEY": settings.xianyu_top_app_key,
+        "XIANYU_TOP_APP_SECRET": settings.xianyu_top_app_secret,
+        "XIANYU_TOP_ACCESS_TOKEN": settings.xianyu_top_access_token,
+        "XIANYU_TOP_BIZ_CODE": settings.xianyu_top_biz_code,
+    }
+    missing = [name for name, value in values.items() if not str(value or "").strip()]
+    return {
+        "configured": not missing,
+        "missing": missing,
+        "mode": "OFFICIAL_TOP_PARTNER_API",
+        "deployment_requirement": "JuShiTa",
+        "note": "Only enable after Xianyu partner invitation and API permission approval.",
+    }
+
+
+def xianyu_status(client: httpx.Client | Any | None = None) -> dict[str, Any]:
+    missing = []
+    if not settings.xianyu_publish_category.strip():
+        missing.append("XIANYU_PUBLISH_CATEGORY")
+    if settings.xianyu_shop_currency.upper() != "CNY":
+        missing.append("XIANYU_SHOP_CURRENCY=CNY")
+
+    bridge = settings.agent_reach_bridge_url.strip().rstrip("/")
+    if bridge:
+        own = client is None
+        http = client or httpx.Client(
+            timeout=8.0,
+            headers={
+                **({"Authorization": f"Bearer {settings.agent_reach_bridge_token}"} if settings.agent_reach_bridge_token else {})
+            },
+        )
+        try:
+            response = http.get(bridge + "/xianyu/status")
+            response.raise_for_status()
+            remote = response.json()
+        except Exception as exc:
+            remote = {"configured": False, "error": str(exc)}
+        finally:
+            if own:
+                http.close()
+        return {
+            "configured": bool(not missing and remote.get("configured")),
+            "missing": missing,
+            "mode": "OPENCLI_AUTHENTICATED_BROWSER",
+            "bridge": remote,
+            "requires_login": "Chrome must be logged into goofish.com",
+            "official_order_api": xianyu_partner_order_status(),
+        }
+
+    info = agent_reach_doctor()
+    channel = (info.get("channels") or {}).get("xianyu") or {}
+    opencli = info.get("opencli") or {}
+    connected = bool(channel.get("opencli_connected") or opencli.get("connected"))
+    return {
+        "configured": bool(not missing and connected),
+        "missing": missing,
+        "mode": "OPENCLI_AUTHENTICATED_BROWSER_LOCAL",
+        "opencli_connected": connected,
+        "requires_login": "Chrome must be logged into goofish.com",
+        "official_order_api": xianyu_partner_order_status(),
+    }
+
+
+def publish_to_xianyu(
+    product_id: int,
+    *,
+    price: float | None = None,
+    category: str | None = None,
+    condition: str | None = None,
+    client: httpx.Client | Any | None = None,
+) -> dict[str, Any]:
+    product = require_approved_current_product(product_id)
+    latest_successful_bundle(product_id)
+    product_currency = str(product.get("price_currency") or settings.default_product_currency).upper()
+    if product_currency != "CNY":
+        raise ValueError("Xianyu publishing currently requires a CNY product price")
+
+    publish_price = float(price if price is not None else product.get("price_suggestion"))
+    if publish_price <= 0:
+        raise ValueError("Xianyu publish price must be greater than zero")
+    publish_category = str(category or settings.xianyu_publish_category).strip()
+    publish_condition = str(condition or settings.xianyu_publish_condition).strip()
+    if not publish_category:
+        raise ValueError("Xianyu publishing is not configured: missing XIANYU_PUBLISH_CATEGORY")
+    if publish_condition not in {"全新", "几乎全新", "轻微使用", "明显使用", "老旧"}:
+        raise ValueError("unsupported Xianyu condition")
+
+    with conn() as c:
+        previous = c.execute(
+            "SELECT * FROM publish_runs WHERE product_id=? AND platform='xianyu' AND status='SUCCESS' ORDER BY id DESC LIMIT 1",
+            (product_id,),
+        ).fetchone()
+    if previous:
+        item = row_to_dict(previous) or {}
+        item["response"] = loads(item.pop("response_json", None), {}) or {}
+        return item
+
+    created_at = now_iso()
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO publish_runs(
+                   product_id,platform,status,stage,external_id,external_url,response_json,error,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (product_id, "xianyu", "RUNNING", "PUBLISH_BROWSER", None, None, None, None, created_at, created_at),
+        )
+        run_id = int(cur.lastrowid)
+
+    cover = _cover_image(product)
+    image_b64 = base64.b64encode(cover.read_bytes()).decode("ascii")
+    title = str(product.get("title") or product.get("name") or "").strip()
+    description = str(product.get("description") or "").strip()
+    description = (
+        description
+        + "\n\n【交付说明】虚拟数字商品，无实物物流；交付内容为系统生成并经 Gate B 审核的原创数字文件。"
+    ).strip()
+    response_payload: dict[str, Any] = {}
+    try:
+        bridge = settings.agent_reach_bridge_url.strip().rstrip("/")
+        if bridge:
+            own = client is None
+            http = client or httpx.Client(
+                timeout=210.0,
+                headers={
+                    "Content-Type": "application/json",
+                    **({"Authorization": f"Bearer {settings.agent_reach_bridge_token}"} if settings.agent_reach_bridge_token else {}),
+                },
+            )
+            try:
+                response = http.post(
+                    bridge + "/xianyu/publish",
+                    json={
+                        "title": title,
+                        "description": description,
+                        "price": publish_price,
+                        "condition": publish_condition,
+                        "category": publish_category,
+                        "images_base64": [image_b64],
+                    },
+                )
+                response.raise_for_status()
+                response_payload = response.json()
+            finally:
+                if own:
+                    http.close()
+        else:
+            response_payload = {
+                "status": "SUCCESS",
+                "result": publish_xianyu_listing(
+                    title, description, publish_price, publish_condition, publish_category, [str(cover)]
+                ),
+            }
+
+        item_id = _extract_xianyu_item_id(response_payload)
+        if not item_id:
+            raise ValueError("Xianyu publish returned no verifiable item_id; product was not marked published")
+        external_url = f"https://www.goofish.com/item?categoryId=0&id={item_id}"
+        finished_at = now_iso()
+        with conn() as c:
+            c.execute(
+                """UPDATE publish_runs SET status='SUCCESS',stage='ACTIVE',external_id=?,external_url=?,
+                          response_json=?,error=NULL,updated_at=? WHERE id=?""",
+                (item_id, external_url, dumps(response_payload), finished_at, run_id),
+            )
+            c.execute(
+                """UPDATE products SET status='PUBLISHED',published_at=?,published_platform='xianyu',
+                          external_listing_id=?,external_listing_url=?,updated_at=? WHERE id=?""",
+                (finished_at, item_id, external_url, finished_at, product_id),
+            )
+            c.execute(
+                "UPDATE opportunities SET status='PUBLISHED',updated_at=? WHERE id=?",
+                (finished_at, int(product["opportunity_id"])),
+            )
+        return {
+            "run_id": run_id,
+            "product_id": product_id,
+            "platform": "xianyu",
+            "status": "SUCCESS",
+            "state": "active",
+            "external_id": item_id,
+            "external_url": external_url,
+            "response": response_payload,
+        }
+    except Exception as exc:
+        with conn() as c:
+            c.execute(
+                "UPDATE publish_runs SET status='FAILED',response_json=?,error=?,updated_at=? WHERE id=?",
+                (dumps(response_payload), str(exc), now_iso(), run_id),
+            )
+        raise

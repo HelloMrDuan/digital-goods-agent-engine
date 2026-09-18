@@ -29,6 +29,7 @@ def _scores(metrics: dict[str, Any]) -> tuple[float, float | None, float]:
     rank = _num(metrics.get("rank_position"))
     views = _log_score(_num(metrics.get("views_count")), 100000.0)
     favorites = _log_score(_num(metrics.get("favorites_count")), 10000.0)
+    wants = _log_score(_num(metrics.get("want_count")), 10000.0)
     reviews = _log_score(_num(metrics.get("review_count")), 3000.0)
     rating = _num(metrics.get("rating"))
     components: list[tuple[float, float]] = []
@@ -38,6 +39,8 @@ def _scores(metrics: dict[str, Any]) -> tuple[float, float | None, float]:
         components.append((views, 0.20))
     if favorites is not None:
         components.append((favorites, 0.15))
+    if wants is not None:
+        components.append((wants, 0.15))
     if reviews is not None:
         # Review count is a real observed metric and can stand on its own.
         components.append((reviews, 0.15))
@@ -254,6 +257,7 @@ def _decode(row: Any) -> dict[str, Any]:
         "rating": data.get("rating") is not None,
         "review_count": data.get("review_count") is not None,
         "favorites_count": data.get("favorites_count") is not None,
+        "want_count": data.get("metrics", {}).get("want_count") is not None,
         "views_count": data.get("views_count") is not None,
         "sales": bool(data.get("sales_verified")) and data.get("sales_count") is not None,
         "sales_scope": data.get("sales_scope"),

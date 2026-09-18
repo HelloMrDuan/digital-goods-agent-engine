@@ -16,6 +16,7 @@ from ..collectors import (
     collect_youtube,
     collect_creative_market,
     collect_etsy_market,
+    collect_xianyu_market,
 )
 from ..collectors.base import CollectorError
 from ..config import settings
@@ -193,6 +194,10 @@ def _dispatch(source: dict[str, Any], config: dict[str, Any], limit: int):
         if not source.get("query"):
             raise CollectorError("Etsy market source missing query")
         return collect_etsy_market(str(source["query"]), limit=limit)
+    if t == "xianyu_market":
+        if not source.get("query"):
+            raise CollectorError("Xianyu market source missing query")
+        return collect_xianyu_market(str(source["query"]), limit=limit)
     raise CollectorError(f"unsupported source_type: {t}")
 
 
@@ -437,6 +442,9 @@ def bootstrap_sources() -> dict[str, int]:
         {"name":"Creative Market - Bestselling Templates","source_type":"creative_market","platform":"creative_market","url":"https://creativemarket.com/templates-themes/popular","config":cfg("market","P1","market_intel",180,ranking="bestseller",limit=40),"enabled":True},
         {"name":"Creative Market - Trending Templates","source_type":"creative_market","platform":"creative_market","url":"https://creativemarket.com/templates-themes/trending","config":cfg("market","P1","market_intel",180,ranking="trending",limit=40),"enabled":True},
         {"name":"Etsy - Digital Template Market","source_type":"etsy_market","platform":"etsy","query":"digital download template","config":cfg("market","P1","market_intel",240,limit=30,digital_only=True),"enabled":True},
+        {"name":"闲鱼 - Excel数字模板","source_type":"xianyu_market","platform":"xianyu","query":"Excel模板 电子版","config":cfg("market","P1","market_intel",180,limit=30,digital_only=True,requires_login=True),"enabled":True},
+        {"name":"闲鱼 - 简历数字模板","source_type":"xianyu_market","platform":"xianyu","query":"简历模板 电子版","config":cfg("market","P1","market_intel",180,limit=30,digital_only=True,requires_login=True),"enabled":True},
+        {"name":"闲鱼 - 自动化数字工具","source_type":"xianyu_market","platform":"xianyu","query":"自动化脚本 虚拟商品","config":cfg("market","P1","market_intel",180,limit=30,digital_only=True,requires_login=True),"enabled":True},
 
         # P2: supply intelligence; useful for finding reusable/open-source building blocks, never demand.
         {"name":"GitHub - automation templates","source_type":"github","platform":"github","query":"automation template in:name,description","config":cfg("supply","P2","supply_intel",360,mode="repositories",limit=50),"enabled":True},

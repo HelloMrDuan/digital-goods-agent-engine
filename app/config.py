@@ -119,6 +119,17 @@ class Settings(BaseSettings):
     etsy_who_made: str = "i_did"
     etsy_when_made: str = "made_to_order"
 
+    # Real Xianyu publishing through the authenticated OpenCLI browser bridge.
+    xianyu_publish_category: str = ""
+    xianyu_publish_condition: str = "全新"
+    xianyu_shop_currency: str = "CNY"
+
+    # Official Xianyu partner order APIs are invitation-only and require JuShiTa deployment.
+    xianyu_top_app_key: str = ""
+    xianyu_top_app_secret: str = ""
+    xianyu_top_access_token: str = ""
+    xianyu_top_biz_code: str = ""
+
     auto_collect_enabled: bool = True
     auto_collect_interval_minutes: int = 180
 

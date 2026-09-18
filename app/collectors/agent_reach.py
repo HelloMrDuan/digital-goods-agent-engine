@@ -145,6 +145,11 @@ def doctor() -> dict[str, Any]:
                         "effective_backend": "OpenCLI Browser Bridge",
                         "opencli_connected": opencli.get("connected", False),
                     },
+                    "xianyu": {
+                        "effective_status": "ok",
+                        "effective_backend": "OpenCLI Browser Bridge",
+                        "opencli_connected": opencli.get("connected", False),
+                    },
                 },
                 "opencli": opencli,
             }
@@ -179,7 +184,7 @@ def doctor() -> dict[str, Any]:
         }
 
         if opencli.get("connected"):
-            for platform in ("xiaohongshu", "reddit"):
+            for platform in ("xiaohongshu", "reddit", "xianyu"):
                 info = dict(effective.get(platform) or {})
                 info["effective_status"] = "ok"
                 info["effective_backend"] = "OpenCLI Browser Bridge"
@@ -293,7 +298,7 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
     if not title:
         return None
 
-    item_id = _first(raw, "id", "note_id", "noteId", "post_id", "postId", "video_id", "videoId", "aweme_id", "mid", "bvid", "aid")
+    item_id = _first(raw, "id", "item_id", "itemId", "note_id", "noteId", "post_id", "postId", "video_id", "videoId", "aweme_id", "mid", "bvid", "aid")
     url = _first(raw, "url", "link", "web_url", "share_url", "note_url", "permalink", "webpage_url")
     if platform == "xiaohongshu" and not url and item_id:
         token = _first(raw, "xsec_token", "xsecToken")
@@ -304,6 +309,8 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
         url = "https://www.reddit.com" + str(url)
     elif platform == "reddit" and not url and item_id:
         url = f"https://www.reddit.com/comments/{item_id}/"
+    elif platform == "xianyu" and not url and item_id:
+        url = f"https://www.goofish.com/item?categoryId=0&id={item_id}"
     elif platform == "bilibili" and not url and item_id:
         sid = str(item_id)
         url = f"https://www.bilibili.com/video/{sid}" if sid.upper().startswith("BV") else f"https://www.bilibili.com/video/av{sid}"
@@ -313,7 +320,7 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
     if not url and item_id is None:
         return None
 
-    author_raw = _first(raw, "author", "user", "owner", "nickname", "username", "user_name", "channel", "uploader")
+    author_raw = _first(raw, "author", "seller", "seller_name", "sellerName", "user", "owner", "nickname", "username", "user_name", "channel", "uploader")
     if isinstance(author_raw, dict):
         author_raw = _first(author_raw, "name", "nickname", "username", "login", "user_name")
 
@@ -362,6 +369,7 @@ def _channel_info(status: dict[str, Any], platform: str) -> dict[str, Any]:
         aliases = {
             "xiaohongshu": ("xiaohongshu", "xhs", "小红书"),
             "reddit": ("reddit",),
+            "xianyu": ("xianyu", "闲鱼", "goofish"),
             "bilibili": ("bilibili", "bili", "b站"),
             "youtube": ("youtube",),
             "github": ("github",),
@@ -398,6 +406,9 @@ def _commands(platform: str, query: str, limit: int, active_backend: str) -> lis
             cmds.append(["opencli", "reddit", "search", query, "-f", "yaml"])
         if "rdt" in b or (not b and shutil.which("rdt")):
             cmds.append(["rdt", "search", query, "--limit", str(limit), "--yaml"])
+    elif platform == "xianyu":
+        if "opencli" in b or (not b and shutil.which("opencli")):
+            cmds.append(["opencli", "xianyu", "search", query, "--limit", str(limit), "-f", "json"])
     elif platform == "bilibili":
         if "bili" in b or (not b and shutil.which("bili")):
             cmds.append(["bili", "search", query, "--type", "video", "--max", str(limit), "--yaml"])
@@ -465,6 +476,50 @@ def _comment_item(platform: str, parent: CollectedItem, raw: dict[str, Any]) -> 
         thread_url=parent.source_url,
         published_time_quality=time_quality,
     )
+
+
+def _enrich_xianyu_details(parents: list[CollectedItem], detail_limit: int) -> list[CollectedItem]:
+    if not shutil.which("opencli") or detail_limit <= 0:
+        return parents
+    out: list[CollectedItem] = []
+    for index, parent in enumerate(parents):
+        if index >= detail_limit or not parent.source_item_id:
+            out.append(parent)
+            continue
+        try:
+            body = _run(["opencli", "xianyu", "item", str(parent.source_item_id), "-f", "json"], timeout=120)
+            raws = _flatten_candidate_items(body)
+            detail = raws[0] if raws else (body if isinstance(body, dict) else {})
+            if isinstance(detail, dict) and detail:
+                merged = dict(parent.raw or {})
+                merged["_xianyu_detail_verified"] = True
+                merged["_xianyu_detail"] = detail
+                detail_title = _first(detail, "title", "name")
+                detail_text = _first(detail, "content", "description", "desc", "text")
+                detail_author = _first(detail, "seller", "seller_name", "sellerName", "nick", "nickname")
+                if isinstance(detail_author, dict):
+                    detail_author = _first(detail_author, "name", "nick", "nickname", "user_name")
+                out.append(CollectedItem(
+                    platform=parent.platform,
+                    source_type=parent.source_type,
+                    source_item_id=parent.source_item_id,
+                    source_url=parent.source_url,
+                    title=str(detail_title or parent.title),
+                    content=str(detail_text or parent.content or "") or None,
+                    author=str(detail_author or parent.author) if (detail_author or parent.author) else None,
+                    published_at=parent.published_at,
+                    engagement=parent.engagement,
+                    raw=merged,
+                    content_kind=parent.content_kind,
+                    parent_source_item_id=parent.parent_source_item_id,
+                    thread_url=parent.thread_url,
+                    published_time_quality=parent.published_time_quality,
+                ))
+                continue
+        except Exception:
+            pass
+        out.append(parent)
+    return out
 
 
 def _enrich_opencli(platform: str, parents: list[CollectedItem], detail_limit: int, comments_limit: int) -> list[CollectedItem]:
@@ -562,10 +617,43 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
                     out.append(item)
             if out:
                 search_items = out[:limit]
-                if enrich and cmd[0] == "opencli" and platform in {"xiaohongshu", "reddit"}:
-                    search_items.extend(_enrich_opencli(platform, search_items, max(0, int(detail_limit)), max(0, int(comments_limit))))
+                if enrich and cmd[0] == "opencli":
+                    if platform in {"xiaohongshu", "reddit"}:
+                        search_items.extend(_enrich_opencli(platform, search_items, max(0, int(detail_limit)), max(0, int(comments_limit))))
+                    elif platform == "xianyu":
+                        search_items = _enrich_xianyu_details(search_items, max(0, int(detail_limit)))
                 return search_items
             errors.append(f"{cmd[0]} returned no parseable real items")
         except Exception as exc:
             errors.append(f"{cmd[0]}: {exc}")
     raise CollectorError("Agent-Reach real collection failed: " + " | ".join(errors))
+
+
+
+def publish_xianyu_listing(
+    title: str,
+    description: str,
+    price: float,
+    condition: str,
+    category: str,
+    image_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish a real Xianyu listing through the authenticated OpenCLI browser adapter."""
+    if not shutil.which("opencli"):
+        raise CollectorError("OpenCLI is not installed")
+    if not title.strip() or not description.strip() or float(price) <= 0 or not category.strip():
+        raise CollectorError("Xianyu publish fields are incomplete")
+    if condition not in {"全新", "几乎全新", "轻微使用", "明显使用", "老旧"}:
+        raise CollectorError("unsupported Xianyu condition")
+    cmd = [
+        "opencli", "xianyu", "publish",
+        title.strip(), description.strip(), f"{float(price):.2f}", condition, category.strip(),
+    ]
+    paths = [str(x).strip() for x in (image_paths or []) if str(x).strip()]
+    if paths:
+        cmd.extend(["--images", ",".join(paths)])
+    cmd.extend(["-f", "json"])
+    body = _run(cmd, timeout=180)
+    if isinstance(body, dict):
+        return body
+    return {"data": body}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ..config import settings
@@ -57,6 +58,7 @@ def _product_snapshot(
         product.get("title"),
         product.get("description"),
         product.get("price_suggestion"),
+        product.get("artifact_format"),
         dumps(product.get("keywords") or []),
         dumps(product.get("deliverables") or []),
         dumps(product.get("faq") or []),
@@ -138,6 +140,26 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
         severity="BLOCKER",
         reason="missing_deliverables",
     )
+    artifact_format = str(product.get("artifact_format") or "").strip().lower()
+    if artifact_format:
+        with conn() as c:
+            build_row = c.execute(
+                """SELECT bundle_path,checksum FROM product_builds
+                   WHERE product_id=? AND status='SUCCESS' ORDER BY id DESC LIMIT 1""",
+                (product_id,),
+            ).fetchone()
+        package_ready = bool(
+            build_row
+            and build_row["bundle_path"]
+            and build_row["checksum"]
+            and Path(str(build_row["bundle_path"])).is_file()
+        )
+        record(
+            "real_deliverable_package",
+            package_ready,
+            severity="BLOCKER",
+            reason="real_deliverable_package_missing",
+        )
     record(
         "faq",
         bool(product.get("faq")),

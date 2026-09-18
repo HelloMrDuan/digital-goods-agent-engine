@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from app.collectors.base import CollectedItem
-from app.collectors.marketplaces import _creative_market_product_links, _etsy_search_rows, _etsy_shop_sales
+from app.collectors import marketplaces
+from app.collectors.marketplaces import _creative_market_product_links, _etsy_listing_digital_status, _etsy_search_rows, _etsy_shop_sales, collect_etsy_market
 from app.config import settings
 from app.db import conn, init_db, now_iso
 from app.services import sources
@@ -66,6 +67,8 @@ def _market_item(
         author="high-volume-shop",
         engagement={},
         raw={
+            "digital_product_verified": True,
+            "digital_verification": "test_verified_digital",
             "market_metrics": {
                 "rank_position": rank,
                 "views_count": 25000,
@@ -225,3 +228,47 @@ def test_sales_with_unknown_scope_is_not_converted_to_sales_score(monkeypatch):
     assert row["sales_score"] is None
     assert row["high_sales"] is False
     assert row["score_basis"] == "heat_only"
+
+
+
+def test_unverified_market_item_is_rejected_before_market_intel(monkeypatch):
+    source_id = _market_source("market-unverified-physical")
+    item = _market_item("6", "Physical Planner Book", rank=1)
+    item.raw.pop("digital_product_verified", None)
+    item.raw.pop("digital_verification", None)
+    monkeypatch.setattr(sources, "_dispatch", lambda source, config, limit: [item])
+
+    result = collect_source(source_id, force=True)
+
+    assert result["market_intel_sync"]["inserted"] == 0
+    assert result["market_intel_sync"]["rejected_invalid"] == 1
+    assert list_market_intel(10) == []
+
+
+def test_etsy_digital_status_requires_explicit_digital_evidence():
+    digital_page = '<script type="application/json">{"listing_id":123,"is_digital":true}</script>'
+    physical_page = '<script type="application/json">{"listing_id":123,"is_digital":false}</script>'
+    unknown_page = '<html><body>Printable-looking product without a digital label</body></html>'
+
+    assert _etsy_listing_digital_status(digital_page, "123")[0] is True
+    assert _etsy_listing_digital_status(physical_page, "123")[0] is False
+    assert _etsy_listing_digital_status(unknown_page, "123")[0] is None
+
+
+def test_etsy_collection_keeps_only_verified_digital_listings(monkeypatch):
+    search_page = """
+    <script type="application/json">
+    {"results":[
+      {"listing_id":101,"title":"Physical Planner","is_digital":false,"price":{"amount":2000,"divisor":100,"currency_code":"USD"}},
+      {"listing_id":102,"title":"Digital Payroll Spreadsheet","is_digital":true,"price":{"amount":1500,"divisor":100,"currency_code":"USD"}}
+    ]}
+    </script>
+    """
+    monkeypatch.setattr(marketplaces, "_get", lambda url: search_page)
+
+    rows = collect_etsy_market("digital payroll template", limit=10)
+
+    assert len(rows) == 1
+    assert rows[0].source_item_id == "102"
+    assert rows[0].raw["digital_product_verified"] is True
+    assert "is_digital" in rows[0].raw["digital_verification"]

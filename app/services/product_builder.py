@@ -31,6 +31,19 @@ _MAX_FILE_CHARS = 120_000
 _MAX_ROWS_PER_SHEET = 3000
 _MAX_COLS_PER_SHEET = 80
 
+_FORMAT_EXTENSIONS = {
+    "xlsx": {".xlsx"},
+    "csv": {".csv"},
+    "markdown": {".md"},
+    "txt": {".txt"},
+    "json": {".json"},
+    "python": {".py"},
+    "javascript": {".js"},
+    "html": {".html"},
+    "css": {".css"},
+    "yaml": {".yaml", ".yml"},
+}
+
 
 def _safe_relative_path(value: Any) -> Path:
     raw = str(value or "").replace("\\", "/").strip().lstrip("/")
@@ -106,18 +119,27 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _validate_manifest(value: dict[str, Any]) -> dict[str, Any]:
+def _validate_manifest(value: dict[str, Any], expected_format: str) -> dict[str, Any]:
     files = value.get("files")
-    if not isinstance(files, list) or len(files) < 2:
-        raise ValueError("artifact generator must return at least README plus one primary file")
+    if not isinstance(files, list) or not files:
+        raise ValueError("artifact generator must return files including README.md")
     if len(files) > _MAX_FILES:
         raise ValueError("artifact generator returned too many files")
-    names = {str(item.get("path") or "").lower() for item in files if isinstance(item, dict)}
-    if "readme.md" not in names:
+    names = [str(item.get("path") or "") for item in files if isinstance(item, dict)]
+    if "readme.md" not in {name.lower() for name in names}:
         raise ValueError("artifact generator must include README.md")
     workbooks = value.get("workbooks") or []
     if not isinstance(workbooks, list):
         raise ValueError("workbooks must be an array")
+    if len(files) + len(workbooks) < 2:
+        raise ValueError("artifact generator must return README plus at least one primary deliverable")
+
+    allowed = _FORMAT_EXTENSIONS.get(expected_format)
+    if not allowed:
+        raise ValueError(f"unsupported expected artifact format: {expected_format}")
+    candidate_paths = names + [str(item.get("path") or "") for item in workbooks if isinstance(item, dict)]
+    if not any(Path(path).suffix.lower() in allowed for path in candidate_paths):
+        raise ValueError(f"artifact generator did not produce required {expected_format} deliverable")
     return value
 
 
@@ -131,8 +153,13 @@ def build_product_artifact(product_id: int) -> dict[str, Any]:
     if int(opportunity.get("analysis_stale") or 0):
         raise ValueError("opportunity analysis is stale; rebuild before producing deliverables")
 
+    artifact_format = str(product.get("artifact_format") or "").strip().lower()
+    if artifact_format not in _FORMAT_EXTENSIONS:
+        raise ValueError("product has no supported artifact_format; rerun product generation from a current BUILD card")
     evidence = get_evidence_for_opportunity(int(product["opportunity_id"]), 30)
     analysis = loads(opportunity.get("analysis_json"), {}) or {}
+    if str(analysis.get("decision") or "").upper() != "BUILD":
+        raise ValueError("current opportunity decision is not BUILD")
     payload = {
         "product": {
             "id": product_id,
@@ -145,6 +172,7 @@ def build_product_artifact(product_id: int) -> dict[str, Any]:
             "deliverables": product.get("deliverables") or [],
             "faq": product.get("faq") or [],
             "compliance_notes": product.get("compliance_notes"),
+            "artifact_format": artifact_format,
         },
         "opportunity": {
             "id": opportunity.get("id"),
@@ -184,7 +212,7 @@ def build_product_artifact(product_id: int) -> dict[str, Any]:
         payload=payload,
         max_new_tokens=max(2200, settings.qiniu_json_retry_max_tokens),
     )
-    manifest = _validate_manifest(generated)
+    manifest = _validate_manifest(generated, artifact_format)
 
     base = Path(settings.artifact_dir).expanduser().resolve()
     root = base / f"product_{product_id}"
@@ -210,6 +238,7 @@ def build_product_artifact(product_id: int) -> dict[str, Any]:
     manifest_payload = {
         "product_id": product_id,
         "sku": product.get("sku"),
+        "artifact_format": artifact_format,
         "generated_at": now_iso(),
         "files": written,
         "quality_notes": manifest.get("quality_notes") or [],

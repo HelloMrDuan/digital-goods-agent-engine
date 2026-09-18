@@ -97,7 +97,9 @@ def _ready_product() -> int:
                         "reasoning": "real demand from two independent buyers",
                         "pain_points": ["manual payroll and overtime calculation"],
                         "target_users": ["small teams"],
-                        "recommended_products": [{"name": "Payroll Workbook", "format": "xlsx"}],
+                        "primary_product": "Payroll Workbook",
+                        "recommended_products": [{"name": "Payroll Workbook", "format": "xlsx", "why": "matches demand", "deliverables": ["xlsx", "guide"]}],
+                        "price_range": {"currency": "CNY", "min": 20, "max": 50, "reason": "AI judgement"},
                     }
                 ),
                 now,
@@ -106,9 +108,9 @@ def _ready_product() -> int:
         )
         cur = c.execute(
             """INSERT INTO products(
-                   opportunity_id,sku,name,category,audience,price_suggestion,price_currency,title,description,
+                   opportunity_id,sku,name,category,audience,price_suggestion,price_currency,artifact_format,title,description,
                    keywords_json,deliverables_json,faq_json,compliance_notes,status,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 opportunity_id,
                 "DG-FLOW-001",
@@ -117,6 +119,7 @@ def _ready_product() -> int:
                 "small teams",
                 29.0,
                 "CNY",
+                "xlsx",
                 "Payroll and Overtime Workbook",
                 "Original workbook for attendance, overtime and payroll tracking.",
                 dumps(["payroll", "attendance"]),

@@ -112,6 +112,16 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     evidence = get_evidence_for_opportunity(opportunity_id, 50)
     analysis = json.loads(opp.get("analysis_json") or "{}")
     product = _validate_product_draft(generate_product(opp, evidence, analysis, chat=provider_chat_json))
+    product["name"] = str(primary_spec["name"]).strip()
+    price_range = analysis.get("price_range") if isinstance(analysis.get("price_range"), dict) else {}
+    try:
+        min_price = float(price_range.get("min"))
+        max_price = float(price_range.get("max"))
+        suggested_price = float(product["price_suggestion"])
+    except (TypeError, ValueError):
+        raise ValueError("product price must be consistent with Product Agent price_range")
+    if min_price > max_price or not (min_price <= suggested_price <= max_price):
+        raise ValueError("product price_suggestion falls outside Product Agent price_range")
     sku = f"DG-{opportunity_id:06d}-{secrets.token_hex(2).upper()}"
     now = now_iso()
     with conn() as c:

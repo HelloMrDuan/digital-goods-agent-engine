@@ -105,6 +105,9 @@ def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any
             if not title or (not source_url and not source_item_id):
                 rejected += 1
                 continue
+            if raw.get("digital_product_verified") is not True:
+                rejected += 1
+                continue
             canonical = stable_hash(getattr(item, "platform", "market"), source_item_id or source_url)
             heat_score, sales_score, market_score = _scores(metrics)
             sales_count = _num(metrics.get("sales_count"))
@@ -122,6 +125,8 @@ def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any
                 "sales_count": sales_count,
                 "sales_scope": metrics.get("sales_scope"),
                 "sales_verified": 1 if bool(metrics.get("sales_verified")) and sales_count is not None else 0,
+                "digital_verified": 1,
+                "digital_verification": raw.get("digital_verification"),
                 "review_count": _num(metrics.get("review_count")),
                 "rating": _num(metrics.get("rating")),
                 "favorites_count": _num(metrics.get("favorites_count")),
@@ -199,7 +204,7 @@ def rematch_market_intel(item_ids: list[int] | None = None) -> int:
         if item_ids:
             placeholders = ",".join("?" for _ in item_ids)
             rows = c.execute(
-                f"SELECT id,title,category FROM market_intel_items WHERE id IN ({placeholders})",
+                f"SELECT id,title,category FROM market_intel_items WHERE digital_verified=1 AND id IN ({placeholders})",
                 tuple(item_ids),
             ).fetchall()
             c.execute(
@@ -207,7 +212,7 @@ def rematch_market_intel(item_ids: list[int] | None = None) -> int:
                 tuple(item_ids),
             )
         else:
-            rows = c.execute("SELECT id,title,category FROM market_intel_items").fetchall()
+            rows = c.execute("SELECT id,title,category FROM market_intel_items WHERE digital_verified=1").fetchall()
             c.execute("DELETE FROM opportunity_market_intel")
         opportunities = c.execute(
             "SELECT id,title,normalized_need,category FROM opportunities WHERE cluster_active=1"
@@ -234,7 +239,7 @@ def rematch_market_intel(item_ids: list[int] | None = None) -> int:
 
 def _decode(row: Any) -> dict[str, Any]:
     data = row_to_dict(row) or {}
-    for key in ("sales_verified", "bestseller", "trending"):
+    for key in ("sales_verified", "digital_verified", "bestseller", "trending"):
         data[key] = bool(data.get(key))
     data["metrics"] = loads(data.pop("metrics_json", None), {}) or {}
     data.pop("raw_json", None)
@@ -264,7 +269,7 @@ def list_market_intel(
     high_sales: bool = False,
     hot_and_selling: bool = False,
 ) -> list[dict[str, Any]]:
-    where: list[str] = []
+    where: list[str] = ["digital_verified=1"]
     params: list[Any] = []
     if high_heat or hot_and_selling:
         where.append("heat_score>=?")
@@ -288,7 +293,7 @@ def market_intel_for_opportunity(opportunity_id: int, limit: int = 12) -> dict[s
             """SELECT mi.*,omi.similarity
                FROM opportunity_market_intel omi
                JOIN market_intel_items mi ON mi.id=omi.market_item_id
-               WHERE omi.opportunity_id=?
+               WHERE omi.opportunity_id=? AND mi.digital_verified=1
                ORDER BY mi.market_score DESC,omi.similarity DESC
                LIMIT ?""",
             (opportunity_id, max(1, min(limit, 50))),
@@ -310,14 +315,15 @@ def market_intel_for_opportunity(opportunity_id: int, limit: int = 12) -> dict[s
 def market_intel_summary() -> dict[str, Any]:
     with conn() as c:
         row = c.execute(
-            """SELECT COUNT(*) total,
-                      SUM(CASE WHEN heat_score>=? THEN 1 ELSE 0 END) high_heat,
-                      SUM(CASE WHEN sales_verified=1 AND sales_score>=? THEN 1 ELSE 0 END) high_sales,
-                      SUM(CASE WHEN heat_score>=? AND sales_verified=1 AND sales_score>=? THEN 1 ELSE 0 END) hot_and_selling,
-                      SUM(CASE WHEN sales_verified=1 THEN 1 ELSE 0 END) verified_sales,
-                      SUM(CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END) verified_ratings,
-                      MAX(heat_score) max_heat,
-                      MAX(sales_score) max_sales
+            """SELECT SUM(CASE WHEN digital_verified=1 THEN 1 ELSE 0 END) total,
+                      SUM(CASE WHEN digital_verified=0 THEN 1 ELSE 0 END) excluded_unverified,
+                      SUM(CASE WHEN digital_verified=1 AND heat_score>=? THEN 1 ELSE 0 END) high_heat,
+                      SUM(CASE WHEN digital_verified=1 AND sales_verified=1 AND sales_score>=? THEN 1 ELSE 0 END) high_sales,
+                      SUM(CASE WHEN digital_verified=1 AND heat_score>=? AND sales_verified=1 AND sales_score>=? THEN 1 ELSE 0 END) hot_and_selling,
+                      SUM(CASE WHEN digital_verified=1 AND sales_verified=1 THEN 1 ELSE 0 END) verified_sales,
+                      SUM(CASE WHEN digital_verified=1 AND rating IS NOT NULL THEN 1 ELSE 0 END) verified_ratings,
+                      MAX(CASE WHEN digital_verified=1 THEN heat_score END) max_heat,
+                      MAX(CASE WHEN digital_verified=1 THEN sales_score END) max_sales
                FROM market_intel_items""",
             (
                 float(settings.market_intel_high_heat_score),
@@ -328,7 +334,7 @@ def market_intel_summary() -> dict[str, Any]:
         ).fetchone()
     data = row_to_dict(row) or {}
     return {
-        **{k: int(data.get(k) or 0) for k in ("total", "high_heat", "high_sales", "hot_and_selling", "verified_sales", "verified_ratings")},
+        **{k: int(data.get(k) or 0) for k in ("total", "excluded_unverified", "high_heat", "high_sales", "hot_and_selling", "verified_sales", "verified_ratings")},
         "max_heat": round(float(data.get("max_heat") or 0), 2),
         "max_sales": round(float(data.get("max_sales") or 0), 2),
         "heat_threshold": float(settings.market_intel_high_heat_score),

@@ -329,6 +329,7 @@ def init_db() -> None:
                 category TEXT,
                 audience TEXT,
                 price_suggestion REAL,
+                artifact_format TEXT,
                 title TEXT,
                 description TEXT,
                 keywords_json TEXT,

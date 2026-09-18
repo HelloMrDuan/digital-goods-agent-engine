@@ -107,6 +107,7 @@ class Settings(BaseSettings):
     market_intel_high_sales_score: float = 60.0
     etsy_enrich_shop_sales: bool = True
     etsy_shop_enrich_limit: int = 8
+    etsy_digital_verify_limit: int = 30
 
     # Real Etsy Open API v3 publishing. No fake success when credentials are absent.
     etsy_api_key: str = ""

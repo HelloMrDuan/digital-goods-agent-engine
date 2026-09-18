@@ -8,7 +8,7 @@ import pytest
 
 from app.collectors.base import CollectedItem
 from app.config import settings
-from app.db import conn, init_db
+from app.db import conn, dumps, init_db
 from app.services.analyze import product_from_opportunity
 from app.services.ingest import insert_evidence
 from app.services.opportunities import build_from_unlinked_evidence, list_opportunities
@@ -131,8 +131,15 @@ def test_product_generation_requires_current_passed_validation(monkeypatch):
     opportunity_id = _opportunity_id()
     with conn() as c:
         c.execute(
-            "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json='{}',analysis_stale=0 WHERE id=?",
-            (opportunity_id,),
+            "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json=?,analysis_stale=0 WHERE id=?",
+            (dumps({
+                "decision": "BUILD",
+                "primary_product": "原创工资表",
+                "recommended_products": [
+                    {"name": "原创工资表", "format": "xlsx", "why": "matches demand", "deliverables": ["xlsx", "使用说明"]}
+                ],
+                "price_range": {"currency": "CNY", "min": 20, "max": 50, "reason": "AI judgement"},
+            }), opportunity_id),
         )
 
     called = False
@@ -206,8 +213,15 @@ def test_approved_product_is_blocked_after_validation_becomes_stale(monkeypatch)
     validate_opportunity(opportunity_id)
     with conn() as c:
         c.execute(
-            "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json='{}',analysis_stale=0 WHERE id=?",
-            (opportunity_id,),
+            "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json=?,analysis_stale=0 WHERE id=?",
+            (dumps({
+                "decision": "BUILD",
+                "primary_product": "原创工资表",
+                "recommended_products": [
+                    {"name": "原创工资表", "format": "xlsx", "why": "matches demand", "deliverables": ["xlsx", "使用说明"]}
+                ],
+                "price_range": {"currency": "CNY", "min": 20, "max": 50, "reason": "AI judgement"},
+            }), opportunity_id),
         )
     monkeypatch.setattr("app.services.analyze.generate_product", lambda *args, **kwargs: {
             "name": "原创工资表",
@@ -296,3 +310,68 @@ def test_same_text_from_two_real_authors_counts_as_two_independent_signals():
     assert result["metrics"]["effective_signal_count"] == 2
     assert result["metrics"]["unique_authors"] == 2
     assert result["status"] == "PASSED"
+
+
+
+def test_watch_decision_cannot_generate_product(monkeypatch):
+    source = _source()
+    _insert(source, "watch-one", "buyer-one")
+    _insert(source, "watch-two", "buyer-two", days_ago=2)
+    opportunity_id = _opportunity_id()
+    assert validate_opportunity(opportunity_id)["status"] == "PASSED"
+    with conn() as c:
+        c.execute(
+            "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json=?,analysis_stale=0 WHERE id=?",
+            (
+                dumps({
+                    "decision": "WATCH",
+                    "primary_product": "原创工资表",
+                    "recommended_products": [{"name": "原创工资表", "format": "xlsx", "why": "maybe", "deliverables": ["xlsx"]}],
+                    "price_range": {"currency": "CNY", "min": 20, "max": 50, "reason": "AI judgement"},
+                }),
+                opportunity_id,
+            ),
+        )
+    monkeypatch.setattr("app.services.analyze.generate_product", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not call")))
+
+    with pytest.raises(ValueError, match="must be BUILD"):
+        product_from_opportunity(opportunity_id)
+
+
+def test_product_generation_is_bound_to_primary_product_and_format(monkeypatch):
+    source = _source()
+    _insert(source, "build-one", "buyer-one")
+    _insert(source, "build-two", "buyer-two", days_ago=2)
+    opportunity_id = _opportunity_id()
+    assert validate_opportunity(opportunity_id)["status"] == "PASSED"
+    with conn() as c:
+        c.execute(
+            "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json=?,analysis_stale=0 WHERE id=?",
+            (
+                dumps({
+                    "decision": "BUILD",
+                    "primary_product": "原创工资表",
+                    "recommended_products": [{"name": "原创工资表", "format": "xlsx", "why": "matches demand", "deliverables": ["xlsx"]}],
+                    "price_range": {"currency": "CNY", "min": 20, "max": 50, "reason": "AI judgement"},
+                }),
+                opportunity_id,
+            ),
+        )
+    monkeypatch.setattr("app.services.analyze.generate_product", lambda *args, **kwargs: {
+        "name": "LLM试图换成别的商品",
+        "category": "办公模板",
+        "audience": "小团队",
+        "price_suggestion": 29.0,
+        "title": "原创工资考勤自动计算模板",
+        "description": "根据真实需求生成的原创模板。",
+        "keywords": ["工资", "考勤"],
+        "deliverables": ["xlsx", "使用说明"],
+        "faq": [],
+        "compliance_notes": "仅原创内容",
+    })
+
+    result = product_from_opportunity(opportunity_id)
+    with conn() as c:
+        row = c.execute("SELECT name,artifact_format FROM products WHERE id=?", (result["product_id"],)).fetchone()
+    assert row["name"] == "原创工资表"
+    assert row["artifact_format"] == "xlsx"

@@ -202,16 +202,25 @@ def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, An
     return result
 
 
-PRODUCT_SYSTEM = """你是数字商品产品经理。只根据输入的真实需求证据和已完成的商机分析设计原创数字商品草稿。
+PRODUCT_SYSTEM = """你是数字商品产品经理。只根据输入的真实需求证据和已完成的 BUILD 商机分析完善最终商品草稿。
+最终商品必须严格对应 analysis.primary_product 以及 analysis.primary_recommendation，不得重新换成另一个商品方向或另一个文件格式。
 不得声称不存在的销量、效果、认证、用户数量或市场数据。价格只作为 AI 建议价格，不得称为市场均价。
-不得复制或打包转售他人受版权保护内容。优先原创模板、表格、工作流、脚本、指南、检查表、知识索引和辅助工具。
+不得复制或打包转售他人受版权保护内容。当前系统只允许能真实构建为 xlsx、csv、markdown、txt、json、python、javascript、html、css、yaml 的商品。
 只输出一个 JSON 对象，不要 Markdown。"""
 
 
 def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]], analysis: dict[str, Any], *, chat=chat_json) -> dict[str, Any]:
     payload = {
         "opportunity": {k: opportunity.get(k) for k in ("id", "title", "normalized_need", "category", "overall_score", "suggested_product")},
-        "analysis": {k: analysis.get(k) for k in ("normalized_need", "category", "reason", "uncertainty", "compliance", "evidence_ids_used")},
+        "analysis": {
+            k: analysis.get(k)
+            for k in (
+                "decision", "primary_product", "primary_recommendation", "recommended_products",
+                "price_range", "pain_points", "target_users", "market_score", "purchase_intent",
+                "reasoning", "commercial_validation", "normalized_need", "category", "reason",
+                "uncertainty", "compliance", "evidence_ids_used"
+            )
+        },
         "evidence": [
             {"id": e.get("id"), "platform": e.get("platform"), "source_url": e.get("source_url"), "title": e.get("title"), "content": (e.get("content") or "")[:700]}
             for e in evidence[:20]

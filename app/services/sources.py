@@ -436,7 +436,7 @@ def bootstrap_sources() -> dict[str, int]:
         # These do not count as direct user demand and never bypass Gate A.
         {"name":"Creative Market - Bestselling Templates","source_type":"creative_market","platform":"creative_market","url":"https://creativemarket.com/templates-themes/popular","config":cfg("market","P1","market_intel",180,ranking="bestseller",limit=40),"enabled":True},
         {"name":"Creative Market - Trending Templates","source_type":"creative_market","platform":"creative_market","url":"https://creativemarket.com/templates-themes/trending","config":cfg("market","P1","market_intel",180,ranking="trending",limit=40),"enabled":True},
-        {"name":"Etsy - Digital Template Market","source_type":"etsy_market","platform":"etsy","query":"digital template","config":cfg("market","P1","market_intel",240,limit=30),"enabled":True},
+        {"name":"Etsy - Digital Template Market","source_type":"etsy_market","platform":"etsy","query":"digital download template","config":cfg("market","P1","market_intel",240,limit=30,digital_only=True),"enabled":True},
 
         # P2: supply intelligence; useful for finding reusable/open-source building blocks, never demand.
         {"name":"GitHub - automation templates","source_type":"github","platform":"github","query":"automation template in:name,description","config":cfg("supply","P2","supply_intel",360,mode="repositories",limit=50),"enabled":True},

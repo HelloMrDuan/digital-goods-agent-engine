@@ -80,6 +80,8 @@ def _creative_market_product_links(page_html: str, base_url: str, limit: int) ->
 def collect_creative_market(url: str, limit: int = 30, ranking: str = "bestseller") -> list[CollectedItem]:
     if not url:
         raise CollectorError("Creative Market source missing url")
+    if "/templates-themes/" not in url:
+        raise CollectorError("Creative Market market-intel source must stay inside downloadable Templates & Themes")
     page = _get(url)
     links = _creative_market_product_links(page, url, limit)
     if not links:
@@ -100,6 +102,8 @@ def collect_creative_market(url: str, limit: int = 30, ranking: str = "bestselle
                 author=seller,
                 engagement={},
                 raw={
+                    "digital_product_verified": True,
+                    "digital_verification": "creative_market_downloadable_templates_category",
                     "market_metrics": {
                         "rank_position": rank,
                         "bestseller": ranking == "bestseller",
@@ -157,6 +161,41 @@ def _first_number(obj: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
+def _bool_value(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes"}:
+            return True
+        if text in {"false", "0", "no"}:
+            return False
+    return None
+
+
+def _etsy_obj_digital_status(obj: dict[str, Any]) -> tuple[bool | None, str | None]:
+    candidates = [obj]
+    for key in ("listing", "listing_card", "listingCard"):
+        child = obj.get(key)
+        if isinstance(child, dict):
+            candidates.append(child)
+    for candidate in candidates:
+        for key in ("is_digital", "isDigital", "is_download", "isDownload"):
+            if key in candidate:
+                value = _bool_value(candidate.get(key))
+                if value is not None:
+                    return value, f"json:{key}"
+        for key in ("type", "listing_type", "listingType", "fulfillment_type", "fulfillmentType"):
+            value = str(candidate.get(key) or "").strip().lower().replace("-", "_")
+            if value in {"download", "digital", "digital_download", "instant_download"}:
+                return True, f"json:{key}={value}"
+            if value in {"physical", "physical_product"}:
+                return False, f"json:{key}={value}"
+    return None, None
+
+
 def _etsy_search_rows(page_html: str, limit: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -184,6 +223,7 @@ def _etsy_search_rows(page_html: str, limit: int) -> list[dict[str, Any]]:
                 currency = price.get("currency_code") or price.get("currency")
             elif isinstance(price, (int, float)):
                 amount = float(price)
+            digital, verification = _etsy_obj_digital_status(obj)
             rows.append({
                 "listing_id": key,
                 "title": title.strip(),
@@ -195,11 +235,34 @@ def _etsy_search_rows(page_html: str, limit: int) -> list[dict[str, Any]]:
                 "favorites": _first_number(obj, "num_favorers", "favorites", "favorite_count"),
                 "review_count": _first_number(obj, "review_count", "reviews_count", "num_reviews"),
                 "rating": _first_number(obj, "rating", "average_rating"),
+                "digital": digital,
+                "digital_verification": verification,
+                "search_rank": len(rows) + 1,
                 "raw": obj,
             })
             if len(rows) >= limit:
                 return rows
     return rows
+
+
+def _etsy_listing_digital_status(page_html: str, listing_id: str | None = None) -> tuple[bool | None, str | None]:
+    wanted = str(listing_id or "").strip()
+    if wanted:
+        for root in _json_scripts(page_html):
+            for obj in _walk(root):
+                current = obj.get("listing_id") or obj.get("listingId")
+                if current is None or str(current) != wanted:
+                    continue
+                status, reason = _etsy_obj_digital_status(obj)
+                if status is not None:
+                    return status, f"listing_page_{reason}"
+
+    # Etsy listing pages expose buyer-facing labels such as "Digital download" / "Instant Download".
+    visible = re.sub(r"<[^>]+>", " ", page_html)
+    visible = " ".join(html_lib.unescape(visible).split()).lower()
+    if re.search(r"\b(digital download|instant download|digital item)\b", visible):
+        return True, "listing_page_digital_download_label"
+    return None, None
 
 
 def _etsy_shop_sales(page_html: str) -> int | None:
@@ -222,14 +285,42 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
         raise CollectorError("Etsy market source missing query")
     search_url = f"https://www.etsy.com/search?q={quote_plus(query)}&explicit=1"
     page = _get(search_url)
-    rows = _etsy_search_rows(page, limit)
+    candidate_limit = min(60, max(limit, limit * 2))
+    rows = _etsy_search_rows(page, candidate_limit)
     if not rows:
         raise CollectorError("Etsy search returned no parseable listing data; page shape or bot protection may have changed")
+
+    verified_rows: list[dict[str, Any]] = []
+    verify_budget = max(1, int(settings.etsy_digital_verify_limit))
+    detail_checks = 0
+    for row in rows:
+        digital = row.get("digital")
+        verification = row.get("digital_verification")
+        if digital is False:
+            continue
+        if digital is not True:
+            if detail_checks >= verify_budget:
+                continue
+            detail_checks += 1
+            try:
+                digital, verification = _etsy_listing_digital_status(_get(str(row["url"])), str(row["listing_id"]))
+            except Exception:
+                digital, verification = None, None
+        if digital is not True:
+            continue
+        row["digital"] = True
+        row["digital_verification"] = verification or "verified_digital"
+        verified_rows.append(row)
+        if len(verified_rows) >= limit:
+            break
+
+    if not verified_rows:
+        raise CollectorError("Etsy search returned no listings that could be verified as digital downloads")
 
     shop_sales: dict[str, tuple[int | None, str]] = {}
     shop_budget = max(0, int(settings.etsy_shop_enrich_limit))
     if settings.etsy_enrich_shop_sales and shop_budget:
-        for shop_name in [r["shop_name"] for r in rows if r.get("shop_name")]:
+        for shop_name in [r["shop_name"] for r in verified_rows if r.get("shop_name")]:
             if shop_name in shop_sales or len(shop_sales) >= shop_budget:
                 continue
             shop_url = f"https://www.etsy.com/shop/{quote_plus(str(shop_name))}"
@@ -239,11 +330,12 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
                 shop_sales[str(shop_name)] = (None, shop_url)
 
     result: list[CollectedItem] = []
-    for rank, row in enumerate(rows, start=1):
+    for row in verified_rows:
         sales_count = None
         sales_url = None
         if row.get("shop_name") in shop_sales:
             sales_count, sales_url = shop_sales[str(row["shop_name"])]
+        rank = int(row.get("search_rank") or 0) or None
         result.append(
             CollectedItem(
                 platform="etsy",
@@ -251,7 +343,7 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
                 source_item_id=str(row["listing_id"]),
                 source_url=str(row["url"]),
                 title=str(row["title"]),
-                content=f"Etsy search rank #{rank} for {query}",
+                content=f"Etsy verified digital search rank #{rank} for {query}",
                 author=row.get("shop_name"),
                 engagement={
                     "views": row.get("views"),
@@ -260,6 +352,8 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
                     "rating": row.get("rating"),
                 },
                 raw={
+                    "digital_product_verified": True,
+                    "digital_verification": row.get("digital_verification"),
                     "market_metrics": {
                         "rank_position": rank,
                         "bestseller": False,

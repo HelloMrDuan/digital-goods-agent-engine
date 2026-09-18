@@ -137,3 +137,44 @@ def test_single_and_batch_analysis_share_same_analyze_one_entrypoint(monkeypatch
     batch = main_legacy.opportunities_analyze_new()
     assert any(item.get("id") == 8 and item["analysis"]["decision"] == "WATCH" for item in batch["results"])
     assert 7 in calls and 8 in calls
+
+
+
+def test_async_single_analysis_does_not_require_commercial_validation_and_deduplicates(monkeypatch):
+    import app.main_legacy as main_legacy
+
+    now = now_iso()
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO opportunities(title,candidate_key,normalized_need,status,evidence_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("weak candidate", "weak-start-key", "weak", "NEW", 1, now, now),
+        )
+        opportunity_id = int(cur.lastrowid)
+        c.execute("UPDATE opportunities SET cluster_active=1 WHERE id=?", (opportunity_id,))
+
+    started: list[tuple] = []
+
+    class FakeThread:
+        def __init__(self, target=None, args=(), daemon=None):
+            started.append((target, args, daemon))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(main_legacy.threading, "Thread", FakeThread)
+
+    first = main_legacy.opportunities_analyze_start(opportunity_id)
+    assert int(first["task_id"]) > 0
+    assert len(started) == 1
+
+    with pytest.raises(HTTPException) as exc:
+        main_legacy.opportunities_analyze_start(opportunity_id)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["task_id"] == first["task_id"]
+
+    with conn() as c:
+        tasks = c.execute(
+            "SELECT COUNT(*) c FROM analysis_tasks WHERE opportunity_id=? AND status IN ('PENDING','RUNNING')",
+            (opportunity_id,),
+        ).fetchone()
+    assert int(tasks["c"]) == 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -129,16 +130,43 @@ def _run_analysis_task(task_id: int, opportunity_id: int):
 def opportunities_analyze_start(opportunity_id: int):
     if not get_opportunity(opportunity_id):
         raise HTTPException(404, "opportunity not found")
-    try:
-        require_current_validation(opportunity_id)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
+
+    # Discovery analysis intentionally accepts real-evidence candidates that have not
+    # passed deterministic commercial validation; the decision guard can only emit
+    # WATCH/DROP until validation passes. Product generation remains Gate-A protected.
+    now = now_iso()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(timespec="seconds")
     with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            """UPDATE analysis_tasks
+               SET status='FAILED',progress=100,stage='失败',message='stale analysis task expired',
+                   error='stale analysis task expired',updated_at=?
+               WHERE opportunity_id=? AND status IN ('PENDING','RUNNING') AND updated_at<?""",
+            (now, opportunity_id, stale_cutoff),
+        )
+        active = c.execute(
+            """SELECT id,status,progress,stage FROM analysis_tasks
+               WHERE opportunity_id=? AND status IN ('PENDING','RUNNING')
+               ORDER BY id DESC LIMIT 1""",
+            (opportunity_id,),
+        ).fetchone()
+        if active:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "opportunity analysis already running",
+                    "task_id": int(active["id"]),
+                    "status": active["status"],
+                    "progress": int(active["progress"] or 0),
+                    "stage": active["stage"],
+                },
+            )
         cur = c.execute(
             "INSERT INTO analysis_tasks(opportunity_id,status,progress,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (opportunity_id, "PENDING", 0, "排队", "等待分析", now_iso(), now_iso())
+            (opportunity_id, "PENDING", 0, "排队", "等待分析", now, now),
         )
-        task_id = cur.lastrowid
+        task_id = int(cur.lastrowid)
     threading.Thread(target=_run_analysis_task, args=(task_id, opportunity_id), daemon=True).start()
     return {"task_id": task_id}
 

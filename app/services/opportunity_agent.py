@@ -13,6 +13,7 @@ from .llm import chat_json_with_meta
 from .opportunities import get_evidence_for_opportunity, get_opportunity
 from .validation import get_validation, validate_opportunity
 from .market_intel import market_intel_for_opportunity
+from .quality import assert_real_opportunity_provenance
 
 
 AGENT_ORDER = ("signal", "pain", "market", "product", "risk", "judge")
@@ -152,11 +153,17 @@ def _validate_agent_output(agent_name: str, output: Any, allowed_evidence_ids: s
     return value
 
 
-def _score(value: Any, default: float = 0.0) -> float:
+def _score(value: Any) -> float:
+    """Return a validated Agent score; never manufacture a neutral/default value."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("agent score is missing")
     try:
-        return round(max(0.0, min(100.0, float(value))), 2)
-    except Exception:
-        return default
+        number = float(value)
+    except Exception as exc:
+        raise ValueError(f"agent score is not numeric: {value!r}") from exc
+    if not 0.0 <= number <= 100.0:
+        raise ValueError(f"agent score out of range: {number}")
+    return round(number, 2)
 
 
 def _ensure_schema() -> None:
@@ -250,6 +257,7 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
     opportunity = get_opportunity(opportunity_id)
     if not opportunity:
         raise KeyError("opportunity not found")
+    assert_real_opportunity_provenance(opportunity_id)
     evidence = get_evidence_for_opportunity(opportunity_id, settings.agent_evidence_limit)
     if len(evidence) < settings.min_evidence_for_analysis:
         raise ValueError(
@@ -501,7 +509,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
 
     market_score = _score(outputs["market"].get("market_score"))
     purchase_intent = _score(outputs["market"].get("purchase_intent"))
-    risk_score = _score(outputs["risk"].get("risk_score"), 50.0)
+    risk_score = _score(outputs["risk"].get("risk_score"))
     final_score = _score(outputs["judge"].get("final_score"))
     confidence = _score(outputs["judge"].get("confidence"))
     deterministic_decision = _decision(final_score, market_score, risk_score)
@@ -535,7 +543,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
         "target_users": outputs["pain"].get("target_users") or [],
         "pain_points": outputs["pain"].get("pain_points") or [],
         "competition": {
-            "level": _score(outputs["market"].get("competition_level"), 50.0),
+            "level": _score(outputs["market"].get("competition_level")),
             "reasoning": outputs["market"].get("reasoning"),
         },
         "market_gaps": outputs["market"].get("competition_gaps") or [],
@@ -619,9 +627,9 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
                 category,
                 "REJECTED_RISK" if risk_score >= settings.high_risk_threshold else "ANALYZED",
                 round(purchase_intent),
-                round(_score(outputs["market"].get("competition_level"), 50.0)),
+                round(_score(outputs["market"].get("competition_level"))),
                 round(_score(outputs["risk"].get("copyright_risk"), risk_score)),
-                round(_score(outputs["product"].get("automation_fit"), 50.0)),
+                round(_score(outputs["product"].get("automation_fit"))),
                 round(final_score),
                 primary_product,
                 reasoning,

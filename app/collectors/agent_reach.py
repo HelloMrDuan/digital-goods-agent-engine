@@ -414,7 +414,9 @@ def _commands(platform: str, query: str, limit: int, active_backend: str) -> lis
 
 
 
-def _synthetic_comment_id(platform: str, parent_id: str | None, author: str | None, text: str) -> str:
+def _derived_comment_id(platform: str, parent_id: str | None, author: str | None, text: str) -> str:
+    # This is only a deterministic local identity for a real comment when the upstream omits an ID.
+    # It never fabricates comment content, author, engagement, or timestamp.
     payload = "\x1f".join([platform, parent_id or "", author or "", re.sub(r"\s+", " ", text).strip()])
     return "comment-hash:" + hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()[:32]
 
@@ -433,7 +435,7 @@ def _comment_item(platform: str, parent: CollectedItem, raw: dict[str, Any]) -> 
     if isinstance(author, dict):
         author = _first(author, "name", "nickname", "username", "user_name")
     raw_id = _first(raw, "id", "comment_id", "commentId", "cid", "rpid")
-    sid = str(raw_id) if raw_id not in (None, "") else _synthetic_comment_id(platform, parent.source_item_id, str(author) if author else None, text)
+    sid = str(raw_id) if raw_id not in (None, "") else _derived_comment_id(platform, parent.source_item_id, str(author) if author else None, text)
     published = _first(raw, "published_at", "created_at", "createdAt", "created_utc", "time", "timestamp")
     time_quality = "source" if published not in (None, "") else "inherited_thread"
     if published in (None, ""):

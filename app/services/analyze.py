@@ -77,6 +77,25 @@ def analyze_one(opportunity_id: int) -> dict[str, Any]:
     }
 
 
+
+def _validate_product_draft(product: dict[str, Any]) -> dict[str, Any]:
+    """Reject incomplete AI drafts instead of filling missing business fields with fake defaults."""
+    required_text = ("name", "category", "audience", "title", "description", "compliance_notes")
+    for field in required_text:
+        value = product.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"product draft missing required field: {field}")
+    price = product.get("price_suggestion")
+    if isinstance(price, bool) or not isinstance(price, (int, float)) or float(price) < 0:
+        raise ValueError("product draft price_suggestion must be a non-negative number")
+    for field in ("keywords", "deliverables", "faq"):
+        if not isinstance(product.get(field), list):
+            raise ValueError(f"product draft {field} must be an array")
+    if not product["deliverables"]:
+        raise ValueError("product draft deliverables must not be empty")
+    return product
+
+
 def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     opp = get_opportunity(opportunity_id)
     if not opp:
@@ -92,7 +111,7 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
         raise ValueError("high copyright/compliance risk; product generation blocked")
     evidence = get_evidence_for_opportunity(opportunity_id, 50)
     analysis = json.loads(opp.get("analysis_json") or "{}")
-    product = generate_product(opp, evidence, analysis, chat=provider_chat_json)
+    product = _validate_product_draft(generate_product(opp, evidence, analysis, chat=provider_chat_json))
     sku = f"DG-{opportunity_id:06d}-{secrets.token_hex(2).upper()}"
     now = now_iso()
     with conn() as c:
@@ -102,10 +121,10 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
             (
                 opportunity_id,
                 sku,
-                product.get("name") or opp.get("suggested_product") or opp.get("title"),
+                product["name"],
                 product.get("category"),
                 product.get("audience"),
-                float(product.get("price_suggestion") or 0),
+                float(product["price_suggestion"]),
                 product.get("title"),
                 product.get("description"),
                 dumps(product.get("keywords") or []),

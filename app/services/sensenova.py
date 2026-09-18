@@ -186,7 +186,7 @@ def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, An
             "category": "string",
             "demand_score": "integer 0-100; AI judgement grounded only in evidence",
             "purchase_intent": "integer 0-100; AI judgement grounded only in explicit intent language",
-            "competition": "integer 0-100; use 50 when competition evidence is unavailable and explain uncertainty",
+            "competition": "integer 0-100 when supported by evidence; otherwise null and explain uncertainty; never invent a neutral score",
             "production_cost": "integer 0-100",
             "after_sales_cost": "integer 0-100",
             "copyright_risk": "integer 0-100",

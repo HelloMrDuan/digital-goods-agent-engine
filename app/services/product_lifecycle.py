@@ -289,8 +289,8 @@ def require_approved_current_product(product_id: int) -> dict[str, Any]:
     product = get_product(product_id)
     if not product:
         raise KeyError("product not found")
-    if str(product.get("status") or "").upper() != "APPROVED":
-        raise ValueError("product must be APPROVED before fulfillment")
+    if str(product.get("status") or "").upper() not in {"APPROVED", "PUBLISH_DRAFT", "PUBLISHED"}:
+        raise ValueError("product must be APPROVED or already published before fulfillment/publishing")
     gate = get_gate_b(product_id)
     if gate.get("decision") != "PASS" or not gate.get("is_current"):
         raise ValueError("current product Gate B must pass before fulfillment")

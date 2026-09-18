@@ -41,4 +41,4 @@ def test_rebuild_concurrency_is_bounded(monkeypatch):
 
 
 def test_main_reports_opportunity_agent_version():
-    assert app.version == "1.2.6-market-intelligence"
+    assert app.version == "1.3.0-real-build-etsy-publish"

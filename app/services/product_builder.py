@@ -1,0 +1,310 @@
+from __future__ import annotations
+
+import csv
+import hashlib
+import json
+import re
+import zipfile
+from pathlib import Path
+from typing import Any
+
+from openpyxl import Workbook
+
+from ..config import settings
+from ..db import conn, dumps, loads, now_iso, row_to_dict
+from .asset_registry import create_source_asset, link_product_asset
+from .llm import chat_json
+from .opportunities import get_evidence_for_opportunity, get_opportunity
+from .product_lifecycle import get_product
+
+
+ARTIFACT_SYSTEM = """你是数字商品交付工程师。根据已经通过真实需求分析的商品草稿，生成真正可交付的原创数字商品内容。
+只允许基于输入中的真实需求证据和商品定义设计内容；不得复制第三方受版权保护内容，不得声称不存在的销量、认证、效果或用户数。
+输出 JSON，必须包含 files 数组；files 中每项包含 path 和 content。至少包含 README.md 和一个真正有用的主交付文件。
+如果商品明显是表格/Excel/工作簿，再输出 workbooks 数组，每个工作簿包含 path 和 sheets；sheet 包含 name、columns、rows。
+文本文件只允许 md/txt/csv/json/py/js/html/css/yaml/yml。内容必须能直接被买家使用，而不是只给一个目录或空壳说明。"""
+
+
+_ALLOWED_TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".py", ".js", ".html", ".css", ".yaml", ".yml"}
+_MAX_FILES = 12
+_MAX_FILE_CHARS = 120_000
+_MAX_ROWS_PER_SHEET = 3000
+_MAX_COLS_PER_SHEET = 80
+
+
+def _safe_relative_path(value: Any) -> Path:
+    raw = str(value or "").replace("\\", "/").strip().lstrip("/")
+    if not raw or raw.startswith(".") or ".." in raw.split("/"):
+        raise ValueError(f"unsafe artifact path: {value!r}")
+    path = Path(raw)
+    if len(path.parts) > 5:
+        raise ValueError(f"artifact path too deep: {raw}")
+    return path
+
+
+def _write_text_file(root: Path, spec: dict[str, Any]) -> str:
+    rel = _safe_relative_path(spec.get("path"))
+    if rel.suffix.lower() not in _ALLOWED_TEXT_EXTENSIONS:
+        raise ValueError(f"unsupported artifact extension: {rel.suffix}")
+    content = spec.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"artifact file is empty: {rel}")
+    if len(content) > _MAX_FILE_CHARS:
+        raise ValueError(f"artifact file too large: {rel}")
+    target = root / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8", newline="\n")
+    return rel.as_posix()
+
+
+def _write_workbook(root: Path, spec: dict[str, Any]) -> str:
+    rel = _safe_relative_path(spec.get("path"))
+    if rel.suffix.lower() != ".xlsx":
+        raise ValueError("workbook path must end with .xlsx")
+    sheets = spec.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        raise ValueError(f"workbook has no sheets: {rel}")
+
+    wb = Workbook()
+    default = wb.active
+    wb.remove(default)
+    for index, sheet in enumerate(sheets[:12]):
+        if not isinstance(sheet, dict):
+            raise ValueError("workbook sheet must be an object")
+        name = str(sheet.get("name") or f"Sheet{index + 1}")[:31]
+        ws = wb.create_sheet(title=name)
+        columns = sheet.get("columns") or []
+        rows = sheet.get("rows") or []
+        if not isinstance(columns, list) or not columns:
+            raise ValueError(f"workbook sheet missing columns: {name}")
+        if not isinstance(rows, list):
+            raise ValueError(f"workbook rows must be an array: {name}")
+        columns = [str(v) for v in columns[:_MAX_COLS_PER_SHEET]]
+        ws.append(columns)
+        for row in rows[:_MAX_ROWS_PER_SHEET]:
+            if isinstance(row, dict):
+                values = [row.get(column) for column in columns]
+            elif isinstance(row, list):
+                values = list(row[: len(columns)])
+            else:
+                raise ValueError(f"unsupported workbook row in {name}")
+            ws.append(values)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    target = root / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(target)
+    return rel.as_posix()
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _validate_manifest(value: dict[str, Any]) -> dict[str, Any]:
+    files = value.get("files")
+    if not isinstance(files, list) or len(files) < 2:
+        raise ValueError("artifact generator must return at least README plus one primary file")
+    if len(files) > _MAX_FILES:
+        raise ValueError("artifact generator returned too many files")
+    names = {str(item.get("path") or "").lower() for item in files if isinstance(item, dict)}
+    if "readme.md" not in names:
+        raise ValueError("artifact generator must include README.md")
+    workbooks = value.get("workbooks") or []
+    if not isinstance(workbooks, list):
+        raise ValueError("workbooks must be an array")
+    return value
+
+
+def build_product_artifact(product_id: int) -> dict[str, Any]:
+    product = get_product(product_id)
+    if not product:
+        raise KeyError("product not found")
+    opportunity = get_opportunity(int(product["opportunity_id"]))
+    if not opportunity:
+        raise KeyError("opportunity not found")
+    if int(opportunity.get("analysis_stale") or 0):
+        raise ValueError("opportunity analysis is stale; rebuild before producing deliverables")
+
+    evidence = get_evidence_for_opportunity(int(product["opportunity_id"]), 30)
+    analysis = loads(opportunity.get("analysis_json"), {}) or {}
+    payload = {
+        "product": {
+            "id": product_id,
+            "sku": product.get("sku"),
+            "name": product.get("name"),
+            "category": product.get("category"),
+            "audience": product.get("audience"),
+            "title": product.get("title"),
+            "description": product.get("description"),
+            "deliverables": product.get("deliverables") or [],
+            "faq": product.get("faq") or [],
+            "compliance_notes": product.get("compliance_notes"),
+        },
+        "opportunity": {
+            "id": opportunity.get("id"),
+            "title": opportunity.get("title"),
+            "normalized_need": opportunity.get("normalized_need"),
+            "suggested_product": opportunity.get("suggested_product"),
+        },
+        "analysis": {
+            "decision": analysis.get("decision"),
+            "reasoning": analysis.get("reasoning"),
+            "pain_points": analysis.get("pain_points") or [],
+            "target_users": analysis.get("target_users") or [],
+            "recommended_products": analysis.get("recommended_products") or [],
+        },
+        "evidence": [
+            {
+                "id": item.get("id"),
+                "platform": item.get("platform"),
+                "title": item.get("title"),
+                "content": str(item.get("content") or "")[:700],
+                "source_url": item.get("source_url"),
+            }
+            for item in evidence[:20]
+        ],
+        "output_schema": {
+            "files": [{"path": "README.md", "content": "complete buyer-facing instructions"}],
+            "workbooks": [{"path": "template.xlsx", "sheets": [{"name": "Sheet1", "columns": ["column"], "rows": [["example"]]}]}],
+            "quality_notes": ["string"],
+        },
+    }
+
+    generated = chat_json(
+        operation="product_artifact_build",
+        entity_type="product",
+        entity_id=product_id,
+        system=ARTIFACT_SYSTEM,
+        payload=payload,
+        max_new_tokens=max(2200, settings.qiniu_json_retry_max_tokens),
+    )
+    manifest = _validate_manifest(generated)
+
+    base = Path(settings.artifact_dir).expanduser().resolve()
+    root = base / f"product_{product_id}"
+    root.mkdir(parents=True, exist_ok=True)
+    build_stamp = re.sub(r"[^0-9]", "", now_iso())[:14]
+    work = root / f"build_{build_stamp}"
+    work.mkdir(parents=True, exist_ok=True)
+
+    written: list[str] = []
+    for spec in manifest["files"]:
+        if not isinstance(spec, dict):
+            raise ValueError("artifact file spec must be an object")
+        written.append(_write_text_file(work, spec))
+    for spec in manifest.get("workbooks") or []:
+        if not isinstance(spec, dict):
+            raise ValueError("workbook spec must be an object")
+        written.append(_write_workbook(work, spec))
+
+    if len(written) < 2:
+        raise ValueError("artifact build produced fewer than two usable files")
+
+    manifest_path = work / "manifest.json"
+    manifest_payload = {
+        "product_id": product_id,
+        "sku": product.get("sku"),
+        "generated_at": now_iso(),
+        "files": written,
+        "quality_notes": manifest.get("quality_notes") or [],
+        "evidence_ids": [item.get("id") for item in evidence],
+        "policy": "original generated deliverable grounded in stored real demand evidence",
+    }
+    manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    zip_path = root / f"{product.get('sku') or f'product-{product_id}'}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(work.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(work).as_posix())
+    checksum = _sha256(zip_path)
+
+    asset = create_source_asset(
+        {
+            "source_type": "owned",
+            "title": f"{product.get('name') or product.get('sku')} deliverable package",
+            "local_ref": str(zip_path),
+            "checksum": checksum,
+            "ownership_type": "self_owned",
+            "license_name": "Original generated product",
+            "commercial_use_allowed": True,
+            "redistribution_allowed": True,
+            "license_evidence": {
+                "generator": "digital-goods-agent-engine",
+                "product_id": product_id,
+                "build_manifest": str(manifest_path),
+                "generated_at": manifest_payload["generated_at"],
+                "evidence_ids": manifest_payload["evidence_ids"],
+            },
+        }
+    )
+    link_product_asset(product_id, int(asset["id"]), "deliverable")
+
+    created_at = now_iso()
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO product_builds(
+                   product_id,status,bundle_path,checksum,manifest_json,source_asset_id,error,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                product_id,
+                "SUCCESS",
+                str(zip_path),
+                checksum,
+                dumps(manifest_payload),
+                int(asset["id"]),
+                None,
+                created_at,
+                created_at,
+            ),
+        )
+        build_id = int(cur.lastrowid)
+    return {
+        "build_id": build_id,
+        "product_id": product_id,
+        "status": "SUCCESS",
+        "bundle_path": str(zip_path),
+        "checksum": checksum,
+        "source_asset_id": int(asset["id"]),
+        "files": written,
+        "manifest": manifest_payload,
+    }
+
+
+def list_product_builds(product_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    with conn() as c:
+        rows = c.execute(
+            "SELECT * FROM product_builds WHERE product_id=? ORDER BY id DESC LIMIT ?",
+            (product_id, max(1, min(limit, 100))),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = row_to_dict(row) or {}
+        item["manifest"] = loads(item.pop("manifest_json", None), {}) or {}
+        result.append(item)
+    return result
+
+
+def latest_successful_bundle(product_id: int) -> dict[str, Any]:
+    with conn() as c:
+        row = c.execute(
+            "SELECT * FROM product_builds WHERE product_id=? AND status='SUCCESS' ORDER BY id DESC LIMIT 1",
+            (product_id,),
+        ).fetchone()
+    if not row:
+        raise ValueError("product has no successfully generated deliverable package")
+    item = row_to_dict(row) or {}
+    path = Path(str(item.get("bundle_path") or "")).resolve()
+    if not path.is_file():
+        raise ValueError("generated deliverable package is missing from disk")
+    checksum = _sha256(path)
+    if checksum != item.get("checksum"):
+        raise ValueError("generated deliverable package checksum mismatch")
+    item["manifest"] = loads(item.pop("manifest_json", None), {}) or {}
+    return item

@@ -116,8 +116,8 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     now = now_iso()
     with conn() as c:
         cur = c.execute(
-            """INSERT INTO products(opportunity_id,sku,name,category,audience,price_suggestion,title,description,keywords_json,deliverables_json,faq_json,compliance_notes,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO products(opportunity_id,sku,name,category,audience,price_suggestion,price_currency,title,description,keywords_json,deliverables_json,faq_json,compliance_notes,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 opportunity_id,
                 sku,
@@ -125,6 +125,7 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
                 product.get("category"),
                 product.get("audience"),
                 float(product["price_suggestion"]),
+                settings.default_product_currency.upper(),
                 product.get("title"),
                 product.get("description"),
                 dumps(product.get("keywords") or []),

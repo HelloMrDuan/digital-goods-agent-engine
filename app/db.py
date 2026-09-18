@@ -387,6 +387,40 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_product_gate_product
                 ON product_gate_runs(product_id, id DESC);
 
+            CREATE TABLE IF NOT EXISTS product_builds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                bundle_path TEXT,
+                checksum TEXT,
+                manifest_json TEXT,
+                source_asset_id INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES source_assets(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_builds_product
+                ON product_builds(product_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS publish_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT,
+                external_id TEXT,
+                external_url TEXT,
+                response_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_publish_runs_product
+                ON publish_runs(product_id, platform, id DESC);
+
             CREATE TABLE IF NOT EXISTS deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER NOT NULL,
@@ -544,6 +578,11 @@ def init_db() -> None:
             "gate_json": "TEXT",
             "approved_at": "TEXT",
             "approved_gate_snapshot_hash": "TEXT",
+            "price_currency": "TEXT NOT NULL DEFAULT 'CNY'",
+            "published_at": "TEXT",
+            "published_platform": "TEXT",
+            "external_listing_id": "TEXT",
+            "external_listing_url": "TEXT",
         }.items():
             _ensure_column(c, "products", name, ddl)
 

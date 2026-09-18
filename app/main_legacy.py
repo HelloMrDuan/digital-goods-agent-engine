@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import httpx
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,6 +27,8 @@ from .services.validation import get_gate_a, get_validation, require_current_val
 from .services.product_lifecycle import approve_product, evaluate_gate_b, get_gate_b, get_product, list_delivery_records, require_approved_current_product
 from .services.asset_registry import create_source_asset, get_source_asset, link_product_asset, list_product_assets, list_source_assets, product_asset_readiness, unlink_product_asset, update_source_asset
 from .services.market_intel import list_market_intel, market_intel_for_opportunity, market_intel_summary, rematch_market_intel
+from .services.product_builder import build_product_artifact, latest_successful_bundle, list_product_builds
+from .services.publishing import etsy_status, list_publish_runs, publish_to_etsy
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -77,6 +80,8 @@ def health() -> dict[str, Any]:
         "market_intel_enabled": True,
         "market_intel_high_heat_score": settings.market_intel_high_heat_score,
         "market_intel_high_sales_score": settings.market_intel_high_sales_score,
+        "artifact_generation_enabled": True,
+        "etsy_publishing": etsy_status(),
         "db": settings.db_path,
     }
 
@@ -721,6 +726,8 @@ def products_list(limit: int = Query(default=100, ge=1, le=500)):
             product["license_readiness"] = product_asset_readiness(int(row["id"]))
         except Exception as exc:
             product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
+        product["builds"] = list_product_builds(int(row["id"]), 1)
+        product["publish_runs"] = list_publish_runs(int(row["id"]), 1)
         out.append(product)
     return out
 
@@ -740,7 +747,79 @@ def product_detail(product_id: int):
     except Exception as exc:
         product["assets"] = []
         product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
+    product["builds"] = list_product_builds(product_id, 20)
+    product["publish_runs"] = list_publish_runs(product_id, 20)
     return product
+
+
+@app.post("/api/products/{product_id}/build-artifact")
+def product_build_artifact(product_id: int):
+    try:
+        return build_product_artifact(product_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+
+@app.get("/api/products/{product_id}/builds")
+def product_builds(product_id: int, limit: int = Query(default=20, ge=1, le=100)):
+    if not get_product(product_id):
+        raise HTTPException(404, "product not found")
+    return list_product_builds(product_id, limit)
+
+
+@app.get("/api/products/{product_id}/artifact/download")
+def product_artifact_download(product_id: int):
+    try:
+        build = latest_successful_bundle(product_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    path = Path(str(build["bundle_path"]))
+    return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@app.get("/api/publish/etsy/status")
+def publish_etsy_status():
+    return etsy_status()
+
+
+@app.get("/api/products/{product_id}/publish-runs")
+def product_publish_runs(product_id: int, limit: int = Query(default=20, ge=1, le=100)):
+    if not get_product(product_id):
+        raise HTTPException(404, "product not found")
+    return list_publish_runs(product_id, limit)
+
+
+@app.post("/api/products/{product_id}/publish/etsy")
+def product_publish_etsy(
+    product_id: int,
+    price: float | None = Query(default=None, gt=0),
+    currency: str | None = Query(default=None, min_length=3, max_length=3),
+    taxonomy_id: int | None = Query(default=None, gt=0),
+    quantity: int | None = Query(default=None, gt=0),
+    activate: bool = True,
+):
+    try:
+        return publish_to_etsy(
+            product_id,
+            price=price,
+            currency=currency,
+            taxonomy_id=taxonomy_id,
+            quantity=quantity,
+            activate=activate,
+        )
+    except KeyError:
+        raise HTTPException(404, "product not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        raise HTTPException(502, f"Etsy API error: {detail}")
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
 
 
 @app.get("/api/products/{product_id}/gate-b")

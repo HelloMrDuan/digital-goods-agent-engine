@@ -13,7 +13,7 @@ const views = {
   trends: ["需求趋势", "趋势只由真实 evidence 时间戳和独立信号计算。"],
   market: ["市场情报", "自动采集真实 Marketplace 榜单、互动与明确销量指标；销量口径原样保留。"],
   quality: ["数据质量", "检查来源覆盖、时效性和失败原因。"],
-  products: ["商品中心", "仅从通过约束的商机生成原创商品草稿。"],
+  products: ["商品中心", "从真实需求生成可下载商品包，通过 Gate 后可发布到真实 Etsy 店铺。"],
   cost: ["AI 成本", "展示真实模型调用记录和预算占用。"],
   settings: ["系统状态", "运行模式、采集通道和验证策略。"],
 };
@@ -41,7 +41,7 @@ function date(value) {
 
 function statusClass(value) {
   const status = String(value || "").toUpperCase();
-  if (["READY", "SUCCESS", "PASSED", "APPROVED", "DELIVERED", "ANALYZED", "BUILD"].includes(status)) return "good";
+  if (["READY", "SUCCESS", "PASSED", "APPROVED", "PUBLISHED", "DELIVERED", "ANALYZED", "BUILD"].includes(status)) return "good";
   if (["FAILED", "ERROR", "REJECTED_RISK", "DISABLED", "DROP"].includes(status)) return "bad";
   if (["STALE", "BACKOFF", "EMPTY", "PENDING", "RUNNING", "NOT_VALIDATED", "WATCH", "PARTIAL"].includes(status)) return "warn";
   return "neutral";
@@ -249,12 +249,43 @@ async function renderProducts() {
     const gate = item.gate_b || {};
     const gateDecision = gate.is_current === false && gate.decision !== "NOT_RUN" ? "STALE" : (gate.decision || item.gate_status || "NOT_RUN");
     const blockers = (gate.blockers || []).concat(gate.review_flags || []);
+    const latestBuild = (item.builds || [])[0] || null;
+    const latestPublish = (item.publish_runs || [])[0] || null;
     const approve = item.status === "DRAFT" && gateDecision === "PASS"
       ? `<button class="btn primary" onclick="approveProduct(${Number(item.id)})">人工批准</button>`
       : "";
-    return `<article class="evidence-card"><div class="source-top"><div><strong>${esc(item.name)}</strong><div class="source-meta mono">${esc(item.sku)}</div></div>${pill(item.status)}</div><p>${esc(item.description || "")}</p><div class="metric-row"><span class="metric-chip">建议价 ¥${n(item.price_suggestion, 2)}</span><span class="metric-chip">交付物 ${(item.deliverables || []).length}</span><span class="metric-chip">Gate B ${esc(gateDecision)}</span><span class="metric-chip">Gate 分 ${n(gate.score ?? item.gate_score, 1)}</span><span class="metric-chip">授权 ${esc(item.license_readiness?.decision || "NOT_CHECKED")}</span></div>${blockers.length ? `<div class="source-error">${esc(blockers.join("、"))}</div>` : ""}<div class="toolbar"><button class="btn secondary" onclick="runGateB(${Number(item.id)})">运行 Gate B</button><button class="btn ghost" onclick="openProduct(${Number(item.id)})">查看详情</button>${approve}</div></article>`;
+    const publish = ["APPROVED", "PUBLISH_DRAFT"].includes(String(item.status || "").toUpperCase())
+      ? `<button class="btn primary" onclick="publishEtsy(${Number(item.id)})">发布 Etsy</button>`
+      : "";
+    const download = latestBuild?.status === "SUCCESS"
+      ? `<button class="btn ghost" onclick="downloadArtifact(${Number(item.id)})">下载商品包</button>`
+      : "";
+    const external = item.external_listing_url
+      ? `<a class="evidence-link" href="${esc(safeUrl(item.external_listing_url))}" target="_blank" rel="noreferrer">打开 Etsy Listing</a>`
+      : "";
+    return `<article class="evidence-card">
+      <div class="source-top"><div><strong>${esc(item.name)}</strong><div class="source-meta mono">${esc(item.sku)}</div></div>${pill(item.status)}</div>
+      <p>${esc(item.description || "")}</p>
+      <div class="metric-row">
+        <span class="metric-chip">建议价 ${esc(item.price_currency || "CNY")} ${n(item.price_suggestion, 2)}</span>
+        <span class="metric-chip">真实商品包 ${latestBuild?.status === "SUCCESS" ? "已生成" : "未生成"}</span>
+        <span class="metric-chip">Gate B ${esc(gateDecision)}</span>
+        <span class="metric-chip">授权 ${esc(item.license_readiness?.decision || "NOT_CHECKED")}</span>
+        <span class="metric-chip">发布 ${esc(latestPublish?.status || "未发布")}</span>
+      </div>
+      ${blockers.length ? `<div class="source-error">${esc(blockers.join("、"))}</div>` : ""}
+      <div class="toolbar">
+        <button class="btn secondary" onclick="buildArtifact(${Number(item.id)})">生成真实商品包</button>
+        ${download}
+        <button class="btn secondary" onclick="runGateB(${Number(item.id)})">运行 Gate B</button>
+        <button class="btn ghost" onclick="openProduct(${Number(item.id)})">查看详情</button>
+        ${approve}
+        ${publish}
+      </div>
+      ${external}
+    </article>`;
   }).join("");
-  document.getElementById("view-products").innerHTML = panel("商品生命周期 / Gate B", body || empty("暂无商品草稿"));
+  document.getElementById("view-products").innerHTML = panel("商品生产 / Gate B / 真发布", body || empty("暂无商品草稿"));
 }
 
 async function renderCost() {
@@ -318,6 +349,9 @@ async function runGateA(id) { await mutate(`/api/opportunities/${id}/gate-a`, "G
 async function generateProduct(id) { await mutate(`/api/products/from-opportunity/${id}`, "商品草稿已生成"); }
 async function runGateB(id) { await mutate(`/api/products/${id}/gate-b`, "Gate B 已更新"); }
 async function approveProduct(id) { await mutate(`/api/products/${id}/approve`, "商品已批准"); }
+async function buildArtifact(id) { await mutate(`/api/products/${id}/build-artifact`, "真实商品包已生成"); }
+async function publishEtsy(id) { await mutate(`/api/products/${id}/publish/etsy`, "Etsy 商品已发布"); }
+function downloadArtifact(id) { window.open(`/api/products/${id}/artifact/download`, "_blank"); }
 
 async function analyzeOpportunity(id) {
   try {
@@ -422,6 +456,9 @@ window.analyzeOpportunity = analyzeOpportunity;
 window.generateProduct = generateProduct;
 window.runGateB = runGateB;
 window.approveProduct = approveProduct;
+window.buildArtifact = buildArtifact;
+window.publishEtsy = publishEtsy;
+window.downloadArtifact = downloadArtifact;
 window.openOpportunity = openOpportunity;
 window.openProduct = openProduct;
 window.openCard = openCard;

@@ -72,3 +72,19 @@ def test_market_intelligence_routes_are_exposed():
     assert ("/api/market-intel/summary", "GET") in paths
     assert ("/api/market-intel/collect", "POST") in paths
     assert ("/api/market-intel/rematch", "POST") in paths
+
+
+
+def test_real_build_and_etsy_publish_routes_are_exposed():
+    paths = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert ("/api/products/{product_id}/build-artifact", "POST") in paths
+    assert ("/api/products/{product_id}/builds", "GET") in paths
+    assert ("/api/products/{product_id}/artifact/download", "GET") in paths
+    assert ("/api/publish/etsy/status", "GET") in paths
+    assert ("/api/products/{product_id}/publish/etsy", "POST") in paths
+    assert ("/api/products/{product_id}/publish-runs", "GET") in paths

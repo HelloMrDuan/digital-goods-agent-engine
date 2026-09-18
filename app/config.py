@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
     db_path: str = str(BASE_DIR / "data" / "digital_goods.db")
+    artifact_dir: str = str(BASE_DIR / "data" / "generated")
+    default_product_currency: str = "CNY"
 
     # Production never falls back to fake AI or fake data.
     qiniu_api_token: str = ""
@@ -105,6 +107,16 @@ class Settings(BaseSettings):
     market_intel_high_sales_score: float = 60.0
     etsy_enrich_shop_sales: bool = True
     etsy_shop_enrich_limit: int = 8
+
+    # Real Etsy Open API v3 publishing. No fake success when credentials are absent.
+    etsy_api_key: str = ""
+    etsy_access_token: str = ""
+    etsy_shop_id: str = ""
+    etsy_taxonomy_id: int = 0
+    etsy_shop_currency: str = ""
+    etsy_listing_quantity: int = 999
+    etsy_who_made: str = "i_did"
+    etsy_when_made: str = "made_to_order"
 
     auto_collect_enabled: bool = False
     auto_collect_interval_minutes: int = 360

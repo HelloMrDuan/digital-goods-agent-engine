@@ -86,18 +86,26 @@ def _opportunity_id(signal_count: int = 2) -> int:
 
 def _fake_chat(**kwargs):
     name = str(kwargs["operation"]).replace("opportunity_agent_", "")
+    payload = kwargs.get("payload") or {}
+    digest = payload.get("digest") or {}
+    refs = list((digest.get("real_metrics") or {}).get("evidence_ids") or [])
+    if not refs:
+        refs = list(((payload.get("digest_metrics") or {}).get("evidence_ids") or []))
+    if not refs and isinstance(payload.get("signal"), dict):
+        refs = list(payload["signal"].get("evidence_refs") or [])
+    refs = refs[:2]
     outputs = {
         "signal": {
             "signals": ["repeated request for payroll automation"],
             "signal_strength": 82,
             "demand_pattern": "small teams want payroll automation",
-            "evidence_refs": [1, 2],
+            "evidence_refs": refs,
             "confidence": 85,
             "reasoning": "grounded in supplied requests",
         },
         "pain": {
             "target_users": ["small business operators"],
-            "pain_points": [{"pain": "manual overtime calculation", "severity": 80, "evidence_refs": [1, 2]}],
+            "pain_points": [{"pain": "manual overtime calculation", "severity": 80, "evidence_refs": refs}],
             "urgency": 72,
             "confidence": 82,
             "reasoning": "manual payroll work is repeatedly requested",

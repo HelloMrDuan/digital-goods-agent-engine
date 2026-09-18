@@ -263,6 +263,8 @@ def init_db() -> None:
                 sales_count REAL,
                 sales_scope TEXT,
                 sales_verified INTEGER NOT NULL DEFAULT 0,
+                digital_verified INTEGER NOT NULL DEFAULT 0,
+                digital_verification TEXT,
                 review_count REAL,
                 rating REAL,
                 favorites_count REAL,
@@ -572,6 +574,12 @@ def init_db() -> None:
 
 
         for name, ddl in {
+            "digital_verified": "INTEGER NOT NULL DEFAULT 0",
+            "digital_verification": "TEXT",
+        }.items():
+            _ensure_column(c, "market_intel_items", name, ddl)
+
+        for name, ddl in {
             "gate_status": "TEXT NOT NULL DEFAULT 'NOT_RUN'",
             "gate_score": "REAL",
             "gate_snapshot_hash": "TEXT",
@@ -579,6 +587,7 @@ def init_db() -> None:
             "gate_json": "TEXT",
             "approved_at": "TEXT",
             "approved_gate_snapshot_hash": "TEXT",
+            "artifact_format": "TEXT",
             "price_currency": "TEXT NOT NULL DEFAULT 'CNY'",
             "published_at": "TEXT",
             "published_platform": "TEXT",

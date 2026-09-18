@@ -37,6 +37,11 @@ WEB_DIR = BASE_DIR / "web"
 async def lifespan(_: FastAPI):
     init_db()
     bootstrap_sources()
+    try:
+        _activate_p0_from_real_login()
+    except Exception:
+        # Readiness remains visible through /api/flow/readiness; startup must not fake success or crash.
+        pass
     backfill_intents()
     start_scheduler()
     try:
@@ -83,6 +88,72 @@ def health() -> dict[str, Any]:
         "artifact_generation_enabled": True,
         "etsy_publishing": etsy_status(),
         "db": settings.db_path,
+    }
+
+
+@app.get("/api/flow/readiness")
+def flow_readiness() -> dict[str, Any]:
+    sources = list_sources()
+    p0 = [
+        source for source in sources
+        if source.get("priority") == "P0"
+        and source.get("role") == "demand"
+        and source.get("business_group") == "core_demand"
+    ]
+    enabled_p0 = [source for source in p0 if source.get("enabled")]
+    market_sources = [source for source in sources if source.get("role") == "market" and source.get("enabled")]
+    with conn() as c:
+        demand_evidence = 0
+        if enabled_p0:
+            ids = [int(source["id"]) for source in enabled_p0]
+            placeholders = ",".join("?" for _ in ids)
+            demand_evidence = int(
+                c.execute(
+                    f"SELECT COUNT(DISTINCT evidence_id) c FROM evidence_sources WHERE source_id IN ({placeholders})",
+                    tuple(ids),
+                ).fetchone()["c"]
+            )
+        market_items = int(c.execute("SELECT COUNT(*) c FROM market_intel_items").fetchone()["c"])
+        active_opportunities = int(c.execute("SELECT COUNT(*) c FROM opportunities WHERE cluster_active=1").fetchone()["c"])
+        built_packages = int(c.execute("SELECT COUNT(*) c FROM product_builds WHERE status='SUCCESS'").fetchone()["c"])
+        published_products = int(c.execute("SELECT COUNT(*) c FROM products WHERE status='PUBLISHED'").fetchone()["c"])
+
+    etsy = etsy_status()
+    stages = {
+        "real_demand": {
+            "configured": bool(enabled_p0),
+            "data_available": demand_evidence > 0,
+            "enabled_sources": [source.get("name") for source in enabled_p0],
+            "evidence_count": demand_evidence,
+            "requirement": "OpenCLI/Agent-Reach real login channel for P0 demand sources",
+        },
+        "market_ranking": {
+            "configured": bool(market_sources),
+            "data_available": market_items > 0,
+            "enabled_sources": [source.get("name") for source in market_sources],
+            "market_item_count": market_items,
+        },
+        "opportunity_analysis": {
+            "configured": settings.is_llm_configured,
+            "active_opportunity_count": active_opportunities,
+        },
+        "real_product_build": {
+            "configured": settings.is_llm_configured,
+            "artifact_dir": settings.artifact_dir,
+            "successful_package_count": built_packages,
+        },
+        "etsy_publish": {
+            **etsy,
+            "published_product_count": published_products,
+        },
+    }
+    return {
+        "auto_collect_enabled": settings.auto_collect_enabled,
+        "auto_collect_interval_minutes": settings.auto_collect_interval_minutes,
+        "stages": stages,
+        "discovery_ready": bool(enabled_p0 and market_sources and settings.is_llm_configured),
+        "full_publish_ready": bool(enabled_p0 and market_sources and settings.is_llm_configured and etsy.get("configured")),
+        "truth_policy": "A stage is not marked configured/ready when its real login, provider, or publishing credentials are missing.",
     }
 
 

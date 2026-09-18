@@ -88,3 +88,14 @@ def test_real_build_and_etsy_publish_routes_are_exposed():
     assert ("/api/publish/etsy/status", "GET") in paths
     assert ("/api/products/{product_id}/publish/etsy", "POST") in paths
     assert ("/api/products/{product_id}/publish-runs", "GET") in paths
+
+
+
+def test_full_flow_readiness_route_is_exposed():
+    paths = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert ("/api/flow/readiness", "GET") in paths

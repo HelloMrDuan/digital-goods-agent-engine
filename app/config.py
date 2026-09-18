@@ -118,8 +118,8 @@ class Settings(BaseSettings):
     etsy_who_made: str = "i_did"
     etsy_when_made: str = "made_to_order"
 
-    auto_collect_enabled: bool = False
-    auto_collect_interval_minutes: int = 360
+    auto_collect_enabled: bool = True
+    auto_collect_interval_minutes: int = 180
 
     @property
     def is_sensenova_configured(self) -> bool:

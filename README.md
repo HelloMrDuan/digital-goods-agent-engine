@@ -72,4 +72,7 @@ node --check web/app.js
 - 闲鱼搜索结果位置记录为真实搜索排名；价格、想要数等只在页面明确暴露时记录，不推测销量。
 - 真上架通过本机 Agent-Reach Bridge 调用 `opencli xianyu publish`。默认桥接器只读；要允许发布必须在运行 bridge 的主机显式设置 `AGENT_REACH_BRIDGE_ALLOW_WRITES=true`。
 - 服务端还必须配置 `XIANYU_PUBLISH_CATEGORY`，否则发布接口明确拒绝，不伪造成功。
-- 闲鱼官方 TOP 订单/虚拟发货能力属于定向合作方能力，官方要求对应 AppKey/API 权限及聚石塔部署；未具备这些条件时系统只报告 NOT_CONFIGURED，不冒充自动发货已接通。
+- 闲鱼官方 TOP 订单/虚拟发货已接入：`GET /api/xianyu/orders/{biz_order_id}` 查询真实订单；只有 `order_status=2`（已付款）才允许 `POST /api/xianyu/orders/{biz_order_id}/virtual-delivery?product_id=...`。
+- TOP 正式网关默认 `https://gw.api.taobao.com/router/rest`，使用 AppKey/AccessToken/MD5 签名；未配置合作方权限时明确 NOT_CONFIGURED。
+- 官方虚拟发货只表示“无物流发货确认”，不代表 ZIP 文件已经传给买家；系统落库为 `VIRTUAL_SHIPPED` 且 `file_transferred=false`，避免伪造真实文件交付。
+- TOP 能力属于闲鱼定向合作方能力，仍需对应 AppKey/API 权限以及聚石塔部署。

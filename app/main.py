@@ -47,4 +47,4 @@ async def _guard_real_refresh(request, call_next):
 
 
 app.include_router(opportunity_v12_router)
-app.version = "1.2.1-opportunity-agent"
+app.version = "1.2.2-product-lifecycle"

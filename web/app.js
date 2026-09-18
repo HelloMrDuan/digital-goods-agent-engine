@@ -106,7 +106,7 @@ async function renderDashboard() {
   ].join("");
   const opportunities = (data.top_opportunities || []).map((item) => `
     <div class="evidence-card">
-      <div class="source-top"><strong>${esc(item.title)}</strong>${pill(item.validation_status || "NOT_VALIDATED")}</div>
+      <div class="source-top"><strong>${esc(item.title)}</strong>${pill(item.gate_a?.decision || "NOT_RUN")}</div>
       <div class="metric-row"><span class="metric-chip">信号 ${n(item.effective_signal_count)}</span><span class="metric-chip">明确需求 ${n(item.explicit_demand_count)}</span><span class="metric-chip">平台 ${n(item.platform_count)}</span><span class="metric-chip">可信趋势 ${n(item.trusted_trend_score, 1)}</span></div>
       <button class="btn ghost" onclick="openOpportunity(${Number(item.id)})">查看证据</button>
     </div>`).join("");
@@ -154,10 +154,10 @@ function opportunityCardHtml(card) {
   const product = card.card?.primary_product || card.recommended_products?.[0]?.name || "—";
   return `<article class="evidence-card">
     <div class="source-top"><div><div class="opportunity-title">${esc(card.title)}</div><div class="source-meta">${esc(card.category || "未分类")} · ${esc((card.source_platforms || []).join(" / ") || "未知来源")}</div></div>${pill(card.decision)}</div>
-    <div class="metric-row"><span class="metric-chip">最终分 ${n(card.final_score, 1)}</span><span class="metric-chip">市场 ${n(card.market_score, 1)}</span><span class="metric-chip">风险 ${n(card.risk_score, 1)}</span><span class="metric-chip">购买意愿 ${n(card.purchase_intent, 1)}</span><span class="metric-chip">置信度 ${n(card.confidence, 1)}</span><span class="metric-chip">证据 ${n(card.evidence_count)}</span></div>
+    <div class="metric-row"><span class="metric-chip">最终分 ${n(card.final_score, 1)}</span><span class="metric-chip">市场 ${n(card.market_score, 1)}</span><span class="metric-chip">风险 ${n(card.risk_score, 1)}</span><span class="metric-chip">购买意愿 ${n(card.purchase_intent, 1)}</span><span class="metric-chip">置信度 ${n(card.confidence, 1)}</span><span class="metric-chip">证据 ${n(card.evidence_count)}</span><span class="metric-chip">Gate A ${esc(card.gate_a?.decision || "NOT_RUN")}</span></div>
     ${card.stale ? '<div class="source-error">证据已变化：该商机卡需要重新分析</div>' : ""}
     <p><strong>目标用户：</strong>${users}</p><p><strong>核心痛点：</strong>${pains}</p><p><strong>优先商品：</strong>${esc(product)} · ${esc(priceText(card.price_range))}</p>
-    <div class="toolbar"><button class="btn primary" onclick="openCard(${Number(card.id)})">查看商机卡</button><button class="btn secondary" onclick="analyzeOpportunity(${Number(card.opportunity_id)})">重新分析</button><button class="btn secondary" onclick="generateProduct(${Number(card.opportunity_id)})">生成商品草稿</button></div>
+    <div class="toolbar"><button class="btn primary" onclick="openCard(${Number(card.id)})">查看商机卡</button><button class="btn secondary" onclick="runGateA(${Number(card.opportunity_id)})">运行 Gate A</button><button class="btn secondary" onclick="analyzeOpportunity(${Number(card.opportunity_id)})">重新分析</button><button class="btn secondary" onclick="generateProduct(${Number(card.opportunity_id)})">生成商品草稿</button></div>
   </article>`;
 }
 
@@ -165,7 +165,7 @@ function candidateHtml(item) {
   return `<article class="evidence-card">
     <div class="source-top"><div><div class="opportunity-title">${esc(item.title)}</div><div class="source-meta">${esc(item.category || "待 Agent 判断")} · ${esc(item.status)}</div></div>${pill(item.validation_status || "NOT_VALIDATED")}</div>
     <div class="metric-row"><span class="metric-chip">独立需求 ${n(item.effective_signal_count)}</span><span class="metric-chip">明确 ${n(item.explicit_demand_count)}</span><span class="metric-chip">平台 ${n(item.platform_count)}</span><span class="metric-chip">质量 ${n(item.data_quality_score, 1)}</span><span class="metric-chip">可信趋势 ${n(item.trusted_trend_score, 1)}</span></div>
-    <div class="toolbar"><button class="btn ghost" onclick="openOpportunity(${Number(item.id)})">证据详情</button><button class="btn secondary" onclick="validateOpportunity(${Number(item.id)})">商业验证</button><button class="btn primary" onclick="analyzeOpportunity(${Number(item.id)})">多 Agent 分析</button></div>
+    <div class="toolbar"><button class="btn ghost" onclick="openOpportunity(${Number(item.id)})">证据详情</button><button class="btn secondary" onclick="runGateA(${Number(item.id)})">运行 Gate A</button><button class="btn primary" onclick="analyzeOpportunity(${Number(item.id)})">多 Agent 分析</button></div>
   </article>`;
 }
 
@@ -193,8 +193,16 @@ async function renderQuality() {
 
 async function renderProducts() {
   const rows = await api("/api/products?limit=200");
-  const body = rows.map((item) => `<article class="evidence-card"><div class="source-top"><div><strong>${esc(item.name)}</strong><div class="source-meta mono">${esc(item.sku)}</div></div>${pill(item.status)}</div><p>${esc(item.description || "")}</p><div class="metric-row"><span class="metric-chip">建议价 ¥${n(item.price_suggestion, 2)}</span><span class="metric-chip">交付物 ${(item.deliverables || []).length}</span></div>${item.status === "DRAFT" ? `<button class="btn primary" onclick="approveProduct(${Number(item.id)})">人工批准</button>` : ""}</article>`).join("");
-  document.getElementById("view-products").innerHTML = panel("商品草稿", body || empty("暂无商品草稿"));
+  const body = rows.map((item) => {
+    const gate = item.gate_b || {};
+    const gateDecision = gate.is_current === false && gate.decision !== "NOT_RUN" ? "STALE" : (gate.decision || item.gate_status || "NOT_RUN");
+    const blockers = (gate.blockers || []).concat(gate.review_flags || []);
+    const approve = item.status === "DRAFT" && gateDecision === "PASS"
+      ? `<button class="btn primary" onclick="approveProduct(${Number(item.id)})">人工批准</button>`
+      : "";
+    return `<article class="evidence-card"><div class="source-top"><div><strong>${esc(item.name)}</strong><div class="source-meta mono">${esc(item.sku)}</div></div>${pill(item.status)}</div><p>${esc(item.description || "")}</p><div class="metric-row"><span class="metric-chip">建议价 ¥${n(item.price_suggestion, 2)}</span><span class="metric-chip">交付物 ${(item.deliverables || []).length}</span><span class="metric-chip">Gate B ${esc(gateDecision)}</span><span class="metric-chip">Gate 分 ${n(gate.score ?? item.gate_score, 1)}</span></div>${blockers.length ? `<div class="source-error">${esc(blockers.join("、"))}</div>` : ""}<div class="toolbar"><button class="btn secondary" onclick="runGateB(${Number(item.id)})">运行 Gate B</button><button class="btn ghost" onclick="openProduct(${Number(item.id)})">查看详情</button>${approve}</div></article>`;
+  }).join("");
+  document.getElementById("view-products").innerHTML = panel("商品生命周期 / Gate B", body || empty("暂无商品草稿"));
 }
 
 async function renderCost() {
@@ -236,7 +244,9 @@ async function sourceAction(path) { await mutate(path, "操作完成"); }
 async function opportunityAction(path) { await mutate(path, "商机已更新"); }
 async function collectSource(id) { await mutate(`/api/sources/${id}/collect?force=true`, "采集完成"); }
 async function validateOpportunity(id) { await mutate(`/api/opportunities/${id}/validation`, "商业验证完成"); }
+async function runGateA(id) { await mutate(`/api/opportunities/${id}/gate-a`, "Gate A 已更新"); }
 async function generateProduct(id) { await mutate(`/api/products/from-opportunity/${id}`, "商品草稿已生成"); }
+async function runGateB(id) { await mutate(`/api/products/${id}/gate-b`, "Gate B 已更新"); }
 async function approveProduct(id) { await mutate(`/api/products/${id}/approve`, "商品已批准"); }
 
 async function analyzeOpportunity(id) {
@@ -297,6 +307,17 @@ async function openOpportunity(id) {
   } catch (error) { showToast(error.message, true); }
 }
 
+async function openProduct(id) {
+  try {
+    const item = await api(`/api/products/${id}`);
+    const gate = item.gate_b || {};
+    const checks = Object.entries(gate.checks || {}).map(([name, check]) => `<div class="progress-row"><span>${esc(name)}</span>${pill(check.ok ? "PASS" : check.severity || "FAIL")}<span>${esc(check.reason || "—")}</span></div>`).join("");
+    document.getElementById("drawer-title").textContent = item.name || item.sku;
+    document.getElementById("drawer-body").innerHTML = `<div class="detail-grid"><div class="detail-box"><span>商品状态</span>${pill(item.status)}</div><div class="detail-box"><span>Gate B</span>${pill(gate.is_current === false && gate.decision !== "NOT_RUN" ? "STALE" : (gate.decision || "NOT_RUN"))}</div><div class="detail-box"><span>Gate 分</span><strong>${n(gate.score, 1)}</strong></div><div class="detail-box"><span>建议价</span><strong>¥${n(item.price_suggestion, 2)}</strong></div></div><p><strong>标题：</strong>${esc(item.title || "—")}</p><p><strong>描述：</strong>${esc(item.description || "—")}</p><h3 class="section-title">Gate B 检查项</h3>${checks || empty("Gate B 尚未运行")}`;
+    document.getElementById("drawer").classList.remove("hidden");
+  } catch (error) { showToast(error.message, true); }
+}
+
 async function openCard(cardId) {
   try {
     const card = await api(`/api/opportunity-cards/${cardId}`);
@@ -322,10 +343,13 @@ window.collectSource = collectSource;
 window.sourceAction = sourceAction;
 window.opportunityAction = opportunityAction;
 window.validateOpportunity = validateOpportunity;
+window.runGateA = runGateA;
 window.analyzeOpportunity = analyzeOpportunity;
 window.generateProduct = generateProduct;
+window.runGateB = runGateB;
 window.approveProduct = approveProduct;
 window.openOpportunity = openOpportunity;
+window.openProduct = openProduct;
 window.openCard = openCard;
 window.startRebuild = startRebuild;
 

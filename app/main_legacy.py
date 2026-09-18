@@ -21,7 +21,8 @@ from .services.sources import bootstrap_sources, collect_source, create_source, 
 from .services.scheduler import run_cycle as scheduler_run_cycle, scheduler_status, start_scheduler, stop_scheduler
 from .services.quality import data_quality_report
 from .services.ingest import backfill_intents
-from .services.validation import get_validation, require_current_validation, validate_active_opportunities, validate_opportunity
+from .services.validation import get_gate_a, get_validation, require_current_validation, validate_active_opportunities, validate_opportunity
+from .services.product_lifecycle import approve_product, evaluate_gate_b, get_gate_b, get_product, list_delivery_records, require_approved_current_product
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -447,7 +448,13 @@ def opportunities_build():
 
 @app.get("/api/opportunities")
 def opportunities_list(status: str | None = None, cross_source_only: bool = False, limit: int = Query(default=100, ge=1, le=500)):
-    return list_opportunities(limit=limit, status=status, cross_source_only=cross_source_only)
+    rows = list_opportunities(limit=limit, status=status, cross_source_only=cross_source_only)
+    for item in rows:
+        try:
+            item["gate_a"] = get_gate_a(int(item["id"]))
+        except Exception as exc:
+            item["gate_a"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
+    return rows
 
 
 @app.get("/api/trends")
@@ -540,30 +547,56 @@ def products_generate(opportunity_id: int):
 @app.get("/api/products")
 def products_list(limit: int = Query(default=100, ge=1, le=500)):
     with conn() as c:
-        rows = c.execute("SELECT * FROM products ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        rows = c.execute("SELECT id FROM products ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     out = []
-    for r in rows:
-        d = row_to_dict(r) or {}
-        d["keywords"] = loads(d.pop("keywords_json", None), [])
-        d["deliverables"] = loads(d.pop("deliverables_json", None), [])
-        d["faq"] = loads(d.pop("faq_json", None), [])
-        out.append(d)
+    for row in rows:
+        product = get_product(int(row["id"]))
+        if not product:
+            continue
+        try:
+            product["gate_b"] = get_gate_b(int(row["id"]))
+        except Exception as exc:
+            product["gate_b"] = {"decision": "REVIEW_REQUIRED", "is_current": False, "error": str(exc)}
+        out.append(product)
     return out
+
+
+@app.get("/api/products/{product_id}")
+def product_detail(product_id: int):
+    product = get_product(product_id)
+    if not product:
+        raise HTTPException(404, "product not found")
+    try:
+        product["gate_b"] = get_gate_b(product_id)
+    except Exception:
+        product["gate_b"] = {"product_id": product_id, "decision": "NOT_RUN", "is_current": False}
+    return product
+
+
+@app.get("/api/products/{product_id}/gate-b")
+def product_gate_b_get(product_id: int):
+    try:
+        return get_gate_b(product_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+
+
+@app.post("/api/products/{product_id}/gate-b")
+def product_gate_b_run(product_id: int):
+    try:
+        return evaluate_gate_b(product_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
 
 
 @app.post("/api/products/{product_id}/approve")
 def product_approve(product_id: int):
-    with conn() as c:
-        row = c.execute("SELECT id,opportunity_id FROM products WHERE id=?", (product_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "product not found")
     try:
-        require_current_validation(int(row["opportunity_id"]))
+        return approve_product(product_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    with conn() as c:
-        c.execute("UPDATE products SET status='APPROVED',updated_at=? WHERE id=?", (now_iso(), product_id))
-    return {"id": product_id, "status": "APPROVED"}
 
 
 @app.get("/api/ai/cost")
@@ -574,20 +607,45 @@ def ai_cost(limit: int = Query(default=100, ge=1, le=500)):
     return {"total_cost_cny": round(float(total or 0), 6), "daily_budget_cny": settings.daily_ai_budget_cny, "runs": [row_to_dict(r) for r in rows]}
 
 
+@app.get("/api/deliveries")
+def deliveries_list(limit: int = Query(default=100, ge=1, le=500)):
+    return list_delivery_records(limit)
+
+
 @app.post("/api/deliveries")
 def delivery_create(body: DeliveryIn):
+    try:
+        require_approved_current_product(body.product_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
     now = now_iso()
+    resource = dict(body.resource or {})
+    if body.delivery_uri and "uri" not in resource:
+        resource["uri"] = body.delivery_uri
+    delivered = bool(body.delivery_uri or resource) and body.delivery_type != "manual_review"
+    status = "DELIVERED" if delivered else "PENDING"
+    delivered_at = now if delivered else None
     with conn() as c:
-        product = c.execute("SELECT id FROM products WHERE id=?", (body.product_id,)).fetchone()
-        if not product:
-            raise HTTPException(404, "product not found")
         try:
             cur = c.execute(
-                "INSERT INTO deliveries(product_id,platform,order_ref,buyer_ref,delivery_uri,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (body.product_id, body.platform, body.order_ref, body.buyer_ref, body.delivery_uri, "DELIVERED" if body.delivery_uri else "PENDING", now, now),
+                """INSERT INTO deliveries(
+                       product_id,platform,order_ref,buyer_ref,delivery_uri,delivery_type,resource_json,retry_count,error_message,delivered_at,status,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    body.product_id, body.platform, body.order_ref, body.buyer_ref, body.delivery_uri,
+                    body.delivery_type, dumps(resource) if resource else None, 0, None, delivered_at, status, now, now,
+                ),
             )
         except Exception as exc:
             if "UNIQUE constraint failed" in str(exc):
                 raise HTTPException(409, "order already exists")
             raise
-    return {"id": int(cur.lastrowid), "status": "DELIVERED" if body.delivery_uri else "PENDING"}
+    return {
+        "id": int(cur.lastrowid),
+        "status": status,
+        "delivery_type": body.delivery_type,
+        "delivered_at": delivered_at,
+    }

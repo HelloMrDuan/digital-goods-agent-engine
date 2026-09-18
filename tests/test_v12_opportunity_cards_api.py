@@ -41,4 +41,4 @@ def test_rebuild_concurrency_is_bounded(monkeypatch):
 
 
 def test_main_reports_opportunity_agent_version():
-    assert app.version == "1.2.1-opportunity-agent"
+    assert app.version == "1.2.2-product-lifecycle"

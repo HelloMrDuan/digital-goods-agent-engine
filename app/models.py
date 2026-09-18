@@ -23,7 +23,12 @@ class SourceUpdate(BaseModel):
 
 class DeliveryIn(BaseModel):
     product_id: int
-    platform: str = "manual"
+    platform: str = Field(default="manual", min_length=1, max_length=80)
     order_ref: str = Field(min_length=1, max_length=200)
     buyer_ref: str | None = Field(default=None, max_length=300)
     delivery_uri: str | None = Field(default=None, max_length=2000)
+    delivery_type: str = Field(
+        default="manual",
+        pattern="^(manual|file_download|cloud_drive_link|extraction_code|license_key|api_delivery|manual_review)$",
+    )
+    resource: dict[str, Any] | None = None

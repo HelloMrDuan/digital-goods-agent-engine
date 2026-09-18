@@ -229,10 +229,46 @@ def get_validation(opportunity_id: int) -> dict[str, Any]:
     return result
 
 
+def gate_a_from_validation(result: dict[str, Any]) -> dict[str, Any]:
+    status = str(result.get("status") or "NOT_VALIDATED").upper()
+    reasons = list(result.get("reason_codes") or [])
+    if status == "PASSED" and bool(result.get("is_current", True)):
+        decision = "PASS"
+    elif status in {"NOT_VALIDATED", "STALE"} or not bool(result.get("is_current")):
+        decision = "REVIEW_REQUIRED"
+    elif {"no_explicit_demand", "no_recent_demand"}.intersection(reasons):
+        decision = "REJECT"
+    else:
+        decision = "REVIEW_REQUIRED"
+    return {
+        "opportunity_id": result.get("opportunity_id"),
+        "decision": decision,
+        "score": result.get("score"),
+        "reasons": reasons,
+        "evidence_metrics": result.get("metrics") or {},
+        "snapshot_hash": result.get("snapshot_hash"),
+        "current_snapshot_hash": result.get("current_snapshot_hash"),
+        "is_current": bool(result.get("is_current")),
+        "policy_version": result.get("policy_version") or POLICY_VERSION,
+        "source_validation_status": status,
+    }
+
+
+def evaluate_gate_a(opportunity_id: int) -> dict[str, Any]:
+    result = validate_opportunity(opportunity_id)
+    result["is_current"] = True
+    result["current_snapshot_hash"] = result.get("snapshot_hash")
+    return gate_a_from_validation(result)
+
+
+def get_gate_a(opportunity_id: int) -> dict[str, Any]:
+    return gate_a_from_validation(get_validation(opportunity_id))
+
+
 def require_current_validation(opportunity_id: int) -> dict[str, Any]:
     result = get_validation(opportunity_id)
     if result.get("status") != "PASSED" or not result.get("is_current"):
-        raise ValueError("current commercial validation must pass before paid AI analysis or product generation")
+        raise ValueError("current commercial validation must pass before product generation or approval")
     return result
 
 

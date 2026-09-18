@@ -260,6 +260,22 @@ def init_db() -> None:
                 FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE RESTRICT
             );
 
+            CREATE TABLE IF NOT EXISTS product_gate_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                decision TEXT NOT NULL,
+                score REAL NOT NULL,
+                policy_version TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                checks_json TEXT NOT NULL,
+                blockers_json TEXT NOT NULL,
+                review_flags_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_gate_product
+                ON product_gate_runs(product_id, id DESC);
+
             CREATE TABLE IF NOT EXISTS deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER NOT NULL,
@@ -267,6 +283,11 @@ def init_db() -> None:
                 order_ref TEXT NOT NULL,
                 buyer_ref TEXT,
                 delivery_uri TEXT,
+                delivery_type TEXT NOT NULL DEFAULT 'manual',
+                resource_json TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                delivered_at TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -403,6 +424,42 @@ def init_db() -> None:
         }.items():
             _ensure_column(c, "opportunities", name, ddl)
 
+
+        for name, ddl in {
+            "gate_status": "TEXT NOT NULL DEFAULT 'NOT_RUN'",
+            "gate_score": "REAL",
+            "gate_snapshot_hash": "TEXT",
+            "gate_checked_at": "TEXT",
+            "gate_json": "TEXT",
+            "approved_at": "TEXT",
+        }.items():
+            _ensure_column(c, "products", name, ddl)
+
+        for name, ddl in {
+            "delivery_type": "TEXT NOT NULL DEFAULT 'manual'",
+            "resource_json": "TEXT",
+            "retry_count": "INTEGER NOT NULL DEFAULT 0",
+            "error_message": "TEXT",
+            "delivered_at": "TEXT",
+        }.items():
+            _ensure_column(c, "deliveries", name, ddl)
+
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS product_gate_runs (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   product_id INTEGER NOT NULL,
+                   decision TEXT NOT NULL,
+                   score REAL NOT NULL,
+                   policy_version TEXT NOT NULL,
+                   snapshot_hash TEXT NOT NULL,
+                   checks_json TEXT NOT NULL,
+                   blockers_json TEXT NOT NULL,
+                   review_flags_json TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+               )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_product_gate_product ON product_gate_runs(product_id, id DESC)")
 
         for name, ddl in {
             "trend_confidence": "REAL NOT NULL DEFAULT 0",

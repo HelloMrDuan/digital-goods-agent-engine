@@ -34,3 +34,19 @@ def test_frontend_bundle_exists():
     bundle = BASE_DIR / "web" / "app.js"
     assert bundle.is_file()
     assert bundle.stat().st_size > 1000
+
+def test_gate_a_gate_b_and_fulfillment_routes_are_exposed():
+    paths = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert ("/api/opportunities/{opportunity_id}/gate-a", "GET") in paths
+    assert ("/api/opportunities/{opportunity_id}/gate-a", "POST") in paths
+    assert ("/api/products/{product_id}", "GET") in paths
+    assert ("/api/products/{product_id}/gate-b", "GET") in paths
+    assert ("/api/products/{product_id}/gate-b", "POST") in paths
+    assert ("/api/products/{product_id}/approve", "POST") in paths
+    assert ("/api/deliveries", "GET") in paths
+    assert ("/api/deliveries", "POST") in paths

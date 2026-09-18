@@ -1,3 +1,13 @@
+# V1.2.2 — Gate A / Gate B Product Lifecycle
+
+- 将既有真实需求商业验证显式标准化为 Gate A：`PASS / REJECT / REVIEW_REQUIRED`，继续坚持 evidence-first，不用 AI 补造需求指标。
+- 新增确定性 Gate B：检查当前 Gate A、商机分析快照、版权/合规风险、SKU、标题、描述、价格、交付物、FAQ 与合规备注。
+- Gate B 结果绑定商品内容 + 商机分析 + Gate A 快照；真实证据或商品内容变化后，旧 Gate B 会自动失效，不能继续批准或交付。
+- 商品人工批准收口到 Gate B：只有 `PASS` 才能进入 `APPROVED`，并把对应商机推进到 `READY_TO_PUBLISH`。
+- 交付记录扩展 `delivery_type/resource/retry/error/delivered_at`，并要求商品已批准且 Gate B 当前有效，禁止用假资源模拟已交付。
+- 新增商品详情、Gate A、Gate B、交付查询 API；前端商机页和商品页直接展示 Gate 状态、阻塞原因和检查项。
+- 旧 SQLite 数据库原地迁移，不删除既有真实 evidence、商机、商品或历史交付记录。
+
 # V1.2.0 — Real-Demand Commercial Validation Gate
 
 - 新增零 AI 的商业验证 Gate：基于独立需求信号、明确需求、作者/平台多样性、证据质量、时间覆盖和近 30 天需求判断商机是否可继续投入。

@@ -12,6 +12,7 @@ from .db import conn, dumps, loads, now_iso, row_to_dict
 from .services.analyze import analyze_one
 from .services.demand_discovery import run_demand_discovery
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity
+from .services.validation import evaluate_gate_a, get_gate_a
 from .services.opportunity_agent import (
     get_card_for_opportunity,
     get_opportunity_card,
@@ -376,6 +377,10 @@ def opportunity_cards_list(
         card["trend_score"] = meta.get("trend_score")
         card["trusted_trend_score"] = meta.get("trusted_trend_score")
         card["data_quality_score"] = meta.get("data_quality_score")
+        try:
+            card["gate_a"] = get_gate_a(int(card["opportunity_id"]))
+        except Exception as exc:
+            card["gate_a"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
     return cards
 
 
@@ -405,3 +410,21 @@ def opportunity_agent_runs(opportunity_id: int, limit: int = Query(default=50, g
     if not get_opportunity(opportunity_id):
         raise HTTPException(404, "opportunity not found")
     return list_agent_runs(opportunity_id, limit)
+
+
+@router.get("/api/opportunities/{opportunity_id}/gate-a")
+def opportunity_gate_a_get(opportunity_id: int):
+    try:
+        return get_gate_a(opportunity_id)
+    except KeyError:
+        raise HTTPException(404, "opportunity not found")
+
+
+@router.post("/api/opportunities/{opportunity_id}/gate-a")
+def opportunity_gate_a_run(opportunity_id: int):
+    try:
+        return evaluate_gate_a(opportunity_id)
+    except KeyError:
+        raise HTTPException(404, "opportunity not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))

@@ -193,3 +193,35 @@ def test_etsy_parser_keeps_public_shop_sales_scope_separate_from_listing():
 
     assert _etsy_shop_sales("<div>12,345 sales</div>") == 12345
     assert _etsy_shop_sales("<div>No public sales metric</div>") is None
+
+
+
+def test_missing_rating_never_uses_neutral_fake_rating(monkeypatch):
+    source_id = _market_source("market-no-rating")
+    item = _market_item("4", "Resume Template Without Rating", rank=4, sales_count=None, sales_scope=None)
+    item.raw["market_metrics"]["rating"] = None
+    item.raw["market_metrics"]["review_count"] = 500
+    monkeypatch.setattr(sources, "_dispatch", lambda source, config, limit: [item])
+
+    collect_source(source_id, force=True)
+    row = list_market_intel(10)[0]
+
+    assert row["rating"] is None
+    assert row["metric_availability"]["rating"] is False
+    assert row["score_basis"] == "heat_only"
+
+
+def test_sales_with_unknown_scope_is_not_converted_to_sales_score(monkeypatch):
+    source_id = _market_source("market-unknown-sales-scope")
+    item = _market_item("5", "Template With Ambiguous Sales Scope", rank=2, sales_count=5000, sales_scope="unknown")
+    monkeypatch.setattr(sources, "_dispatch", lambda source, config, limit: [item])
+
+    collect_source(source_id, force=True)
+    row = list_market_intel(10)[0]
+
+    assert row["sales_count"] == 5000
+    assert row["sales_verified"] is True
+    assert row["sales_scope"] == "unknown"
+    assert row["sales_score"] is None
+    assert row["high_sales"] is False
+    assert row["score_basis"] == "heat_only"

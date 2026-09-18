@@ -208,6 +208,7 @@ async function renderMarket() {
     stat("高销量", summary.high_sales || 0, `阈值 ${n(summary.sales_threshold, 0)}`),
     stat("高热 + 高销量", summary.hot_and_selling || 0, "优先商业情报"),
     stat("有真实销量", summary.verified_sales || 0, "保留 sales_scope"),
+    stat("有真实评分", summary.verified_ratings || 0, "未公开则不参与评分"),
   ].join("");
   const cards = (rows || []).map((item) => {
     const sales = item.sales_verified
@@ -221,7 +222,7 @@ async function renderMarket() {
     return `<article class="evidence-card">
       <div class="source-top"><div><strong>${esc(item.title)}</strong><div class="source-meta">${esc(item.marketplace)} · ${esc(item.seller || "seller unknown")}</div></div><div>${badges}</div></div>
       <div class="metric-row"><span class="metric-chip">热度 ${n(item.heat_score,1)}</span><span class="metric-chip">销量分 ${item.sales_score == null ? "—" : n(item.sales_score,1)}</span><span class="metric-chip">销量 ${sales}</span><span class="metric-chip">榜单 #${n(item.rank_position)}</span><span class="metric-chip">市场分 ${n(item.market_score,1)}</span></div>
-      <div class="source-meta">评论 ${n(item.review_count)} · 收藏 ${n(item.favorites_count)} · 浏览 ${n(item.views_count)} · 评分 ${n(item.rating,1)}</div>
+      <div class="source-meta">评论 ${n(item.review_count)} · 收藏 ${n(item.favorites_count)} · 浏览 ${n(item.views_count)} · 评分 ${item.metric_availability?.rating ? n(item.rating,1) : "未公开"} · 评分基础 ${esc(item.score_basis || "heat_only")}</div>
       ${item.source_url ? `<a class="evidence-link" href="${esc(safeUrl(item.source_url))}" target="_blank" rel="noreferrer">打开市场商品</a>` : ""}
     </article>`;
   }).join("");

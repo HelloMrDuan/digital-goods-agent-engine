@@ -39,8 +39,11 @@ def _scores(metrics: dict[str, Any]) -> tuple[float, float | None, float]:
     if favorites is not None:
         components.append((favorites, 0.15))
     if reviews is not None:
-        review_value = reviews * max(0.4, min(1.0, (rating or 4.0) / 5.0))
-        components.append((review_value, 0.20))
+        # Review count is a real observed metric and can stand on its own.
+        components.append((reviews, 0.15))
+    if rating is not None and 0.0 <= rating <= 5.0:
+        # Rating contributes only when the marketplace explicitly exposes it.
+        components.append((round(rating / 5.0 * 100.0, 2), 0.05))
     if components:
         weight = sum(item[1] for item in components)
         heat = sum(value * w for value, w in components) / max(weight, 0.0001)
@@ -57,9 +60,13 @@ def _scores(metrics: dict[str, Any]) -> tuple[float, float | None, float]:
     sales_score = _log_score(sales, 10000.0) if verified else None
     if sales_score is not None:
         scope = str(metrics.get("sales_scope") or "").lower()
-        factor = {"listing": 1.0, "product": 1.0, "shop": 0.65, "seller": 0.65, "account": 0.50}.get(scope, 0.45)
-        sales_score = round(sales_score * factor, 2)
-        market = round(heat * 0.55 + sales_score * 0.45, 2)
+        factor = {"listing": 1.0, "product": 1.0, "shop": 0.65, "seller": 0.65, "account": 0.50}.get(scope)
+        if factor is None:
+            sales_score = None
+            market = heat
+        else:
+            sales_score = round(sales_score * factor, 2)
+            market = round(heat * 0.55 + sales_score * 0.45, 2)
     else:
         market = heat
     return heat, sales_score, market
@@ -238,6 +245,15 @@ def _decode(row: Any) -> dict[str, Any]:
         and float(data.get("sales_score") or 0) >= float(settings.market_intel_high_sales_score)
     )
     data["hot_and_selling"] = data["high_heat"] and data["high_sales"]
+    data["metric_availability"] = {
+        "rating": data.get("rating") is not None,
+        "review_count": data.get("review_count") is not None,
+        "favorites_count": data.get("favorites_count") is not None,
+        "views_count": data.get("views_count") is not None,
+        "sales": bool(data.get("sales_verified")) and data.get("sales_count") is not None,
+        "sales_scope": data.get("sales_scope"),
+    }
+    data["score_basis"] = "heat_plus_sales" if data.get("sales_score") is not None else "heat_only"
     return data
 
 
@@ -299,6 +315,7 @@ def market_intel_summary() -> dict[str, Any]:
                       SUM(CASE WHEN sales_verified=1 AND sales_score>=? THEN 1 ELSE 0 END) high_sales,
                       SUM(CASE WHEN heat_score>=? AND sales_verified=1 AND sales_score>=? THEN 1 ELSE 0 END) hot_and_selling,
                       SUM(CASE WHEN sales_verified=1 THEN 1 ELSE 0 END) verified_sales,
+                      SUM(CASE WHEN rating IS NOT NULL THEN 1 ELSE 0 END) verified_ratings,
                       MAX(heat_score) max_heat,
                       MAX(sales_score) max_sales
                FROM market_intel_items""",
@@ -311,7 +328,7 @@ def market_intel_summary() -> dict[str, Any]:
         ).fetchone()
     data = row_to_dict(row) or {}
     return {
-        **{k: int(data.get(k) or 0) for k in ("total", "high_heat", "high_sales", "hot_and_selling", "verified_sales")},
+        **{k: int(data.get(k) or 0) for k in ("total", "high_heat", "high_sales", "hot_and_selling", "verified_sales", "verified_ratings")},
         "max_heat": round(float(data.get("max_heat") or 0), 2),
         "max_sales": round(float(data.get("max_sales") or 0), 2),
         "heat_threshold": float(settings.market_intel_high_heat_score),

@@ -210,7 +210,7 @@ def _etsy_shop_sales(page_html: str) -> int | None:
                 return int(value)
     text = re.sub(r"<[^>]+>", " ", page_html)
     text = html_lib.unescape(text)
-    match = re.search(r"([0-9][0-9,.s]*)\s+sales\b", text, flags=re.I)
+    match = re.search(r"([0-9][0-9,.\s]*)\s+sales\b", text, flags=re.I)
     if not match:
         return None
     digits = re.sub(r"[^0-9]", "", match.group(1))

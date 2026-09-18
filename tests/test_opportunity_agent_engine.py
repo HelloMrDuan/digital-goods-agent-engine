@@ -238,3 +238,48 @@ def test_agent_schema_rejects_extra_fields(monkeypatch):
 
     with pytest.raises(ValueError, match="output schema invalid"):
         opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+
+
+
+def test_market_intel_reaches_market_and_judge_agents(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+    captured = {}
+
+    monkeypatch.setattr(
+        opportunity_agent,
+        "market_intel_for_opportunity",
+        lambda oid: {
+            "matched_count": 1,
+            "high_heat_count": 1,
+            "high_sales_count": 1,
+            "hot_and_selling_count": 1,
+            "max_heat_score": 88.0,
+            "max_sales_score": 72.0,
+            "items": [{
+                "id": 99,
+                "title": "Payroll Workbook",
+                "rating": 4.9,
+                "review_count": 400,
+                "sales_count": 12000,
+                "sales_scope": "shop",
+                "sales_verified": True,
+                "heat_score": 88.0,
+                "sales_score": 72.0,
+                "market_score": 80.8,
+            }],
+            "truth_policy": "real metrics only",
+        },
+    )
+
+    def recording_chat(**kwargs):
+        name = str(kwargs["operation"]).replace("opportunity_agent_", "")
+        if name in {"market", "judge"}:
+            captured[name] = kwargs.get("payload") or {}
+        return _fake_chat(**kwargs)
+
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", recording_chat)
+    opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+
+    assert captured["market"]["market_intel"]["items"][0]["rating"] == 4.9
+    assert captured["market"]["market_intel"]["items"][0]["sales_scope"] == "shop"
+    assert captured["judge"]["market_intel"]["items"][0]["sales_verified"] is True

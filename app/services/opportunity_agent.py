@@ -628,7 +628,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
                 "REJECTED_RISK" if risk_score >= settings.high_risk_threshold else "ANALYZED",
                 round(purchase_intent),
                 round(_score(outputs["market"].get("competition_level"))),
-                round(_score(outputs["risk"].get("copyright_risk"), risk_score)),
+                round(_score(outputs["risk"].get("copyright_risk"))),
                 round(_score(outputs["product"].get("automation_fit"))),
                 round(final_score),
                 primary_product,

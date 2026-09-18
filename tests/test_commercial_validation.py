@@ -140,7 +140,18 @@ def test_product_generation_requires_current_passed_validation(monkeypatch):
     def fake_generate(*args, **kwargs):
         nonlocal called
         called = True
-        return {}
+        return {
+            "name": "原创工资表",
+            "category": "办公模板",
+            "audience": "小团队",
+            "price_suggestion": 29.0,
+            "title": "原创工资考勤自动计算模板",
+            "description": "根据真实需求生成的原创模板。",
+            "keywords": ["工资", "考勤"],
+            "deliverables": ["xlsx", "使用说明"],
+            "faq": [],
+            "compliance_notes": "仅原创内容",
+        }
 
     monkeypatch.setattr("app.services.analyze.generate_product", fake_generate)
     with pytest.raises(ValueError, match="commercial validation"):
@@ -198,7 +209,18 @@ def test_approved_product_is_blocked_after_validation_becomes_stale(monkeypatch)
             "UPDATE opportunities SET status='ANALYZED',overall_score=90,copyright_risk=10,analysis_json='{}',analysis_stale=0 WHERE id=?",
             (opportunity_id,),
         )
-    monkeypatch.setattr("app.services.analyze.generate_product", lambda *args, **kwargs: {"name": "原创工资表"})
+    monkeypatch.setattr("app.services.analyze.generate_product", lambda *args, **kwargs: {
+            "name": "原创工资表",
+            "category": "办公模板",
+            "audience": "小团队",
+            "price_suggestion": 29.0,
+            "title": "原创工资考勤自动计算模板",
+            "description": "根据真实需求生成的原创模板。",
+            "keywords": ["工资", "考勤"],
+            "deliverables": ["xlsx", "使用说明"],
+            "faq": [],
+            "compliance_notes": "仅原创内容",
+        })
     product_id = product_from_opportunity(opportunity_id)["product_id"]
 
     _insert(source, "three", "buyer-three", days_ago=3)

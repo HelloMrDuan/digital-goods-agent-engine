@@ -70,6 +70,37 @@ def test_xianyu_market_keeps_only_detail_verified_digital_goods(monkeypatch):
     assert rows[0].raw["market_metrics"]["want_count"] == pytest.approx(88)
 
 
+def test_xianyu_market_accepts_real_world_netdisk_delivery_wording(monkeypatch):
+    candidate = CollectedItem(
+        platform="xianyu",
+        source_type="agent_reach_xianyu",
+        source_item_id="987594951873",
+        source_url="https://www.goofish.com/item?id=987594951873",
+        title="手机可编辑Word简历模板",
+        content="Word简历模板，手机也可以直接编辑",
+        author="通通一米阳光",
+        raw={
+            "price": "¥1",
+            "want_count": "2205",
+            "_xianyu_detail_verified": True,
+            "_xianyu_detail": {
+                "description": "直接购买，拍下夸克网盘发货的 标价即售价，可以直接拍！",
+                "browse_count": "15016",
+                "collect_count": "153",
+            },
+        },
+    )
+    monkeypatch.setattr(xianyu, "collect_agent_reach", lambda *args, **kwargs: [candidate])
+
+    rows = xianyu.collect_xianyu_market("简历模板", 10)
+
+    assert len(rows) == 1
+    assert rows[0].raw["digital_verification"] == "xianyu_detail_marker:网盘发货"
+    assert rows[0].raw["market_metrics"]["want_count"] == pytest.approx(2205)
+    assert rows[0].raw["market_metrics"]["views_count"] == pytest.approx(15016)
+    assert rows[0].raw["market_metrics"]["favorites_count"] == pytest.approx(153)
+
+
 def test_xianyu_market_source_enters_market_intel_not_demand(monkeypatch):
     source_id = create_source(
         {

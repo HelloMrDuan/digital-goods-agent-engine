@@ -10,7 +10,7 @@ from .base import CollectedItem, CollectorError
 
 _DIGITAL_MARKERS = (
     "虚拟商品", "数字商品", "电子版", "电子文件", "数字下载", "下载链接",
-    "无需物流", "无实物", "自动发货", "在线交付", "网盘交付", "邮箱发送",
+    "无需物流", "无实物", "自动发货", "自动秒发", "在线交付", "网盘交付", "网盘发货", "邮箱发送",
     "源码交付", "脚本交付", "表格模板", "excel模板", "excel 模板",
 )
 
@@ -88,7 +88,8 @@ def collect_xianyu_market(query: str, limit: int = 30) -> list[CollectedItem]:
             continue
         price = _number(_first(item.raw, "price", "current_price", "currentPrice", "sold_price", "amount"))
         want_count = _number(_first(item.raw, "want_count", "wantCount", "wanted_count", "want_num", "wantNum", "favor_count"))
-        view_count = _number(_first(item.raw, "view_count", "viewCount", "views"))
+        view_count = _number(_first(item.raw, "view_count", "viewCount", "views", "browse_count", "browseCount"))
+        collect_count = _number(_first(item.raw, "collect_count", "collectCount", "favorite_count", "favorites_count"))
         seller = item.author or _first(item.raw, "seller_name", "sellerName", "user_name", "nick", "nickname")
         category = _first(item.raw, "category", "category_name", "categoryName")
         raw = dict(item.raw)
@@ -106,7 +107,7 @@ def collect_xianyu_market(query: str, limit: int = 30) -> list[CollectedItem]:
                     "currency": "CNY" if price is not None else None,
                     "want_count": want_count,
                     "views_count": view_count,
-                    "favorites_count": None,
+                    "favorites_count": collect_count,
                     "review_count": None,
                     "rating": None,
                     "sales_count": None,

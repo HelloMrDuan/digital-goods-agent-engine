@@ -48,3 +48,15 @@ def test_bootstrap_disables_legacy_v2ex_defaults_and_marks_them_auxiliary():
     assert cfg["priority"] == "P3"
     assert cfg["business_group"] == "auxiliary"
     assert cfg["recommended"] is False
+
+
+
+def test_bootstrap_adds_enabled_p1_market_intelligence_sources():
+    bootstrap_sources()
+    rows = list_sources()
+    market = [x for x in rows if x["role"] == "market"]
+    assert market
+    assert all(x["priority"] == "P1" for x in market)
+    assert all(x["business_group"] == "market_intel" for x in market)
+    assert any(x["source_type"] == "creative_market" and x["enabled"] for x in market)
+    assert any(x["source_type"] == "etsy_market" and x["enabled"] for x in market)

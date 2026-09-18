@@ -11,6 +11,7 @@ const views = {
   evidence: ["真实证据", "每条需求都可回到原帖、作者、时间和意图判断。"],
   opportunities: ["商机中心", "Evidence → Signal → Pain → Market → Product → Risk → Judge → Opportunity Card。"],
   trends: ["需求趋势", "趋势只由真实 evidence 时间戳和独立信号计算。"],
+  market: ["市场情报", "自动采集真实 Marketplace 榜单、互动与明确销量指标；销量口径原样保留。"],
   quality: ["数据质量", "检查来源覆盖、时效性和失败原因。"],
   products: ["商品中心", "仅从通过约束的商机生成原创商品草稿。"],
   cost: ["AI 成本", "展示真实模型调用记录和预算占用。"],
@@ -110,6 +111,7 @@ async function renderDashboard() {
     stat("真实证据", data.evidence, `今日 +${data.evidence_today}`),
     stat("候选商机", data.opportunities, `跨来源 ${data.cross_source_opportunities}`),
     stat("验证通过", data.validation_passed || 0, "确定性商业 Gate"),
+    stat("市场情报", data.market_intel || 0, `高热 ${data.market_high_heat || 0} / 高销量 ${data.market_high_sales || 0}`),
     stat("商品草稿", data.products, `已批准 ${data.approved}`),
     stat("今日 AI 成本", `¥${n(data.ai_spend_today_cny, 4)}`, `预算 ¥${n(data.ai_budget_today_cny, 2)}`),
   ].join("");
@@ -195,6 +197,46 @@ async function renderTrends() {
   document.getElementById("view-trends").innerHTML = panel("可信需求趋势", body || empty("暂无趋势数据"));
 }
 
+async function renderMarket() {
+  const [summary, rows] = await Promise.all([
+    api("/api/market-intel/summary"),
+    api("/api/market-intel?limit=200"),
+  ]);
+  const stats = [
+    stat("市场商品", summary.total || 0, "真实 Marketplace 观测"),
+    stat("高热", summary.high_heat || 0, `阈值 ${n(summary.heat_threshold, 0)}`),
+    stat("高销量", summary.high_sales || 0, `阈值 ${n(summary.sales_threshold, 0)}`),
+    stat("高热 + 高销量", summary.hot_and_selling || 0, "优先商业情报"),
+    stat("有真实销量", summary.verified_sales || 0, "保留 sales_scope"),
+  ].join("");
+  const cards = (rows || []).map((item) => {
+    const sales = item.sales_verified
+      ? `${n(item.sales_count)} (${esc(item.sales_scope || "unknown")})`
+      : "未公开";
+    const badges = [
+      item.high_heat ? pill("HIGH_HEAT") : "",
+      item.high_sales ? pill("HIGH_SALES") : "",
+      item.hot_and_selling ? pill("HOT_SELLING") : "",
+    ].join("");
+    return `<article class="evidence-card">
+      <div class="source-top"><div><strong>${esc(item.title)}</strong><div class="source-meta">${esc(item.marketplace)} · ${esc(item.seller || "seller unknown")}</div></div><div>${badges}</div></div>
+      <div class="metric-row"><span class="metric-chip">热度 ${n(item.heat_score,1)}</span><span class="metric-chip">销量分 ${item.sales_score == null ? "—" : n(item.sales_score,1)}</span><span class="metric-chip">销量 ${sales}</span><span class="metric-chip">榜单 #${n(item.rank_position)}</span><span class="metric-chip">市场分 ${n(item.market_score,1)}</span></div>
+      <div class="source-meta">评论 ${n(item.review_count)} · 收藏 ${n(item.favorites_count)} · 浏览 ${n(item.views_count)} · 评分 ${n(item.rating,1)}</div>
+      ${item.source_url ? `<a class="evidence-link" href="${esc(safeUrl(item.source_url))}" target="_blank" rel="noreferrer">打开市场商品</a>` : ""}
+    </article>`;
+  }).join("");
+  const actions = '<div class="toolbar"><button class="btn primary" onclick="collectMarketIntel()">立即采集市场情报</button><button class="btn secondary" onclick="mutate(\'/api/market-intel/rematch\', \'市场情报已重新匹配商机\')">重新匹配商机</button></div>';
+  document.getElementById("view-market").innerHTML = `<div class="grid-stats">${stats}</div>${panel("Market Intelligence", cards || empty("暂无市场情报；点击“立即采集市场情报”"), actions)}`;
+}
+
+async function collectMarketIntel() {
+  try {
+    const result = await api("/api/market-intel/collect?force=true", { method: "POST" });
+    showToast(`市场情报采集完成：成功 ${result.success_count || 0} / 失败 ${result.failed_count || 0}`, (result.failed_count || 0) > 0 && (result.success_count || 0) === 0);
+    await renderMarket();
+  } catch (error) { showToast(error.message, true); }
+}
+
 async function renderQuality() {
   const data = await api("/api/data-quality");
   document.getElementById("view-quality").innerHTML = panel("质量报告", `<pre class="code-block">${esc(JSON.stringify(data, null, 2))}</pre>`);
@@ -243,7 +285,7 @@ function clearApiToken() {
   showToast("API Token 已清除");
 }
 
-const renderers = { dashboard: renderDashboard, sources: renderSources, evidence: renderEvidence, opportunities: renderOpportunities, trends: renderTrends, quality: renderQuality, products: renderProducts, cost: renderCost, settings: renderSettings };
+const renderers = { dashboard: renderDashboard, sources: renderSources, evidence: renderEvidence, opportunities: renderOpportunities, trends: renderTrends, market: renderMarket, quality: renderQuality, products: renderProducts, cost: renderCost, settings: renderSettings };
 
 async function selectView(view) {
   if (!renderers[view]) return;
@@ -329,7 +371,9 @@ async function openOpportunity(id) {
     document.getElementById("drawer-title").textContent = item.title;
     const validation = item.validation || {};
     const evidence = (item.evidence || []).map((row) => `<article class="evidence-card"><strong>${esc(row.title)}</strong><div class="source-meta">${esc(row.platform)} · ${esc(row.author || "作者未知")} · ${date(row.published_at)}</div>${row.source_url ? `<a class="evidence-link" target="_blank" rel="noreferrer" href="${esc(safeUrl(row.source_url))}">原帖</a>` : ""}</article>`).join("");
-    document.getElementById("drawer-body").innerHTML = `<div class="detail-grid"><div class="detail-box"><span>商业验证</span>${pill(validation.status)}</div><div class="detail-box"><span>验证分</span><strong>${n(validation.score, 1)}</strong></div><div class="detail-box"><span>综合分</span><strong>${n(item.overall_score)}</strong></div><div class="detail-box"><span>真实证据</span><strong>${n(item.evidence_count)}</strong></div></div>${validation.reason_codes && validation.reason_codes.length ? `<div class="source-error">${esc(validation.reason_codes.join("、"))}</div>` : ""}<h3 class="section-title">证据</h3>${evidence || empty("无关联证据")}`;
+    const market = item.market_intel || {};
+    const marketRows = (market.items || []).slice(0, 8).map((row) => `<article class="evidence-card"><div class="source-top"><strong>${esc(row.title)}</strong><span class="score">${n(row.market_score,1)}</span></div><div class="metric-row"><span class="metric-chip">热度 ${n(row.heat_score,1)}</span><span class="metric-chip">销量 ${row.sales_verified ? `${n(row.sales_count)} (${esc(row.sales_scope || "unknown")})` : "未公开"}</span><span class="metric-chip">匹配 ${n((row.similarity || 0) * 100,1)}%</span></div></article>`).join("");
+    document.getElementById("drawer-body").innerHTML = `<div class="detail-grid"><div class="detail-box"><span>商业验证</span>${pill(validation.status)}</div><div class="detail-box"><span>验证分</span><strong>${n(validation.score, 1)}</strong></div><div class="detail-box"><span>综合分</span><strong>${n(item.overall_score)}</strong></div><div class="detail-box"><span>真实证据</span><strong>${n(item.evidence_count)}</strong></div></div>${validation.reason_codes && validation.reason_codes.length ? `<div class="source-error">${esc(validation.reason_codes.join("、"))}</div>` : ""}<h3 class="section-title">市场情报</h3>${marketRows || empty("暂无匹配市场情报")}<h3 class="section-title">证据</h3>${evidence || empty("无关联证据")}`;
     document.getElementById("drawer").classList.remove("hidden");
   } catch (error) { showToast(error.message, true); }
 }

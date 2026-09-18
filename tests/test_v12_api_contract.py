@@ -58,3 +58,17 @@ def test_gate_a_gate_b_and_fulfillment_routes_are_exposed():
     assert ("/api/products/{product_id}/assets/{asset_id}", "POST") in paths
     assert ("/api/products/{product_id}/assets/{asset_id}", "DELETE") in paths
     assert ("/api/products/{product_id}/license-readiness", "GET") in paths
+
+
+
+def test_market_intelligence_routes_are_exposed():
+    paths = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert ("/api/market-intel", "GET") in paths
+    assert ("/api/market-intel/summary", "GET") in paths
+    assert ("/api/market-intel/collect", "POST") in paths
+    assert ("/api/market-intel/rematch", "POST") in paths

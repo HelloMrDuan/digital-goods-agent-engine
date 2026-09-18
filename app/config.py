@@ -98,6 +98,14 @@ class Settings(BaseSettings):
     source_stale_after_hours: int = 24
     trend_support_similarity_threshold: float = 0.42
     trend_min_confidence_for_trusted_rank: float = 35.0
+
+    # Market Intelligence: real marketplace rank/engagement/sales observations.
+    market_intel_match_threshold: float = 0.12
+    market_intel_high_heat_score: float = 65.0
+    market_intel_high_sales_score: float = 60.0
+    etsy_enrich_shop_sales: bool = True
+    etsy_shop_enrich_limit: int = 8
+
     auto_collect_enabled: bool = False
     auto_collect_interval_minutes: int = 360
 

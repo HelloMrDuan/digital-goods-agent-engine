@@ -12,6 +12,7 @@ from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
 from .llm import chat_json_with_meta
 from .opportunities import get_evidence_for_opportunity, get_opportunity
 from .validation import get_validation, validate_opportunity
+from .market_intel import market_intel_for_opportunity
 
 
 AGENT_ORDER = ("signal", "pain", "market", "product", "risk", "judge")
@@ -19,7 +20,7 @@ AGENT_ORDER = ("signal", "pain", "market", "product", "risk", "judge")
 _AGENT_SYSTEM = {
     "signal": """你是 Signal Agent。只依据输入中的真实 evidence digest 识别需求信号，不得编造搜索量、销量、用户量或趋势。输出 JSON 对象：signals(array), signal_strength(0-100), demand_pattern(string), evidence_refs(array of evidence ids), confidence(0-100), reasoning(string)。""",
     "pain": """你是 Pain Agent。根据 Signal Agent 结果和真实 evidence digest 提取用户痛点。输出 JSON 对象：target_users(array), pain_points(array of objects with pain,severity 0-100,evidence_refs), urgency(0-100), confidence(0-100), reasoning(string)。不得补造未出现在证据中的事实。""",
-    "market": """你是 Market Agent。根据真实证据、Signal/Pain 结果判断数字商品市场可做性。所有评分都是基于当前证据的判断，不是市场事实。输出 JSON：category(string), market_score(0-100), purchase_intent(0-100), competition_level(0-100), competition_gaps(array), buyer_profile(array), confidence(0-100), reasoning(string)。不得编造销量、GMV、搜索量或竞品数量。""",
+    "market": """你是 Market Agent。根据真实证据、Signal/Pain 结果和输入中的 market_intel 判断数字商品市场可做性。market_intel 中 heat_score 来自真实榜单/互动观测；sales_count 只有 sales_verified=true 时才可引用，并且必须保留 sales_scope（listing/shop/account）的语义，严禁把 shop 销量写成单商品销量。所有评分都是判断，不是市场事实。输出 JSON：category(string), market_score(0-100), purchase_intent(0-100), competition_level(0-100), competition_gaps(array), buyer_profile(array), confidence(0-100), reasoning(string)。不得编造销量、GMV、搜索量或竞品数量。""",
     "product": """你是 Product Agent。把已识别痛点转成可以原创、合法、低售后、可自动交付的数字商品。输出 JSON：recommended_products(array of objects with name,format,why,deliverables), primary_product(string), price_range(object with currency,min,max,reason), production_complexity(0-100), automation_fit(0-100), confidence(0-100), reasoning(string)。禁止推荐盗版、破解、账号、未授权资料包。""",
     "risk": """你是 Risk Agent。审查版权、平台合规、市场饱和、需求真实性、售后和支付意愿风险。输出 JSON：risk_score(0-100), copyright_risk(0-100), saturation_risk(0-100), payment_risk(0-100), platform_risks(array), warnings(array), blockers(array), confidence(0-100), reasoning(string)。高风险必须明确说明。""",
     "judge": """你是 Judge Agent。综合前五个 Agent 和真实证据指标，给出谨慎的商业决策。输出 JSON：final_score(0-100), decision(BUILD|WATCH|DROP), confidence(0-100), title(string), category(string), summary(string), reasoning(string)。不得把 AI 判断包装成事实；证据不足时优先 WATCH 或 DROP。""",
@@ -281,10 +282,24 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
             }
         )
 
+    market_intel = market_intel_for_opportunity(opportunity_id)
+
     snapshot_hash = stable_hash(
-        "opportunity-agent-v1",
+        "opportunity-agent-v2-market-intel",
         opportunity.get("cluster_signature"),
         dumps([(item.get("id"), item.get("raw_hash"), item.get("intent_class")) for item in evidence]),
+        dumps([
+            (
+                item.get("id"),
+                item.get("heat_score"),
+                item.get("sales_count"),
+                item.get("sales_scope"),
+                item.get("sales_verified"),
+                item.get("market_score"),
+                item.get("last_seen_at"),
+            )
+            for item in market_intel.get("items", [])
+        ]),
     )
     return {
         "opportunity": {
@@ -307,6 +322,7 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
             "intent_counts": dict(intents),
         },
         "evidence": snippets,
+        "market_intel": market_intel,
         "snapshot_hash": snapshot_hash,
     }
 
@@ -452,6 +468,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
                 "commercial_validation": validation,
                 "signal": outputs["signal"],
                 "pain": outputs["pain"],
+                "market_intel": digest["market_intel"],
             }
         elif agent_name == "product":
             payload = {
@@ -476,6 +493,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
                 "market": outputs["market"],
                 "product": outputs["product"],
                 "risk": outputs["risk"],
+                "market_intel": digest["market_intel"],
             }
         output, last_meta, run_id = _run_agent(opportunity_id, agent_name, payload, allowed_evidence_ids)
         outputs[agent_name] = output

@@ -249,6 +249,78 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ai_budget_reservations_created
                 ON ai_budget_reservations(created_at);
 
+            CREATE TABLE IF NOT EXISTS market_intel_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                marketplace TEXT NOT NULL,
+                source_item_id TEXT,
+                source_url TEXT,
+                title TEXT NOT NULL,
+                seller TEXT,
+                category TEXT,
+                price REAL,
+                currency TEXT,
+                sales_count REAL,
+                sales_scope TEXT,
+                sales_verified INTEGER NOT NULL DEFAULT 0,
+                review_count REAL,
+                rating REAL,
+                favorites_count REAL,
+                views_count REAL,
+                rank_position INTEGER,
+                bestseller INTEGER NOT NULL DEFAULT 0,
+                trending INTEGER NOT NULL DEFAULT 0,
+                heat_score REAL NOT NULL DEFAULT 0,
+                sales_score REAL,
+                market_score REAL NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL,
+                raw_json TEXT,
+                canonical_key TEXT NOT NULL UNIQUE,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_intel_score
+                ON market_intel_items(market_score DESC, heat_score DESC, sales_score DESC);
+
+            CREATE TABLE IF NOT EXISTS market_intel_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_item_id INTEGER NOT NULL,
+                observed_at TEXT NOT NULL,
+                price REAL,
+                sales_count REAL,
+                sales_scope TEXT,
+                sales_verified INTEGER NOT NULL DEFAULT 0,
+                review_count REAL,
+                rating REAL,
+                favorites_count REAL,
+                views_count REAL,
+                rank_position INTEGER,
+                bestseller INTEGER NOT NULL DEFAULT 0,
+                trending INTEGER NOT NULL DEFAULT 0,
+                heat_score REAL NOT NULL DEFAULT 0,
+                sales_score REAL,
+                market_score REAL NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL,
+                FOREIGN KEY(market_item_id) REFERENCES market_intel_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_intel_snapshots_item
+                ON market_intel_snapshots(market_item_id, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS opportunity_market_intel (
+                opportunity_id INTEGER NOT NULL,
+                market_item_id INTEGER NOT NULL,
+                similarity REAL NOT NULL,
+                matched_at TEXT NOT NULL,
+                PRIMARY KEY(opportunity_id, market_item_id),
+                FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE CASCADE,
+                FOREIGN KEY(market_item_id) REFERENCES market_intel_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_market_intel_opp
+                ON opportunity_market_intel(opportunity_id, similarity DESC);
+
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 opportunity_id INTEGER NOT NULL,

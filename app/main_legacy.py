@@ -25,6 +25,7 @@ from .services.ingest import backfill_intents
 from .services.validation import get_gate_a, get_validation, require_current_validation, validate_active_opportunities, validate_opportunity
 from .services.product_lifecycle import approve_product, evaluate_gate_b, get_gate_b, get_product, list_delivery_records, require_approved_current_product
 from .services.asset_registry import create_source_asset, get_source_asset, link_product_asset, list_product_assets, list_source_assets, product_asset_readiness, unlink_product_asset, update_source_asset
+from .services.market_intel import list_market_intel, market_intel_for_opportunity, market_intel_summary, rematch_market_intel
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -32,6 +33,7 @@ WEB_DIR = BASE_DIR / "web"
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    bootstrap_sources()
     backfill_intents()
     start_scheduler()
     try:
@@ -72,6 +74,9 @@ def health() -> dict[str, Any]:
         "auto_collect_enabled": settings.auto_collect_enabled,
         "auto_collect_interval_minutes": settings.auto_collect_interval_minutes,
         "commercial_validation_policy": "commercial-validation-v1-real-demand",
+        "market_intel_enabled": True,
+        "market_intel_high_heat_score": settings.market_intel_high_heat_score,
+        "market_intel_high_sales_score": settings.market_intel_high_sales_score,
         "db": settings.db_path,
     }
 
@@ -91,6 +96,10 @@ def dashboard() -> dict[str, Any]:
             "products": c.execute("SELECT COUNT(*) c FROM products").fetchone()["c"],
             "approved": c.execute("SELECT COUNT(*) c FROM products WHERE status='APPROVED'").fetchone()["c"],
             "validation_passed": c.execute("SELECT COUNT(*) c FROM opportunities WHERE cluster_active=1 AND validation_status='PASSED'").fetchone()["c"],
+            "market_intel": c.execute("SELECT COUNT(*) c FROM market_intel_items").fetchone()["c"],
+            "market_high_heat": c.execute("SELECT COUNT(*) c FROM market_intel_items WHERE heat_score>=?", (settings.market_intel_high_heat_score,)).fetchone()["c"],
+            "market_high_sales": c.execute("SELECT COUNT(*) c FROM market_intel_items WHERE sales_verified=1 AND sales_score>=?", (settings.market_intel_high_sales_score,)).fetchone()["c"],
+            "market_hot_and_selling": c.execute("SELECT COUNT(*) c FROM market_intel_items WHERE heat_score>=? AND sales_verified=1 AND sales_score>=?", (settings.market_intel_high_heat_score, settings.market_intel_high_sales_score)).fetchone()["c"],
         }
         spend = c.execute("SELECT coalesce(sum(estimated_cost_cny),0) s FROM ai_runs WHERE status='SUCCESS' AND substr(created_at,1,10)=?", (today,)).fetchone()["s"]
         top = c.execute("SELECT id,title,category,evidence_count,effective_signal_count,explicit_demand_count,probable_demand_count,comment_demand_count,platform_count,current_7d,previous_7d,growth_7d_pct,acceleration_pct,trend_score,trend_confidence,trusted_trend_score,data_quality_score,validation_status,validation_score,overall_score,suggested_product,status FROM opportunities WHERE cluster_active=1 ORDER BY coalesce(trusted_trend_score,0) DESC,coalesce(trend_score,0) DESC,coalesce(overall_score,-1) DESC LIMIT 8").fetchall()
@@ -104,7 +113,8 @@ def dashboard() -> dict[str, Any]:
         "source_health": [row_to_dict(r) for r in source_health],
         "recent_runs": [row_to_dict(r) for r in recent_runs],
         "latest_cluster_run": latest_cluster_run(),
-        "truth_policy": "所有业务数据来自真实采集；无数据即为0，失败显示失败原因。趋势指标只由真实 evidence 时间戳计算。",
+        "market_intel_summary": market_intel_summary(),
+        "truth_policy": "所有业务数据来自真实采集；无数据即为0，失败显示失败原因。趋势指标只由真实 evidence 时间戳计算；市场销量只有来源明确暴露时才记录，并保留 listing/shop/account 口径。",
     }
 
 
@@ -369,6 +379,61 @@ def sources_collect_enabled(force: bool = False):
     return _collect_source_batch(sources, "all_enabled", force=force)
 
 
+@app.get("/api/market-intel")
+def market_intel_list(
+    limit: int = Query(default=100, ge=1, le=500),
+    high_heat: bool = False,
+    high_sales: bool = False,
+    hot_and_selling: bool = False,
+):
+    return list_market_intel(
+        limit,
+        high_heat=high_heat,
+        high_sales=high_sales,
+        hot_and_selling=hot_and_selling,
+    )
+
+
+@app.get("/api/market-intel/summary")
+def market_intel_summary_api():
+    return market_intel_summary()
+
+
+@app.post("/api/market-intel/rematch")
+def market_intel_rematch():
+    return {"matched_links": rematch_market_intel()}
+
+
+@app.post("/api/market-intel/collect")
+def market_intel_collect(force: bool = True):
+    market_sources = [
+        source for source in list_sources()
+        if source.get("enabled") and source.get("role") == "market"
+    ]
+    results = []
+    for source in market_sources:
+        try:
+            item = collect_source(int(source["id"]), force=force)
+            item["source_name"] = source.get("name")
+            item["platform"] = source.get("platform")
+            results.append(item)
+        except Exception as exc:
+            results.append({
+                "source_id": source.get("id"),
+                "source_name": source.get("name"),
+                "platform": source.get("platform"),
+                "status": "FAILED",
+                "error": str(exc),
+            })
+    return {
+        "processed": len(results),
+        "success_count": sum(1 for item in results if item.get("status") in {"SUCCESS", "EMPTY"}),
+        "failed_count": sum(1 for item in results if item.get("status") == "FAILED"),
+        "results": results,
+        "summary": market_intel_summary(),
+    }
+
+
 @app.get("/api/agent-reach/doctor")
 def agent_reach_health():
     return agent_reach_doctor()
@@ -513,6 +578,7 @@ def opportunity_detail(opportunity_id: int):
     opp["trend"] = trend_detail(opportunity_id)
     opp["evidence"] = get_evidence_for_opportunity(opportunity_id, 100)
     opp["validation"] = get_validation(opportunity_id)
+    opp["market_intel"] = market_intel_for_opportunity(opportunity_id, 20)
     return opp
 
 

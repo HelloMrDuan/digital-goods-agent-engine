@@ -78,6 +78,30 @@ def analyze_one(opportunity_id: int) -> dict[str, Any]:
 
 
 
+_BUILDABLE_FORMATS = {"xlsx", "csv", "markdown", "txt", "json", "python", "javascript", "html", "css", "yaml"}
+
+
+def _primary_build_spec(analysis: dict[str, Any]) -> dict[str, Any]:
+    if str(analysis.get("decision") or "").upper() != "BUILD":
+        raise ValueError("opportunity decision must be BUILD before product generation")
+    primary = str(analysis.get("primary_product") or "").strip()
+    recommendations = analysis.get("recommended_products")
+    if not primary or not isinstance(recommendations, list) or not recommendations:
+        raise ValueError("analysis missing primary buildable product; rerun Opportunity Agent")
+    matches = [
+        item for item in recommendations
+        if isinstance(item, dict) and str(item.get("name") or "").strip() == primary
+    ]
+    if len(matches) != 1:
+        raise ValueError("primary_product must map to exactly one recommended product")
+    spec = dict(matches[0])
+    artifact_format = str(spec.get("format") or "").strip().lower()
+    if artifact_format not in _BUILDABLE_FORMATS:
+        raise ValueError(f"unsupported product artifact format: {artifact_format or 'missing'}")
+    spec["format"] = artifact_format
+    return spec
+
+
 def _validate_product_draft(product: dict[str, Any]) -> dict[str, Any]:
     """Reject incomplete AI drafts instead of filling missing business fields with fake defaults."""
     required_text = ("name", "category", "audience", "title", "description", "compliance_notes")
@@ -111,6 +135,8 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
         raise ValueError("high copyright/compliance risk; product generation blocked")
     evidence = get_evidence_for_opportunity(opportunity_id, 50)
     analysis = json.loads(opp.get("analysis_json") or "{}")
+    primary_spec = _primary_build_spec(analysis)
+    analysis["primary_recommendation"] = primary_spec
     product = _validate_product_draft(generate_product(opp, evidence, analysis, chat=provider_chat_json))
     product["name"] = str(primary_spec["name"]).strip()
     price_range = analysis.get("price_range") if isinstance(analysis.get("price_range"), dict) else {}
@@ -126,8 +152,8 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     now = now_iso()
     with conn() as c:
         cur = c.execute(
-            """INSERT INTO products(opportunity_id,sku,name,category,audience,price_suggestion,price_currency,title,description,keywords_json,deliverables_json,faq_json,compliance_notes,status,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO products(opportunity_id,sku,name,category,audience,price_suggestion,price_currency,artifact_format,title,description,keywords_json,deliverables_json,faq_json,compliance_notes,status,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 opportunity_id,
                 sku,
@@ -136,6 +162,7 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
                 product.get("audience"),
                 float(product["price_suggestion"]),
                 settings.default_product_currency.upper(),
+                primary_spec["format"],
                 product.get("title"),
                 product.get("description"),
                 dumps(product.get("keywords") or []),

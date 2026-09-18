@@ -285,8 +285,15 @@ def _collect_probe(
     intents = _intent_counts(observed_ids)
     unique_authors = len({str(item.author).strip().lower() for item in retained if item.author and str(item.author).strip()})
     duration_ms = int((time.monotonic() - t0) * 1000)
-    status = "SUCCESS" if retained else "EMPTY"
-    error = None if retained or not query_errors else " | ".join(query_errors[:4])
+    all_queries_failed = bool(selected_queries) and len(query_errors) == len(selected_queries)
+    if retained:
+        status = "SUCCESS"
+    elif all_queries_failed:
+        status = "FAILED"
+    else:
+        status = "EMPTY"
+    error = " | ".join(query_errors[:4]) if query_errors else None
+    source_status = "READY" if retained else ("ERROR" if status == "FAILED" else "EMPTY")
     now = now_iso()
     with conn() as c:
         c.execute(
@@ -301,9 +308,10 @@ def _collect_probe(
             """UPDATE sources SET status=?,last_error=?,last_checked_at=?,last_success_at=?,last_item_count=?,
                failure_streak=?,empty_streak=?,next_retry_at=NULL,avg_duration_ms=?,updated_at=? WHERE id=?""",
             (
-                "READY" if retained else "EMPTY", error, now, now if retained else source.get("last_success_at"),
-                len(retained), 0 if retained else int(source.get("failure_streak") or 0),
-                0 if retained else int(source.get("empty_streak") or 0) + 1,
+                source_status, error, now, now if retained else source.get("last_success_at"),
+                len(retained),
+                int(source.get("failure_streak") or 0) + 1 if status == "FAILED" else 0,
+                int(source.get("empty_streak") or 0) + 1 if status == "EMPTY" else 0,
                 duration_ms, now, int(source["id"]),
             ),
         )

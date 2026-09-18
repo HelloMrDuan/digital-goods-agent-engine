@@ -127,43 +127,60 @@ def rebuild_clusters() -> dict[str, Any]:
             ("RUNNING", _METHOD, settings.cluster_window_days, settings.cluster_similarity_threshold, started),
         )
         run_id = int(cur.lastrowid)
-        c.execute(
-            "UPDATE opportunities SET cluster_active=0 WHERE cluster_method IN (?,?,?,?,?,?)",
-            (
-                _METHOD,
-                "real_evidence_tfidf_v5_content_intent_gate",
-                "real_evidence_tfidf_v4_business_priority",
-                "real_evidence_tfidf_v3",
-                "real_evidence_tfidf_v2",
-                "real_evidence_tfidf_v1",
-            ),
-        )
+
     try:
         candidate_rows, support_rows, relation_by_id, demand_count, context_count = _load_candidates()
         clusters, vectors, idf = _legacy._cluster_rows(candidate_rows)
         active_ids: list[int] = []
         cross_platform = 0
         support_links = 0
-        for cluster in clusters:
-            rep = _legacy._representative(cluster, vectors)
-            signature = _legacy._signature(cluster)
-            candidate_key = stable_hash("cluster-v6-evidence-first", signature)
-            evidence_ids = sorted({int(row["id"]) for row in cluster})
-            support_ids = _legacy._support_matches(cluster, support_rows, vectors, idf)
-            platforms = {row.get("platform") for row in cluster if row.get("platform")}
-            if len(platforms) >= 2:
-                cross_platform += 1
-            with conn() as c:
+
+        # The active-cluster switch and all opportunity/link mutations are one SQLite
+        # transaction. If any cluster fails, rollback restores the previously active set.
+        with conn() as c:
+            c.execute(
+                "UPDATE opportunities SET cluster_active=0 WHERE cluster_method IN (?,?,?,?,?,?)",
+                (
+                    _METHOD,
+                    "real_evidence_tfidf_v5_content_intent_gate",
+                    "real_evidence_tfidf_v4_business_priority",
+                    "real_evidence_tfidf_v3",
+                    "real_evidence_tfidf_v2",
+                    "real_evidence_tfidf_v1",
+                ),
+            )
+            for cluster in clusters:
+                rep = _legacy._representative(cluster, vectors)
+                signature = _legacy._signature(cluster)
+                candidate_key = stable_hash("cluster-v6-evidence-first", signature)
+                evidence_ids = sorted({int(row["id"]) for row in cluster})
+                support_ids = _legacy._support_matches(cluster, support_rows, vectors, idf)
+                platforms = {row.get("platform") for row in cluster if row.get("platform")}
+                if len(platforms) >= 2:
+                    cross_platform += 1
+
                 opportunity_id = _existing_for_cluster(c, evidence_ids, candidate_key)
                 now = now_iso()
                 if opportunity_id is None:
                     cur = c.execute(
                         """INSERT INTO opportunities(title,candidate_key,normalized_need,status,evidence_count,cluster_method,cluster_signature,
                            platform_count,cluster_active,last_cluster_run_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (rep.get("title") or signature, candidate_key, rep.get("title") or signature, "NEW", 0, _METHOD, signature, len(platforms), 1, run_id, now, now),
+                        (
+                            rep.get("title") or signature,
+                            candidate_key,
+                            rep.get("title") or signature,
+                            "NEW",
+                            0,
+                            _METHOD,
+                            signature,
+                            len(platforms),
+                            1,
+                            run_id,
+                            now,
+                            now,
+                        ),
                     )
                     opportunity_id = int(cur.lastrowid)
-                    old_ids: set[int] = set()
                 else:
                     old_ids = {
                         int(row["evidence_id"])
@@ -172,7 +189,10 @@ def rebuild_clusters() -> dict[str, Any]:
                             (opportunity_id,),
                         ).fetchall()
                     }
-                    existing = c.execute("SELECT analysis_json,candidate_key FROM opportunities WHERE id=?", (opportunity_id,)).fetchone()
+                    existing = c.execute(
+                        "SELECT analysis_json,candidate_key FROM opportunities WHERE id=?",
+                        (opportunity_id,),
+                    ).fetchone()
                     changed = old_ids != set(evidence_ids)
                     stale = 1 if changed and existing and existing["analysis_json"] else 0
                     if changed:
@@ -193,6 +213,7 @@ def rebuild_clusters() -> dict[str, Any]:
                             (safe_key, _METHOD, signature, len(platforms), stale, run_id, now, opportunity_id),
                         )
                     c.execute("DELETE FROM opportunity_evidence WHERE opportunity_id=?", (opportunity_id,))
+
                 for evidence_id in evidence_ids:
                     relation = relation_by_id.get(evidence_id, "context")
                     c.execute(
@@ -205,18 +226,33 @@ def rebuild_clusters() -> dict[str, Any]:
                         (opportunity_id, evidence_id),
                     )
                     support_links += 1
-            active_ids.append(opportunity_id)
-            _legacy.calculate_trend(opportunity_id)
+                active_ids.append(opportunity_id)
+
+        trend_errors: list[dict[str, Any]] = []
+        for opportunity_id in active_ids:
+            try:
+                _legacy.calculate_trend(opportunity_id)
+            except Exception as exc:
+                trend_errors.append({"opportunity_id": opportunity_id, "error": str(exc)})
 
         finished = now_iso()
+        run_status = "SUCCESS" if not trend_errors else "PARTIAL"
         with conn() as c:
             c.execute(
-                """UPDATE cluster_runs SET status='SUCCESS',finished_at=?,evidence_count=?,cluster_count=?,cross_platform_cluster_count=? WHERE id=?""",
-                (finished, len(candidate_rows), len(clusters), cross_platform, run_id),
+                """UPDATE cluster_runs SET status=?,finished_at=?,evidence_count=?,cluster_count=?,cross_platform_cluster_count=?,error=? WHERE id=?""",
+                (
+                    run_status,
+                    finished,
+                    len(candidate_rows),
+                    len(clusters),
+                    cross_platform,
+                    None if not trend_errors else dumps(trend_errors[:10]),
+                    run_id,
+                ),
             )
         return {
             "run_id": run_id,
-            "status": "SUCCESS",
+            "status": run_status,
             "method": _METHOD,
             "processed_evidence": demand_count,
             "context_evidence_considered": context_count,
@@ -226,6 +262,7 @@ def rebuild_clusters() -> dict[str, Any]:
             "candidate_groups": len(clusters),
             "cross_platform_groups": cross_platform,
             "opportunity_ids": active_ids,
+            "trend_errors": trend_errors,
             "threshold": settings.cluster_similarity_threshold,
             "support_threshold": settings.trend_support_similarity_threshold,
             "window_days": settings.cluster_window_days,
@@ -233,9 +270,11 @@ def rebuild_clusters() -> dict[str, Any]:
         }
     except Exception as exc:
         with conn() as c:
-            c.execute("UPDATE cluster_runs SET status='FAILED',finished_at=?,error=? WHERE id=?", (now_iso(), str(exc), run_id))
+            c.execute(
+                "UPDATE cluster_runs SET status='FAILED',finished_at=?,error=? WHERE id=?",
+                (now_iso(), str(exc), run_id),
+            )
         raise
-
 
 def calculate_trend(opportunity_id: int, calculated_at: datetime | None = None) -> dict[str, Any]:
     return _legacy.calculate_trend(opportunity_id, calculated_at)

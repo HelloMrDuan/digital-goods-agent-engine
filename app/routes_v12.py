@@ -323,14 +323,42 @@ def opportunities_rebuild(
     if analyze and not settings.is_llm_configured:
         raise HTTPException(409, "LLM is not configured; set Qiniu or SenseNova, or call with analyze=false")
     now = now_iso()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(timespec="seconds")
     with conn() as c:
+        # Serialize the active-task check and insert so two rapid clicks/processes cannot
+        # both pass the check and start duplicate paid Agent work.
+        c.execute("BEGIN IMMEDIATE")
+        c.execute(
+            """UPDATE opportunity_rebuild_tasks
+               SET status='FAILED',progress=100,stage='失败',message='stale rebuild task expired',
+                   error='stale rebuild task expired',updated_at=?
+               WHERE status IN ('PENDING','RUNNING') AND updated_at<?""",
+            (now, stale_cutoff),
+        )
+        active = c.execute(
+            """SELECT id,status,progress,stage,created_at,updated_at
+               FROM opportunity_rebuild_tasks
+               WHERE status IN ('PENDING','RUNNING')
+               ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        if active:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": "opportunity rebuild already running",
+                    "task_id": int(active["id"]),
+                    "status": active["status"],
+                    "progress": int(active["progress"] or 0),
+                    "stage": active["stage"],
+                },
+            )
         cur = c.execute(
             """INSERT INTO opportunity_rebuild_tasks(
                    status,progress,stage,message,analyze_enabled,refresh_enabled,requested_limit,created_at,updated_at
                ) VALUES(?,?,?,?,?,?,?,?,?)""",
             ("PENDING", 0, "排队", "等待刷新真实需求并重建", 1 if analyze else 0, 1 if refresh else 0, limit, now, now),
         )
-    task_id = int(cur.lastrowid)
+        task_id = int(cur.lastrowid)
     threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit, refresh, refresh_queries_per_probe), daemon=True).start()
     return {
         "task_id": task_id,

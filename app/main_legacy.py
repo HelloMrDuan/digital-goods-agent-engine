@@ -29,6 +29,7 @@ from .services.asset_registry import create_source_asset, get_source_asset, link
 from .services.market_intel import list_market_intel, market_intel_for_opportunity, market_intel_summary, rematch_market_intel
 from .services.product_builder import build_product_artifact, latest_successful_bundle, list_product_builds
 from .services.publishing import etsy_status, list_publish_runs, publish_to_etsy, publish_to_xianyu, xianyu_status
+from .services.xianyu_top import xianyu_order_query, xianyu_virtual_delivery
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -923,6 +924,37 @@ def product_publish_xianyu(
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:2000] if exc.response is not None else str(exc)
         raise HTTPException(502, f"Xianyu bridge error: {detail}")
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+
+@app.get("/api/xianyu/orders/{biz_order_id}")
+def xianyu_order_get(biz_order_id: str):
+    try:
+        return xianyu_order_query(biz_order_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        raise HTTPException(502, f"Xianyu TOP error: {detail}")
+    except Exception as exc:
+        raise HTTPException(502, str(exc))
+
+
+@app.post("/api/xianyu/orders/{biz_order_id}/virtual-delivery")
+def xianyu_order_virtual_delivery(
+    biz_order_id: str,
+    product_id: int = Query(..., gt=0),
+):
+    try:
+        return xianyu_virtual_delivery(product_id, biz_order_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        raise HTTPException(502, f"Xianyu TOP error: {detail}")
     except Exception as exc:
         raise HTTPException(502, str(exc))
 

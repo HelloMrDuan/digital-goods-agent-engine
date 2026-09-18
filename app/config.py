@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     xianyu_top_app_secret: str = ""
     xianyu_top_access_token: str = ""
     xianyu_top_biz_code: str = ""
+    xianyu_top_gateway: str = "https://gw.api.taobao.com/router/rest"
 
     auto_collect_enabled: bool = True
     auto_collect_interval_minutes: int = 180

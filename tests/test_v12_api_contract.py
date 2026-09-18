@@ -111,3 +111,15 @@ def test_xianyu_market_and_publish_routes_are_exposed():
     }
     assert ("/api/publish/xianyu/status", "GET") in paths
     assert ("/api/products/{product_id}/publish/xianyu", "POST") in paths
+
+
+
+def test_xianyu_official_order_and_virtual_delivery_routes_are_exposed():
+    paths = {
+        (route.path, method)
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert ("/api/xianyu/orders/{biz_order_id}", "GET") in paths
+    assert ("/api/xianyu/orders/{biz_order_id}/virtual-delivery", "POST") in paths

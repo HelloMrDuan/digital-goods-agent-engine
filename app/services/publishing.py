@@ -15,6 +15,7 @@ from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .product_builder import latest_successful_bundle
 from .product_lifecycle import get_product, require_approved_current_product
 from ..collectors.agent_reach import doctor as agent_reach_doctor, publish_xianyu_listing
+from .xianyu_top import xianyu_top_status
 
 
 ETSY_BASE_URL = "https://api.etsy.com/v3/application"
@@ -305,20 +306,7 @@ def _extract_xianyu_item_id(value: Any) -> str | None:
 
 
 def xianyu_partner_order_status() -> dict[str, Any]:
-    values = {
-        "XIANYU_TOP_APP_KEY": settings.xianyu_top_app_key,
-        "XIANYU_TOP_APP_SECRET": settings.xianyu_top_app_secret,
-        "XIANYU_TOP_ACCESS_TOKEN": settings.xianyu_top_access_token,
-        "XIANYU_TOP_BIZ_CODE": settings.xianyu_top_biz_code,
-    }
-    missing = [name for name, value in values.items() if not str(value or "").strip()]
-    return {
-        "configured": not missing,
-        "missing": missing,
-        "mode": "OFFICIAL_TOP_PARTNER_API",
-        "deployment_requirement": "JuShiTa",
-        "note": "Only enable after Xianyu partner invitation and API permission approval.",
-    }
+    return xianyu_top_status()
 
 
 def xianyu_status(client: httpx.Client | Any | None = None) -> dict[str, Any]:

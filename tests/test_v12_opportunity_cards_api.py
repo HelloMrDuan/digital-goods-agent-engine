@@ -41,4 +41,4 @@ def test_rebuild_concurrency_is_bounded(monkeypatch):
 
 
 def test_main_reports_opportunity_agent_version():
-    assert app.version == "1.2.4-correctness-security-hardening"
+    assert app.version == "1.2.5-github-supply-assets"

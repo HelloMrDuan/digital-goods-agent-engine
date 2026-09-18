@@ -19,6 +19,7 @@ from ..collectors.base import CollectorError
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .ingest import ingest_items
+from .asset_registry import sync_github_source_asset_candidates
 
 _source_locks: dict[int, threading.Lock] = {}
 _source_locks_guard = threading.Lock()
@@ -243,6 +244,15 @@ def collect_source(source_id: int, limit: int | None = None, force: bool = False
             assert last_exc is not None
             raise last_exc
 
+        source_asset_sync = None
+        if (
+            source.get("source_type") == "github"
+            and source_role(source) == "supply"
+            and source_priority(source) == "P2"
+            and str(config.get("mode") or "repositories") == "repositories"
+        ):
+            source_asset_sync = sync_github_source_asset_candidates(source, items)
+
         stats = ingest_items(source, items)
         finished = now_iso()
         duration_ms = max(0, int((time.monotonic() - t0) * 1000))
@@ -262,7 +272,16 @@ def collect_source(source_id: int, limit: int | None = None, force: bool = False
                    failure_streak=0,empty_streak=?,next_retry_at=NULL,avg_duration_ms=?,updated_at=? WHERE id=?""",
                 (source_status, finished, finished, stats["fetched"], int(source.get("empty_streak") or 0) + 1 if empty else 0, avg_ms, finished, source_id),
             )
-        return {"run_id": run_id, "source_id": source_id, "status": status, "role": source_role(source), "duration_ms": duration_ms, "retry_count": retry_count, **stats}
+        return {
+            "run_id": run_id,
+            "source_id": source_id,
+            "status": status,
+            "role": source_role(source),
+            "duration_ms": duration_ms,
+            "retry_count": retry_count,
+            "source_asset_sync": source_asset_sync,
+            **stats,
+        }
     except Exception as exc:
         finished = now_iso()
         duration_ms = max(0, int((time.monotonic() - t0) * 1000)) if 't0' in locals() else 0

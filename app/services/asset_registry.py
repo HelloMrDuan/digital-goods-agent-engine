@@ -6,6 +6,185 @@ from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
 
 
 LICENSE_POLICY_VERSION = "asset-license-v1"
+GITHUB_ASSET_POLICY_VERSION = "github-source-asset-v1"
+
+_GITHUB_AUTO_PASS_LICENSES = {
+    "0BSD",
+    "APACHE-2.0",
+    "BSD-2-CLAUSE",
+    "BSD-3-CLAUSE",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "UNLICENSE",
+    "ZLIB",
+}
+
+
+def _github_license_classification(raw: dict[str, Any]) -> dict[str, Any]:
+    license_info = raw.get("license") if isinstance(raw.get("license"), dict) else {}
+    spdx = str(license_info.get("spdx_id") or "").strip().upper()
+    name = str(license_info.get("name") or "").strip()
+    license_url = str(license_info.get("url") or "").strip() or None
+    combined = f"{spdx} {name}".upper()
+
+    if not spdx or spdx in {"NOASSERTION", "OTHER"}:
+        return {
+            "status": "REVIEW_REQUIRED",
+            "ownership_type": "unknown",
+            "license_name": name or None,
+            "license_url": license_url,
+            "commercial_use_allowed": None,
+            "redistribution_allowed": None,
+            "reason": "github_license_not_verified",
+        }
+
+    if "-NC-" in combined or "NONCOMMERCIAL" in combined or "NON-COMMERCIAL" in combined:
+        return {
+            "status": "BLOCKED",
+            "ownership_type": "open_source",
+            "license_name": name or spdx,
+            "license_url": license_url,
+            "commercial_use_allowed": False,
+            "redistribution_allowed": None,
+            "reason": "license_explicitly_noncommercial",
+        }
+
+    if spdx in _GITHUB_AUTO_PASS_LICENSES:
+        return {
+            "status": "ACTIVE",
+            "ownership_type": "open_source",
+            "license_name": name or spdx,
+            "license_url": license_url,
+            "commercial_use_allowed": True,
+            "redistribution_allowed": True,
+            "reason": "approved_permissive_license",
+        }
+
+    return {
+        "status": "REVIEW_REQUIRED",
+        "ownership_type": "open_source",
+        "license_name": name or spdx,
+        "license_url": license_url,
+        "commercial_use_allowed": True,
+        "redistribution_allowed": None,
+        "reason": "license_requires_manual_obligation_review",
+    }
+
+
+def sync_github_source_asset_candidates(source: dict[str, Any], items: list[Any]) -> dict[str, Any]:
+    """Convert GitHub P2 repository results into license-gated SourceAsset candidates.
+
+    Every repository enters CANDIDATE first. Official GitHub license metadata is then
+    evaluated conservatively: only a small permissive allow-list becomes ACTIVE
+    automatically; unclear/copyleft licenses require review; explicit non-commercial
+    licenses are blocked.
+    """
+    source_id = int(source["id"])
+    now = now_iso()
+    counts = {"created": 0, "updated": 0, "active": 0, "review_required": 0, "blocked": 0}
+    asset_ids: list[int] = []
+
+    with conn() as c:
+        for item in items:
+            raw = item.raw if isinstance(getattr(item, "raw", None), dict) else {}
+            repo_url = str(getattr(item, "source_url", None) or raw.get("html_url") or "").strip()
+            title = str(getattr(item, "title", None) or raw.get("full_name") or raw.get("name") or "").strip()
+            if not repo_url or not title:
+                continue
+
+            policy = _github_license_classification(raw)
+            license_info = raw.get("license") if isinstance(raw.get("license"), dict) else {}
+            spdx = str(license_info.get("spdx_id") or "").strip() or None
+            evidence = {
+                "provider": "github",
+                "policy_version": GITHUB_ASSET_POLICY_VERSION,
+                "initial_status": "CANDIDATE",
+                "review_decision": policy["status"],
+                "review_reason": policy["reason"],
+                "source_id": source_id,
+                "source_query": source.get("query"),
+                "repository_id": raw.get("id"),
+                "repository_node_id": raw.get("node_id"),
+                "repository_full_name": raw.get("full_name") or title,
+                "repository_url": repo_url,
+                "license_spdx_id": spdx,
+                "license_api_url": license_info.get("url"),
+                "captured_at": now,
+                "note": "GitHub discovery never implies commercial rights; status is derived only from explicit license metadata.",
+            }
+            fingerprint = stable_hash(
+                "github-repository",
+                raw.get("id"),
+                raw.get("full_name") or title,
+                raw.get("updated_at"),
+                raw.get("pushed_at"),
+                spdx,
+            )
+
+            existing = c.execute(
+                "SELECT id FROM source_assets WHERE source_type='github_repository' AND source_url=? ORDER BY id LIMIT 1",
+                (repo_url,),
+            ).fetchone()
+            values = (
+                title,
+                getattr(item, "author", None) or ((raw.get("owner") or {}).get("login") if isinstance(raw.get("owner"), dict) else None),
+                fingerprint,
+                policy["ownership_type"],
+                policy["license_name"],
+                policy["license_url"],
+                None if policy["commercial_use_allowed"] is None else (1 if policy["commercial_use_allowed"] else 0),
+                None if policy["redistribution_allowed"] is None else (1 if policy["redistribution_allowed"] else 0),
+                dumps(evidence),
+                policy["status"],
+                now,
+            )
+            if existing:
+                asset_id = int(existing["id"])
+                # Explicitly pass through CANDIDATE before applying the fresh license decision.
+                c.execute("UPDATE source_assets SET status='CANDIDATE',updated_at=? WHERE id=?", (now, asset_id))
+                c.execute(
+                    """UPDATE source_assets SET title=?,author=?,checksum=?,ownership_type=?,license_name=?,license_url=?,
+                       commercial_use_allowed=?,redistribution_allowed=?,license_evidence_json=?,status=?,updated_at=?
+                       WHERE id=?""",
+                    (*values, asset_id),
+                )
+                counts["updated"] += 1
+            else:
+                cur = c.execute(
+                    """INSERT INTO source_assets(
+                           source_type,source_url,local_ref,title,author,checksum,ownership_type,license_name,license_url,
+                           commercial_use_allowed,redistribution_allowed,license_evidence_json,status,created_at,updated_at
+                       ) VALUES('github_repository',?,NULL,?,?,?,?,?,?,?,?,?,'CANDIDATE',?,?)""",
+                    (
+                        repo_url,
+                        title,
+                        getattr(item, "author", None) or ((raw.get("owner") or {}).get("login") if isinstance(raw.get("owner"), dict) else None),
+                        fingerprint,
+                        policy["ownership_type"],
+                        policy["license_name"],
+                        policy["license_url"],
+                        None if policy["commercial_use_allowed"] is None else (1 if policy["commercial_use_allowed"] else 0),
+                        None if policy["redistribution_allowed"] is None else (1 if policy["redistribution_allowed"] else 0),
+                        dumps(evidence),
+                        now,
+                        now,
+                    ),
+                )
+                asset_id = int(cur.lastrowid)
+                c.execute("UPDATE source_assets SET status=?,updated_at=? WHERE id=?", (policy["status"], now, asset_id))
+                counts["created"] += 1
+
+            counts[policy["status"].lower()] += 1
+            asset_ids.append(asset_id)
+
+    return {
+        "status": "SUCCESS",
+        "policy_version": GITHUB_ASSET_POLICY_VERSION,
+        "source_id": source_id,
+        "asset_ids": asset_ids,
+        **counts,
+    }
 
 
 def _decode_asset(row: Any) -> dict[str, Any] | None:
@@ -117,6 +296,19 @@ def update_source_asset(asset_id: int, payload: dict[str, Any]) -> dict[str, Any
     updated = get_source_asset(asset_id)
     if not updated:
         raise KeyError("source asset not found")
+
+    decision, _ = _asset_license_decision(updated)
+    current_status = str(current.get("status") or "ACTIVE").upper()
+    if current_status in {"CANDIDATE", "REVIEW_REQUIRED", "BLOCKED"} or decision == "BLOCKED":
+        desired_status = {
+            "PASS": "ACTIVE",
+            "REVIEW_REQUIRED": "REVIEW_REQUIRED",
+            "BLOCKED": "BLOCKED",
+        }[decision]
+        if str(updated.get("status") or "").upper() != desired_status:
+            with conn() as c:
+                c.execute("UPDATE source_assets SET status=?,updated_at=? WHERE id=?", (desired_status, now_iso(), asset_id))
+            updated = get_source_asset(asset_id) or updated
     return updated
 
 
@@ -144,9 +336,11 @@ def link_product_asset(product_id: int, asset_id: int, role: str = "deliverable"
         product = c.execute("SELECT id FROM products WHERE id=?", (product_id,)).fetchone()
         if not product:
             raise KeyError("product not found")
-        asset = c.execute("SELECT id FROM source_assets WHERE id=? AND status='ACTIVE'", (asset_id,)).fetchone()
+        asset = c.execute("SELECT id,status FROM source_assets WHERE id=?", (asset_id,)).fetchone()
         if not asset:
             raise KeyError("source asset not found")
+        if str(asset["status"] or "").upper() != "ACTIVE":
+            raise ValueError("source asset must be ACTIVE before product binding")
         c.execute(
             """INSERT OR IGNORE INTO product_assets(product_id,source_asset_id,role,created_at)
                VALUES(?,?,?,?)""",

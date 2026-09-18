@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .collectors import agent_reach_doctor, rsshub_doctor
 from .config import BASE_DIR, settings
 from .db import conn, init_db, loads, now_iso, row_to_dict
-from .models import DeliveryIn, SourceCreate, SourceUpdate
+from .models import DeliveryIn, SourceAssetCreate, SourceAssetUpdate, SourceCreate, SourceUpdate
 from .services.analyze import analyze_one, product_from_opportunity
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity, list_opportunities
 from .services.clustering import latest_cluster_run, trend_detail, trend_ranking
@@ -23,6 +23,7 @@ from .services.quality import data_quality_report
 from .services.ingest import backfill_intents
 from .services.validation import get_gate_a, get_validation, require_current_validation, validate_active_opportunities, validate_opportunity
 from .services.product_lifecycle import approve_product, evaluate_gate_b, get_gate_b, get_product, list_delivery_records, require_approved_current_product
+from .services.asset_registry import create_source_asset, get_source_asset, link_product_asset, list_product_assets, list_source_assets, product_asset_readiness, unlink_product_asset, update_source_asset
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -544,6 +545,71 @@ def products_generate(opportunity_id: int):
         raise HTTPException(400, str(exc))
 
 
+@app.get("/api/source-assets")
+def source_assets_list(limit: int = Query(default=100, ge=1, le=500)):
+    return list_source_assets(limit)
+
+
+@app.post("/api/source-assets")
+def source_asset_create(body: SourceAssetCreate):
+    try:
+        return create_source_asset(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/source-assets/{asset_id}")
+def source_asset_detail(asset_id: int):
+    asset = get_source_asset(asset_id)
+    if not asset:
+        raise HTTPException(404, "source asset not found")
+    return asset
+
+
+@app.patch("/api/source-assets/{asset_id}")
+def source_asset_update(asset_id: int, body: SourceAssetUpdate):
+    try:
+        return update_source_asset(asset_id, body.model_dump(exclude_unset=True))
+    except KeyError:
+        raise HTTPException(404, "source asset not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/products/{product_id}/assets")
+def product_assets_list(product_id: int):
+    try:
+        return {"assets": list_product_assets(product_id), "license_readiness": product_asset_readiness(product_id)}
+    except KeyError:
+        raise HTTPException(404, "product not found")
+
+
+@app.post("/api/products/{product_id}/assets/{asset_id}")
+def product_asset_link(product_id: int, asset_id: int, role: str = Query(default="deliverable")):
+    try:
+        return link_product_asset(product_id, asset_id, role)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.delete("/api/products/{product_id}/assets/{asset_id}")
+def product_asset_unlink(product_id: int, asset_id: int, role: str | None = None):
+    try:
+        return unlink_product_asset(product_id, asset_id, role)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+
+
+@app.get("/api/products/{product_id}/license-readiness")
+def product_license_readiness(product_id: int):
+    try:
+        return product_asset_readiness(product_id)
+    except KeyError:
+        raise HTTPException(404, "product not found")
+
+
 @app.get("/api/products")
 def products_list(limit: int = Query(default=100, ge=1, le=500)):
     with conn() as c:
@@ -557,6 +623,10 @@ def products_list(limit: int = Query(default=100, ge=1, le=500)):
             product["gate_b"] = get_gate_b(int(row["id"]))
         except Exception as exc:
             product["gate_b"] = {"decision": "REVIEW_REQUIRED", "is_current": False, "error": str(exc)}
+        try:
+            product["license_readiness"] = product_asset_readiness(int(row["id"]))
+        except Exception as exc:
+            product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
         out.append(product)
     return out
 
@@ -570,6 +640,12 @@ def product_detail(product_id: int):
         product["gate_b"] = get_gate_b(product_id)
     except Exception:
         product["gate_b"] = {"product_id": product_id, "decision": "NOT_RUN", "is_current": False}
+    try:
+        product["assets"] = list_product_assets(product_id)
+        product["license_readiness"] = product_asset_readiness(product_id)
+    except Exception as exc:
+        product["assets"] = []
+        product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
     return product
 
 

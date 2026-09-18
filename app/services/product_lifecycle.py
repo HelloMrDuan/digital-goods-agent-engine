@@ -4,6 +4,7 @@ from typing import Any
 
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
+from .asset_registry import product_asset_readiness
 from .opportunities import get_opportunity
 from .validation import get_validation
 
@@ -42,7 +43,12 @@ def list_delivery_records(limit: int = 100) -> list[dict[str, Any]]:
     return result
 
 
-def _product_snapshot(product: dict[str, Any], opportunity: dict[str, Any], validation: dict[str, Any]) -> str:
+def _product_snapshot(
+    product: dict[str, Any],
+    opportunity: dict[str, Any],
+    validation: dict[str, Any],
+    asset_readiness: dict[str, Any],
+) -> str:
     return stable_hash(
         POLICY_VERSION,
         product.get("id"),
@@ -62,6 +68,8 @@ def _product_snapshot(product: dict[str, Any], opportunity: dict[str, Any], vali
         validation.get("current_snapshot_hash"),
         validation.get("status"),
         validation.get("is_current"),
+        asset_readiness.get("snapshot_hash"),
+        asset_readiness.get("decision"),
     )
 
 
@@ -77,6 +85,7 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
     if not opportunity:
         raise KeyError("opportunity not found")
     validation = get_validation(int(product["opportunity_id"]))
+    asset_readiness = product_asset_readiness(product_id)
 
     blockers: list[str] = []
     review_flags: list[str] = []
@@ -141,6 +150,22 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
         severity="REVIEW",
         reason="compliance_notes_missing",
     )
+    if asset_readiness["decision"] == "BLOCKED":
+        record(
+            "asset_license_readiness",
+            False,
+            severity="BLOCKER",
+            reason=(asset_readiness.get("blockers") or ["asset_license_blocked"])[0],
+        )
+    elif asset_readiness["decision"] == "REVIEW_REQUIRED":
+        record(
+            "asset_license_readiness",
+            False,
+            severity="REVIEW",
+            reason=(asset_readiness.get("review_flags") or ["asset_license_review_required"])[0],
+        )
+    else:
+        record("asset_license_readiness", True, severity="BLOCKER", reason="asset_license_not_ready")
 
     if blockers:
         decision = "BLOCKED"
@@ -151,7 +176,7 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
 
     passed_checks = sum(1 for item in checks.values() if item["ok"])
     score = round(passed_checks / max(1, len(checks)) * 100.0, 2)
-    snapshot_hash = _product_snapshot(product, opportunity, validation)
+    snapshot_hash = _product_snapshot(product, opportunity, validation, asset_readiness)
     checked_at = now_iso()
     result = {
         "product_id": product_id,
@@ -168,6 +193,7 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
             "is_current": bool(validation.get("is_current")),
             "snapshot_hash": validation.get("snapshot_hash"),
         },
+        "asset_readiness": asset_readiness,
         "checked_at": checked_at,
         "data_policy": "deterministic product readiness gate; no synthetic fulfillment or license claims",
     }
@@ -206,7 +232,8 @@ def get_gate_b(product_id: int) -> dict[str, Any]:
     if not opportunity:
         raise KeyError("opportunity not found")
     validation = get_validation(int(product["opportunity_id"]))
-    current_snapshot_hash = _product_snapshot(product, opportunity, validation)
+    asset_readiness = product_asset_readiness(product_id)
+    current_snapshot_hash = _product_snapshot(product, opportunity, validation, asset_readiness)
 
     with conn() as c:
         row = c.execute(
@@ -247,8 +274,9 @@ def approve_product(product_id: int) -> dict[str, Any]:
             raise KeyError("product not found")
         opportunity_id = int(row["opportunity_id"])
         c.execute(
-            "UPDATE products SET status='APPROVED',approved_at=?,updated_at=? WHERE id=?",
-            (approved_at, approved_at, product_id),
+            """UPDATE products SET status='APPROVED',approved_at=?,approved_gate_snapshot_hash=?,updated_at=?
+               WHERE id=?""",
+            (approved_at, result["snapshot_hash"], approved_at, product_id),
         )
         c.execute(
             "UPDATE opportunities SET status='READY_TO_PUBLISH',updated_at=? WHERE id=?",
@@ -266,5 +294,7 @@ def require_approved_current_product(product_id: int) -> dict[str, Any]:
     gate = get_gate_b(product_id)
     if gate.get("decision") != "PASS" or not gate.get("is_current"):
         raise ValueError("current product Gate B must pass before fulfillment")
+    if product.get("approved_gate_snapshot_hash") != gate.get("snapshot_hash"):
+        raise ValueError("product changed after approval; human re-approval is required before fulfillment")
     product["gate_b"] = gate
     return product

@@ -50,3 +50,11 @@ def test_gate_a_gate_b_and_fulfillment_routes_are_exposed():
     assert ("/api/products/{product_id}/approve", "POST") in paths
     assert ("/api/deliveries", "GET") in paths
     assert ("/api/deliveries", "POST") in paths
+    assert ("/api/source-assets", "GET") in paths
+    assert ("/api/source-assets", "POST") in paths
+    assert ("/api/source-assets/{asset_id}", "GET") in paths
+    assert ("/api/source-assets/{asset_id}", "PATCH") in paths
+    assert ("/api/products/{product_id}/assets", "GET") in paths
+    assert ("/api/products/{product_id}/assets/{asset_id}", "POST") in paths
+    assert ("/api/products/{product_id}/assets/{asset_id}", "DELETE") in paths
+    assert ("/api/products/{product_id}/license-readiness", "GET") in paths

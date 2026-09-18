@@ -260,6 +260,36 @@ def init_db() -> None:
                 FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE RESTRICT
             );
 
+            CREATE TABLE IF NOT EXISTS source_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_url TEXT,
+                local_ref TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                checksum TEXT,
+                ownership_type TEXT NOT NULL DEFAULT 'unknown',
+                license_name TEXT,
+                license_url TEXT,
+                commercial_use_allowed INTEGER,
+                redistribution_allowed INTEGER,
+                license_evidence_json TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS product_assets (
+                product_id INTEGER NOT NULL,
+                source_asset_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'deliverable',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(product_id, source_asset_id, role),
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES source_assets(id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_assets_product ON product_assets(product_id);
+
             CREATE TABLE IF NOT EXISTS product_gate_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER NOT NULL,
@@ -432,6 +462,7 @@ def init_db() -> None:
             "gate_checked_at": "TEXT",
             "gate_json": "TEXT",
             "approved_at": "TEXT",
+            "approved_gate_snapshot_hash": "TEXT",
         }.items():
             _ensure_column(c, "products", name, ddl)
 
@@ -443,6 +474,39 @@ def init_db() -> None:
             "delivered_at": "TEXT",
         }.items():
             _ensure_column(c, "deliveries", name, ddl)
+
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS source_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_url TEXT,
+                local_ref TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                checksum TEXT,
+                ownership_type TEXT NOT NULL DEFAULT 'unknown',
+                license_name TEXT,
+                license_url TEXT,
+                commercial_use_allowed INTEGER,
+                redistribution_allowed INTEGER,
+                license_evidence_json TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS product_assets (
+                product_id INTEGER NOT NULL,
+                source_asset_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'deliverable',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(product_id, source_asset_id, role),
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES source_assets(id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_assets_product ON product_assets(product_id);
+            """
+        )
 
         c.execute(
             """CREATE TABLE IF NOT EXISTS product_gate_runs (

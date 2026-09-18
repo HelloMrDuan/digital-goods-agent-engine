@@ -10,6 +10,7 @@ from app.collectors.base import CollectedItem
 from app.config import settings
 from app.db import conn, dumps, init_db, now_iso
 from app.services.ingest import insert_evidence
+from app.services.asset_registry import create_source_asset, link_product_asset, product_asset_readiness, update_source_asset
 from app.services.opportunities import build_from_unlinked_evidence, list_opportunities
 from app.services.product_lifecycle import (
     approve_product,
@@ -94,7 +95,16 @@ def _ready_opportunity() -> tuple[int, dict[str, int]]:
     return opportunity_id, source
 
 
-def _product(opportunity_id: int, *, faq: bool = True, compliance: bool = True) -> int:
+def _product(
+    opportunity_id: int,
+    *,
+    faq: bool = True,
+    compliance: bool = True,
+    bind_asset: bool = True,
+    asset_ownership: str = "self_owned",
+    commercial_use_allowed: bool | None = None,
+    redistribution_allowed: bool | None = None,
+) -> int:
     now = now_iso()
     with conn() as c:
         cur = c.execute(
@@ -120,7 +130,22 @@ def _product(opportunity_id: int, *, faq: bool = True, compliance: bool = True) 
                 now,
             ),
         )
-    return int(cur.lastrowid)
+    product_id = int(cur.lastrowid)
+    if bind_asset:
+        asset = create_source_asset(
+            {
+                "source_type": "owned" if asset_ownership == "self_owned" else "web",
+                "title": "工资考勤模板源文件",
+                "local_ref": f"owned://product/{product_id}/payroll.xlsx",
+                "ownership_type": asset_ownership,
+                "license_name": "Owner declaration" if asset_ownership == "self_owned" else None,
+                "commercial_use_allowed": commercial_use_allowed,
+                "redistribution_allowed": redistribution_allowed,
+                "license_evidence": {"declared_by": "test-operator"} if asset_ownership == "self_owned" else {},
+            }
+        )
+        link_product_asset(product_id, int(asset["id"]), "deliverable")
+    return product_id
 
 
 def test_gate_a_maps_validation_states_without_inventing_metrics():
@@ -194,3 +219,83 @@ def test_approval_is_blocked_when_gate_b_needs_review():
 
     with pytest.raises(ValueError, match="Gate B must PASS"):
         approve_product(product_id)
+
+
+def test_gate_b_requires_source_asset_license_readiness():
+    opportunity_id, _ = _ready_opportunity()
+    product_id = _product(opportunity_id, bind_asset=False)
+
+    result = evaluate_gate_b(product_id)
+
+    assert result["decision"] == "REVIEW_REQUIRED"
+    assert "no_source_assets_bound" in result["review_flags"]
+
+
+def test_explicit_noncommercial_asset_blocks_gate_b():
+    opportunity_id, _ = _ready_opportunity()
+    product_id = _product(
+        opportunity_id,
+        asset_ownership="licensed",
+        commercial_use_allowed=False,
+        redistribution_allowed=True,
+    )
+
+    readiness = product_asset_readiness(product_id)
+    result = evaluate_gate_b(product_id)
+
+    assert readiness["decision"] == "BLOCKED"
+    assert result["decision"] == "BLOCKED"
+    assert any("commercial_use_explicitly_disallowed" in item for item in result["blockers"])
+
+
+def test_asset_change_after_approval_requires_human_reapproval_before_fulfillment():
+    opportunity_id, _ = _ready_opportunity()
+    product_id = _product(opportunity_id)
+    approve_product(product_id)
+
+    extra = create_source_asset(
+        {
+            "source_type": "owned",
+            "title": "新增说明文件",
+            "local_ref": f"owned://product/{product_id}/readme.pdf",
+            "ownership_type": "self_owned",
+            "license_evidence": {"declared_by": "test-operator"},
+        }
+    )
+    link_product_asset(product_id, int(extra["id"]), "deliverable")
+    assert get_gate_b(product_id)["is_current"] is False
+    assert evaluate_gate_b(product_id)["decision"] == "PASS"
+
+    with pytest.raises(ValueError, match="human re-approval"):
+        require_approved_current_product(product_id)
+
+    approve_product(product_id)
+    assert require_approved_current_product(product_id)["id"] == product_id
+
+
+def test_license_metadata_update_invalidates_gate_and_can_resolve_review():
+    opportunity_id, _ = _ready_opportunity()
+    product_id = _product(opportunity_id, bind_asset=False)
+    asset = create_source_asset(
+        {
+            "source_type": "licensed",
+            "title": "licensed source package",
+            "source_url": "https://example.test/package",
+            "ownership_type": "licensed",
+        }
+    )
+    link_product_asset(product_id, int(asset["id"]), "source")
+    assert product_asset_readiness(product_id)["decision"] == "REVIEW_REQUIRED"
+
+    update_source_asset(
+        int(asset["id"]),
+        {
+            "license_name": "Commercial redistribution license",
+            "license_url": "https://example.test/license",
+            "commercial_use_allowed": True,
+            "redistribution_allowed": True,
+            "license_evidence": {"invoice": "LIC-001"},
+        },
+    )
+    assert product_asset_readiness(product_id)["decision"] == "PASS"
+    assert evaluate_gate_b(product_id)["decision"] == "PASS"

@@ -1,3 +1,13 @@
+# V1.2.3 — SourceAsset License Registry
+
+- 新增 SourceAsset Registry：素材来源、URL/本地引用、checksum、所有权类型、许可证名称/URL、商用许可、再分发许可和证据独立入库。
+- 授权判断坚持显式事实：不会因为来源是 GitHub、网页或“开源”字样自动推断可商用/可再分发；未知信息进入 `REVIEW_REQUIRED`。
+- 明确 `commercial_use_allowed=false` 或 `redistribution_allowed=false` 的素材直接让商品 Gate B `BLOCKED`。
+- 商品必须绑定至少一个 SourceAsset 才能通过 Gate B；自有素材通过 `self_owned` 显式声明，外部许可素材要求补许可证/证据。
+- 新增素材登记、修改、商品绑定/解绑、授权 readiness API；商品详情页展示实际素材及商用/再分发状态。
+- Gate B 快照新增素材授权快照；素材或许可证信息变化会让旧 Gate B 自动失效。
+- 商品批准时记录批准对应的 Gate B snapshot；批准后若素材变化，即便重新跑 Gate B 通过，也必须再次人工批准才能交付。
+
 # V1.2.2 — Gate A / Gate B Product Lifecycle
 
 - 将既有真实需求商业验证显式标准化为 Gate A：`PASS / REJECT / REVIEW_REQUIRED`，继续坚持 evidence-first，不用 AI 补造需求指标。

@@ -2,7 +2,7 @@
 
 本地自托管的数字商品需求发现与经营辅助系统。系统坚持 `REAL DATA ONLY`：业务数据只能来自真实采集，失败显示真实原因，AI 不得补造搜索量、销量、用户数或趋势。
 
-## V1.2.2 主流程
+## V1.2.3 主流程
 
 1. 通过 OpenCLI/Agent-Reach、RSS、GitHub、Bilibili、YouTube 等来源采集真实内容。
 2. 明确/高概率需求作为确定性 demand；高质量核心来源 discussion 可作为 `context` 进入商机候选，但不会抬高需求数量、趋势分或商业验证分。
@@ -13,6 +13,7 @@
 7. Gate B 对商品标题、描述、价格、交付物、客服 FAQ、合规备注、版权风险和上游 Gate A 快照做确定性检查，输出 `PASS / BLOCKED / REVIEW_REQUIRED`。
 8. 人工批准只能在当前 Gate B 为 `PASS` 时执行；批准后商品进入 `APPROVED`，商机进入 `READY_TO_PUBLISH`。
 9. 交付记录要求商品已批准且 Gate B 仍然有效；上游证据变化会让旧 Gate B 失效，阻止继续自动交付。
+10. SourceAsset Registry 独立记录素材来源、所有权、许可证、商用许可、再分发许可和证据；Gate B 只使用显式授权事实，不根据 URL、仓库名或“开源”字样猜测可商用。
 
 Gate A / Gate B 都是确定性 Gate，不调用 AI、不生成测试业务数据。证据变化后，旧 Gate A 自动进入 `STALE`；Gate B 绑定商品内容、商机分析和 Gate A 快照，上游任一变化都会变为非当前状态，必须重新检查。多 Agent 运行仍记录 provider、model、token、耗时、状态和错误。
 
@@ -30,6 +31,11 @@ Gate A / Gate B 都是确定性 Gate，不调用 AI、不生成测试业务数�
 - `GET/POST /api/products/{product_id}/gate-b`：查询或重新执行商品上线前 Gate B。
 - `POST /api/products/{product_id}/approve`：人工批准；仅当前 Gate B 为 `PASS` 时允许。
 - `GET/POST /api/deliveries`：查询/创建交付记录；创建交付要求商品已批准且 Gate B 仍然有效。
+- `GET/POST /api/source-assets`：查询/登记来源素材和授权元数据。
+- `GET/PATCH /api/source-assets/{asset_id}`：查看或修正素材所有权/许可证证据。
+- `GET /api/products/{product_id}/assets`：查看商品绑定素材及聚合授权状态。
+- `POST/DELETE /api/products/{product_id}/assets/{asset_id}`：绑定或解绑商品素材。
+- `GET /api/products/{product_id}/license-readiness`：获取明确的商用/再分发授权 Gate。
 
 ## 启动
 

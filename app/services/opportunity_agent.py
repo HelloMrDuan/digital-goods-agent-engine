@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
-from typing import Any, Callable
+from typing import Any, Callable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
@@ -22,6 +24,131 @@ _AGENT_SYSTEM = {
     "risk": """你是 Risk Agent。审查版权、平台合规、市场饱和、需求真实性、售后和支付意愿风险。输出 JSON：risk_score(0-100), copyright_risk(0-100), saturation_risk(0-100), payment_risk(0-100), platform_risks(array), warnings(array), blockers(array), confidence(0-100), reasoning(string)。高风险必须明确说明。""",
     "judge": """你是 Judge Agent。综合前五个 Agent 和真实证据指标，给出谨慎的商业决策。输出 JSON：final_score(0-100), decision(BUILD|WATCH|DROP), confidence(0-100), title(string), category(string), summary(string), reasoning(string)。不得把 AI 判断包装成事实；证据不足时优先 WATCH 或 DROP。""",
 }
+
+
+class _AgentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SignalOutput(_AgentOutput):
+    signals: list[str]
+    signal_strength: float = Field(ge=0, le=100)
+    demand_pattern: str
+    evidence_refs: list[int] = Field(min_length=1)
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _PainPoint(_AgentOutput):
+    pain: str
+    severity: float = Field(ge=0, le=100)
+    evidence_refs: list[int] = Field(min_length=1)
+
+
+class _PainOutput(_AgentOutput):
+    target_users: list[str]
+    pain_points: list[_PainPoint]
+    urgency: float = Field(ge=0, le=100)
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _MarketOutput(_AgentOutput):
+    category: str
+    market_score: float = Field(ge=0, le=100)
+    purchase_intent: float = Field(ge=0, le=100)
+    competition_level: float = Field(ge=0, le=100)
+    competition_gaps: list[str]
+    buyer_profile: list[str]
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _RecommendedProduct(_AgentOutput):
+    name: str
+    format: str
+    why: str
+    deliverables: list[str]
+
+
+class _PriceRange(_AgentOutput):
+    currency: str
+    min: float = Field(ge=0)
+    max: float = Field(ge=0)
+    reason: str
+
+
+class _ProductOutput(_AgentOutput):
+    recommended_products: list[_RecommendedProduct]
+    primary_product: str
+    price_range: _PriceRange
+    production_complexity: float = Field(ge=0, le=100)
+    automation_fit: float = Field(ge=0, le=100)
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _RiskOutput(_AgentOutput):
+    risk_score: float = Field(ge=0, le=100)
+    copyright_risk: float = Field(ge=0, le=100)
+    saturation_risk: float = Field(ge=0, le=100)
+    payment_risk: float = Field(ge=0, le=100)
+    platform_risks: list[str]
+    warnings: list[str]
+    blockers: list[str]
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _JudgeOutput(_AgentOutput):
+    final_score: float = Field(ge=0, le=100)
+    decision: Literal["BUILD", "WATCH", "DROP"]
+    confidence: float = Field(ge=0, le=100)
+    title: str
+    category: str
+    summary: str
+    reasoning: str
+
+
+_AGENT_SCHEMAS: dict[str, type[_AgentOutput]] = {
+    "signal": _SignalOutput,
+    "pain": _PainOutput,
+    "market": _MarketOutput,
+    "product": _ProductOutput,
+    "risk": _RiskOutput,
+    "judge": _JudgeOutput,
+}
+
+
+def _validate_agent_output(agent_name: str, output: Any, allowed_evidence_ids: set[int]) -> dict[str, Any]:
+    schema = _AGENT_SCHEMAS[agent_name]
+    try:
+        value = schema.model_validate(output).model_dump()
+    except ValidationError as exc:
+        raise ValueError(
+            f"{agent_name} agent output schema invalid: {exc.errors(include_url=False)}"
+        ) from exc
+
+    def check_refs(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key == "evidence_refs":
+                    invalid = sorted({int(ref) for ref in child} - allowed_evidence_ids)
+                    if invalid:
+                        raise ValueError(
+                            f"{agent_name} agent evidence_refs outside input evidence: {invalid}"
+                        )
+                else:
+                    check_refs(child)
+        elif isinstance(node, list):
+            for child in node:
+                check_refs(child)
+
+    check_refs(value)
+    price = value.get("price_range")
+    if isinstance(price, dict) and float(price.get("max") or 0) < float(price.get("min") or 0):
+        raise ValueError(f"{agent_name} agent price_range max must be >= min")
+    return value
 
 
 def _score(value: Any, default: float = 0.0) -> float:
@@ -222,7 +349,12 @@ def _record_agent_run(
         return int(cur.lastrowid)
 
 
-def _run_agent(opportunity_id: int, agent_name: str, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], int]:
+def _run_agent(
+    opportunity_id: int,
+    agent_name: str,
+    payload: dict[str, Any],
+    allowed_evidence_ids: set[int],
+) -> tuple[dict[str, Any], dict[str, Any], int]:
     started = time.monotonic()
     try:
         output, meta = chat_json_with_meta(
@@ -233,8 +365,7 @@ def _run_agent(opportunity_id: int, agent_name: str, payload: dict[str, Any]) ->
             payload=payload,
             max_new_tokens=settings.agent_max_new_tokens,
         )
-        if not isinstance(output, dict):
-            raise ValueError(f"{agent_name} agent returned non-object JSON")
+        output = _validate_agent_output(agent_name, output, allowed_evidence_ids)
         duration_ms = int((time.monotonic() - started) * 1000)
         run_id = _record_agent_run(
             opportunity_id=opportunity_id,
@@ -289,6 +420,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
     except Exception as exc:
         validation = {"status": "ERROR", "score": 0, "reason_codes": [str(exc)]}
 
+    allowed_evidence_ids = {int(value) for value in digest["real_metrics"]["evidence_ids"]}
     outputs: dict[str, dict[str, Any]] = {}
     run_ids: list[int] = []
     last_meta: dict[str, Any] = {}
@@ -345,7 +477,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
                 "product": outputs["product"],
                 "risk": outputs["risk"],
             }
-        output, last_meta, run_id = _run_agent(opportunity_id, agent_name, payload)
+        output, last_meta, run_id = _run_agent(opportunity_id, agent_name, payload, allowed_evidence_ids)
         outputs[agent_name] = output
         run_ids.append(run_id)
 

@@ -1,4 +1,9 @@
-const state = { current: "dashboard", health: null, rebuildTaskId: null };
+const state = {
+  current: "dashboard",
+  health: null,
+  rebuildTaskId: null,
+  apiToken: localStorage.getItem("digitalGoodsApiToken") || "",
+};
 
 const views = {
   dashboard: ["工作台", "真实采集、真实证据、真实 Agent 分析。"],
@@ -56,7 +61,11 @@ function safeUrl(value) {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: {
+      "Content-Type": "application/json",
+      ...(state.apiToken ? { Authorization: `Bearer ${state.apiToken}` } : {}),
+      ...(options.headers || {}),
+    },
     ...options,
   });
   const type = response.headers.get("content-type") || "";
@@ -213,7 +222,25 @@ async function renderCost() {
 
 async function renderSettings() {
   const [health, agent, scheduler] = await Promise.all([api("/health"), api("/api/agent-reach/doctor"), api("/api/scheduler/status")]);
-  document.getElementById("view-settings").innerHTML = `<div class="split">${panel("运行状态", `<pre class="code-block">${esc(JSON.stringify(health, null, 2))}</pre>`)}${panel("采集与调度", `<pre class="code-block">${esc(JSON.stringify({ agent_reach: agent, scheduler }, null, 2))}</pre>`)}</div>`;
+  const auth = `<div class="source-meta">远程写操作需要与服务端 API_AUTH_TOKEN 一致的 Token；Token 仅保存在当前浏览器 localStorage。</div>
+    <div class="toolbar"><input id="api-token-input" type="password" placeholder="API Token" value="${esc(state.apiToken)}" autocomplete="off"><button class="btn secondary" onclick="saveApiToken()">保存 Token</button><button class="btn ghost" onclick="clearApiToken()">清除</button></div>`;
+  document.getElementById("view-settings").innerHTML = `<div class="split">${panel("运行状态", `<pre class="code-block">${esc(JSON.stringify(health, null, 2))}</pre>`)}${panel("采集与调度", `<pre class="code-block">${esc(JSON.stringify({ agent_reach: agent, scheduler }, null, 2))}</pre>`)}</div>${panel("API 写操作认证", auth)}`;
+}
+
+function saveApiToken() {
+  const input = document.getElementById("api-token-input");
+  state.apiToken = String(input?.value || "").trim();
+  if (state.apiToken) localStorage.setItem("digitalGoodsApiToken", state.apiToken);
+  else localStorage.removeItem("digitalGoodsApiToken");
+  showToast(state.apiToken ? "API Token 已保存" : "API Token 已清除");
+}
+
+function clearApiToken() {
+  state.apiToken = "";
+  localStorage.removeItem("digitalGoodsApiToken");
+  const input = document.getElementById("api-token-input");
+  if (input) input.value = "";
+  showToast("API Token 已清除");
 }
 
 const renderers = { dashboard: renderDashboard, sources: renderSources, evidence: renderEvidence, opportunities: renderOpportunities, trends: renderTrends, quality: renderQuality, products: renderProducts, cost: renderCost, settings: renderSettings };

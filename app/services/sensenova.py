@@ -10,6 +10,7 @@ import httpx
 
 from ..config import settings
 from ..db import conn, dumps, now_iso
+from .llm.budget import BudgetExceededError, release_ai_budget, reserve_ai_budget
 
 
 class SenseNovaError(RuntimeError):
@@ -57,9 +58,6 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
 def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system: str, payload: dict[str, Any], max_new_tokens: int = 1800) -> dict[str, Any]:
     if not settings.is_sensenova_configured:
         raise SenseNovaError("SenseNova is not configured. Set SENSENOVA_API_TOKEN and SENSENOVA_MODEL. No mock fallback is allowed.")
-    if _daily_spend() >= settings.daily_ai_budget_cny:
-        raise SenseNovaError(f"Daily AI budget reached: ¥{_daily_spend():.4f} / ¥{settings.daily_ai_budget_cny:.2f}")
-
     request_body = {
         "model": settings.sensenova_model,
         "messages": [
@@ -74,7 +72,15 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
     }
     headers = {"Authorization": f"Bearer {settings.sensenova_api_token}", "Content-Type": "application/json"}
     created_at = now_iso()
+    reservation_id: int | None = None
     try:
+        prompt_text = system + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        prompt_upper = max(256, int(len(prompt_text) * 1.25) + 256)
+        reserve_cost = _estimate_cost(prompt_upper, int(max_new_tokens))
+        try:
+            reservation_id = reserve_ai_budget("SenseNova", reserve_cost)
+        except BudgetExceededError as exc:
+            raise SenseNovaError(str(exc)) from exc
         with httpx.Client(timeout=90.0, headers=headers) as client:
             resp = client.post(settings.sensenova_base_url, json=request_body)
             resp.raise_for_status()
@@ -102,6 +108,7 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model, "SUCCESS", prompt_tokens, completion_tokens, total_tokens, cost, created_at),
             )
+            release_ai_budget(reservation_id, c)
         result["_usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens, "estimated_cost_cny": cost}
         return result
     except Exception as exc:
@@ -111,6 +118,7 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model or "UNCONFIGURED", "FAILED", str(exc), created_at),
             )
+            release_ai_budget(reservation_id, c)
         if isinstance(exc, SenseNovaError):
             raise
         raise SenseNovaError(str(exc)) from exc

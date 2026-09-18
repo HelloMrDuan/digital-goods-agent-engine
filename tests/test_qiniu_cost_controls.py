@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from app.config import settings
-from app.db import init_db
+from app.db import conn, init_db
+from app.services.llm.budget import BudgetExceededError, budget_snapshot, reserve_ai_budget, release_ai_budget
 from app.services.llm import qiniu
 
 
@@ -206,3 +207,35 @@ def test_qiniu_retries_clearly_truncated_json_with_larger_token_cap(monkeypatch,
     assert meta["usage"]["prompt_tokens"] == 1400
     assert meta["usage"]["completion_tokens"] == 1100
     assert meta["usage"]["total_tokens"] == 2500
+
+
+
+def test_budget_reservation_is_atomic_and_prevents_oversubscription(qiniu_env):
+    settings.daily_ai_budget_cny = 5.0
+    first = reserve_ai_budget("Qiniu", 3.0)
+    snapshot = budget_snapshot()
+    assert snapshot["reserved_cny"] == pytest.approx(3.0)
+
+    with pytest.raises(BudgetExceededError, match="would be exceeded"):
+        reserve_ai_budget("Qiniu", 3.0)
+
+    release_ai_budget(first)
+    second = reserve_ai_budget("Qiniu", 3.0)
+    release_ai_budget(second)
+
+
+def test_qiniu_success_settles_budget_reservation(monkeypatch, qiniu_env):
+    monkeypatch.setattr(qiniu.httpx, "Client", _Client)
+    qiniu.chat_json_with_meta(
+        operation="budget-settlement",
+        system="Return JSON",
+        payload={"hello": "world"},
+        max_new_tokens=800,
+    )
+    with conn() as c:
+        reservations = c.execute("SELECT COUNT(*) c FROM ai_budget_reservations").fetchone()
+        success = c.execute(
+            "SELECT COUNT(*) c FROM ai_runs WHERE operation='budget-settlement' AND status='SUCCESS'"
+        ).fetchone()
+    assert int(reservations["c"]) == 0
+    assert int(success["c"]) == 1

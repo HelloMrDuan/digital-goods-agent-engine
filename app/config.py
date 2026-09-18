@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     min_score_for_product: int = 70
     high_risk_threshold: int = 80
     daily_ai_budget_cny: float = 5.0
+    # Unknown/unpriced models still reserve budget conservatively instead of bypassing the cap.
+    ai_unknown_call_reserve_cny: float = 0.10
+
+    # Mutating /api routes require this token for non-loopback clients. When empty,
+    # remote writes are disabled; local loopback development remains usable.
+    api_auth_token: str = ""
 
     # V1.2 deterministic commercial validation. This gate protects product generation,
     # but the opportunity Agent workflow may still evaluate failed candidates as WATCH/DROP

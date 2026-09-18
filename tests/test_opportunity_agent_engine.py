@@ -192,3 +192,41 @@ def test_failed_deterministic_validation_no_longer_blocks_discovery_agent(monkey
     with conn() as c:
         row = c.execute("SELECT COUNT(*) count FROM agent_runs WHERE opportunity_id=?", (opportunity_id,)).fetchone()
     assert int(row["count"]) == 6
+
+
+
+def test_agent_schema_rejects_evidence_refs_not_present_in_input(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+
+    def fake_bad_ref(**kwargs):
+        output, meta = _fake_chat(**kwargs)
+        if kwargs["operation"] == "opportunity_agent_signal":
+            output = dict(output)
+            output["evidence_refs"] = [999999]
+        return output, meta
+
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", fake_bad_ref)
+
+    with pytest.raises(ValueError, match="evidence_refs outside input evidence"):
+        opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+
+    runs = opportunity_agent.list_agent_runs(opportunity_id)
+    assert len(runs) == 1
+    assert runs[0]["agent_name"] == "signal"
+    assert runs[0]["status"] == "FAILED"
+
+
+def test_agent_schema_rejects_extra_fields(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+
+    def fake_extra(**kwargs):
+        output, meta = _fake_chat(**kwargs)
+        if kwargs["operation"] == "opportunity_agent_signal":
+            output = dict(output)
+            output["invented_metric"] = 123
+        return output, meta
+
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", fake_extra)
+
+    with pytest.raises(ValueError, match="output schema invalid"):
+        opportunity_agent.run_opportunity_agent_workflow(opportunity_id)

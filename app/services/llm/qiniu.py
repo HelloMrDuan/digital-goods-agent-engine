@@ -11,6 +11,7 @@ import httpx
 
 from ...config import settings
 from ...db import conn, now_iso
+from .budget import BudgetExceededError, release_ai_budget, reserve_ai_budget
 
 
 class QiniuError(RuntimeError):
@@ -84,6 +85,15 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
         + completion_tokens / 1_000_000 * output_price,
         6,
     )
+
+
+def _request_budget_reserve(messages: list[dict[str, Any]], max_new_tokens: int | None) -> float:
+    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    prompt_upper = max(256, int(len(serialized) * 1.25) + 256)
+    output_limit = max(1, int(max_new_tokens or settings.agent_max_new_tokens or 800))
+    retry_limit = max(output_limit, _expanded_json_retry_tokens(output_limit))
+    estimate = _estimate_cost(prompt_upper * 2, output_limit + retry_limit)
+    return estimate if estimate > 0 else max(0.000001, float(settings.ai_unknown_call_reserve_cny or 0.0))
 
 
 def _wait_for_request_slot() -> None:
@@ -189,9 +199,6 @@ def _expanded_json_retry_tokens(original: int) -> int:
 def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     if not settings.is_qiniu_configured:
         raise QiniuError("Qiniu is not configured. Set QINIU_API_TOKEN/QINIU_BASE_URL/QINIU_MODEL.")
-    if _daily_spend() >= settings.daily_ai_budget_cny:
-        raise QiniuError(f"Daily AI budget reached: ¥{_daily_spend():.4f} / ¥{settings.daily_ai_budget_cny:.2f}")
-
     url = settings.qiniu_base_url.rstrip("/")
     if not url.endswith("/chat/completions"):
         url += "/chat/completions"
@@ -226,7 +233,15 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     entity_type = str(kwargs.get("entity_type") or "system")
     entity_id = kwargs.get("entity_id")
     created_at = now_iso()
+    reservation_id: int | None = None
     try:
+        try:
+            reservation_id = reserve_ai_budget(
+                "Qiniu",
+                _request_budget_reserve(messages, int(max_new_tokens) if max_new_tokens else None),
+            )
+        except BudgetExceededError as exc:
+            raise QiniuError(str(exc)) from exc
         response = _post_with_rate_limit_retry(url, headers, body)
         data, content, finish_reason = _decode_completion_response(response)
         usage_parts = [_usage_numbers(data)]
@@ -276,6 +291,7 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                     created_at,
                 ),
             )
+            release_ai_budget(reservation_id, c)
         meta = {
             "provider": "Qiniu",
             "model": settings.qiniu_model,
@@ -307,6 +323,7 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                     created_at,
                 ),
             )
+            release_ai_budget(reservation_id, c)
         if isinstance(exc, QiniuError):
             raise
         raise QiniuError(f"Qiniu connection failed: {exc}") from exc

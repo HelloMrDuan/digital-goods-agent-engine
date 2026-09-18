@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+
 # Keep the validated V1.2 commercial-validation application intact and layer the
 # Opportunity Card / rebuild APIs on top. Splitting the routes keeps the next
 # iteration small and makes rollback straightforward.
@@ -35,8 +37,50 @@ def _real_refresh_readiness() -> tuple[bool, str | None]:
     return True, None
 
 
+def _is_loopback_client(host: str | None) -> bool:
+    value = str(host or "").strip().lower()
+    return value in {"127.0.0.1", "::1", "localhost", "testclient"} or value.startswith("::ffff:127.")
+
+
+def _write_auth_error(
+    method: str,
+    path: str,
+    client_host: str | None,
+    authorization: str | None,
+    api_key: str | None,
+) -> tuple[int, str] | None:
+    if method.upper() not in {"POST", "PUT", "PATCH", "DELETE"} or not path.startswith("/api/"):
+        return None
+    expected = str(settings.api_auth_token or "").strip()
+    if not expected:
+        if _is_loopback_client(client_host):
+            return None
+        return 403, "remote API writes are disabled until API_AUTH_TOKEN is configured"
+
+    bearer = ""
+    raw_auth = str(authorization or "").strip()
+    if raw_auth.lower().startswith("bearer "):
+        bearer = raw_auth[7:].strip()
+    supplied = str(api_key or "").strip() or bearer
+    if not supplied or not secrets.compare_digest(supplied, expected):
+        return 401, "valid API token required for mutating API requests"
+    return None
+
+
 @app.middleware("http")
-async def _guard_real_refresh(request, call_next):
+async def _security_guards(request, call_next):
+    client_host = request.client.host if request.client else None
+    auth_error = _write_auth_error(
+        request.method,
+        request.url.path,
+        client_host,
+        request.headers.get("Authorization"),
+        request.headers.get("X-API-Key"),
+    )
+    if auth_error:
+        status, detail = auth_error
+        return JSONResponse(status_code=status, content={"detail": detail})
+
     if request.method.upper() == "POST" and request.url.path == "/api/opportunities/rebuild":
         refresh = str(request.query_params.get("refresh", "true")).strip().lower() not in {"0", "false", "no", "off"}
         if refresh:
@@ -47,4 +91,4 @@ async def _guard_real_refresh(request, call_next):
 
 
 app.include_router(opportunity_v12_router)
-app.version = "1.2.3-asset-license-registry"
+app.version = "1.2.4-correctness-security-hardening"

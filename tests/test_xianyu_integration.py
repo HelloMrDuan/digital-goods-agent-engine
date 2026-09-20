@@ -146,3 +146,35 @@ def test_xianyu_market_source_enters_market_intel_not_demand(monkeypatch):
     assert list_market_intel(10)[0]["marketplace"] == "xianyu"
     with conn() as c:
         assert c.execute("SELECT COUNT(*) c FROM evidence").fetchone()["c"] == 0
+
+
+
+def test_xianyu_market_caps_detail_enrichment_for_interactive_refresh(monkeypatch):
+    captured = {}
+
+    def fake_collect(*args, **kwargs):
+        captured.update(kwargs)
+        return [
+            CollectedItem(
+                platform="xianyu",
+                source_type="agent_reach_xianyu",
+                source_item_id="1",
+                source_url="https://www.goofish.com/item?id=1",
+                title="Excel模板",
+                raw={
+                    "_xianyu_detail_verified": True,
+                    "_xianyu_detail": {"description": "电子版 网盘发货"},
+                },
+            )
+        ]
+
+    monkeypatch.setattr(xianyu, "collect_agent_reach", fake_collect)
+    old = settings.xianyu_market_detail_limit
+    settings.xianyu_market_detail_limit = 7
+    try:
+        rows = xianyu.collect_xianyu_market("Excel模板", 30)
+    finally:
+        settings.xianyu_market_detail_limit = old
+
+    assert len(rows) == 1
+    assert captured["detail_limit"] == 7

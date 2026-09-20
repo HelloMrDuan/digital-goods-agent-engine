@@ -274,10 +274,10 @@ def test_market_refresh_collects_enabled_market_sources_and_reports_partial_fail
         {"id": 4, "name": "demand", "platform": "reddit", "role": "demand", "enabled": True},
     ])
 
-    calls: list[tuple[int, bool]] = []
+    calls: list[tuple[int, int | None, bool]] = []
 
     def fake_collect(source_id: int, limit=None, force=False):
-        calls.append((source_id, force))
+        calls.append((source_id, limit, force))
         if source_id == 2:
             raise RuntimeError("etsy unavailable")
         return {"status": "SUCCESS", "fetched": 5, "inserted": 3, "duplicates": 2, "rejected_invalid": 0}
@@ -292,9 +292,15 @@ def test_market_refresh_collects_enabled_market_sources_and_reports_partial_fail
         "max_sales": 88.0,
     })
 
-    result = routes_v12._refresh_market_intelligence()
+    progress: list[dict] = []
+    result = routes_v12._refresh_market_intelligence(progress_callback=progress.append)
 
-    assert sorted(calls) == [(1, True), (2, True)]
+    assert sorted(calls) == [
+        (1, settings.market_refresh_source_limit, True),
+        (2, settings.market_refresh_source_limit, True),
+    ]
+    assert len(progress) == 2
+    assert sorted(event["completed_sources"] for event in progress) == [1, 2]
     assert result["processed"] == 2
     assert result["successful"] == 1
     assert result["failed"] == 1
@@ -311,8 +317,15 @@ def test_rebuild_without_ai_refreshes_market_before_clustering(monkeypatch):
         "direct_demand_signals": 3,
     })
 
-    def fake_market_refresh():
+    def fake_market_refresh(progress_callback=None):
         events.append("market")
+        if progress_callback is not None:
+            progress_callback({
+                "completed_sources": 1,
+                "total_sources": 1,
+                "source_name": "market",
+                "status": "SUCCESS",
+            })
         return {
             "processed": 3,
             "successful": 3,

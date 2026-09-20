@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -111,12 +111,14 @@ def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict
         return {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
 
 
-def _refresh_market_intelligence() -> dict[str, Any]:
-    """Refresh every enabled market-intelligence source without faking availability.
+def _refresh_market_intelligence(
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Refresh enabled market sources with bounded per-source breadth.
 
-    A single marketplace failure is reported but does not discard successful fresh
-    observations from the other real sources. Opportunity clustering rematches the
-    resulting verified digital market rows immediately afterwards.
+    The rebuild path needs fresh top-market signals, not a deep crawl. Each source is
+    forced once with MARKET_REFRESH_SOURCE_LIMIT, while collectors retain their own
+    real-data verification rules. One marketplace failure does not discard others.
     """
     market_sources = [
         source
@@ -124,18 +126,21 @@ def _refresh_market_intelligence() -> dict[str, Any]:
         if source.get("enabled") and str(source.get("role") or "").lower() == "market"
     ]
     results: list[dict[str, Any]] = []
+    total = len(market_sources)
+    source_limit = max(1, min(50, int(settings.market_refresh_source_limit)))
     if market_sources:
         worker_count = min(3, len(market_sources))
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="market-refresh") as pool:
             future_map = {
-                pool.submit(collect_source, int(source["id"]), None, True): source
+                pool.submit(collect_source, int(source["id"]), source_limit, True): source
                 for source in market_sources
             }
+            completed = 0
             for future in as_completed(future_map):
                 source = future_map[future]
                 try:
                     item = future.result()
-                    results.append({
+                    result = {
                         "source_id": int(source["id"]),
                         "source_name": source.get("name"),
                         "platform": source.get("platform"),
@@ -144,14 +149,22 @@ def _refresh_market_intelligence() -> dict[str, Any]:
                         "inserted": int(item.get("inserted") or 0),
                         "duplicates": int(item.get("duplicates") or 0),
                         "rejected_invalid": int(item.get("rejected_invalid") or 0),
-                    })
+                    }
                 except Exception as exc:
-                    results.append({
+                    result = {
                         "source_id": int(source["id"]),
                         "source_name": source.get("name"),
                         "platform": source.get("platform"),
                         "status": "FAILED",
                         "error": str(exc),
+                    }
+                results.append(result)
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback({
+                        **result,
+                        "completed_sources": completed,
+                        "total_sources": total,
                     })
 
     results.sort(key=lambda item: int(item.get("source_id") or 0))
@@ -161,6 +174,7 @@ def _refresh_market_intelligence() -> dict[str, Any]:
         "processed": len(results),
         "successful": sum(str(item.get("status") or "").upper() in success_like for item in results),
         "failed": sum(str(item.get("status") or "").upper() == "FAILED" for item in results),
+        "source_limit": source_limit,
         "results": results,
         "summary": summary,
         "truth_policy": "only verified digital market rows are stored; sales contributes only when the upstream source explicitly exposes a verified sales metric",
@@ -273,7 +287,24 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 stage="刷新市场情报",
                 message="正在刷新闲鱼/Etsy/Creative Market 等真实数字商品热度与可验证销量信号",
             )
-            market_refresh_result = _refresh_market_intelligence()
+            def market_progress(event: dict[str, Any]) -> None:
+                completed = int(event.get("completed_sources") or 0)
+                total_sources = max(1, int(event.get("total_sources") or 1))
+                progress = min(18, 12 + int(completed / total_sources * 6))
+                status_text = str(event.get("status") or "UNKNOWN")
+                source_name = str(event.get("source_name") or event.get("platform") or "market")
+                error = str(event.get("error") or "").strip()
+                message = f"{source_name} | {status_text}"
+                if error:
+                    message += f" | {error[:120]}"
+                _update_rebuild(
+                    task_id,
+                    progress=progress,
+                    stage=f"刷新市场情报 {completed}/{total_sources}",
+                    message=message,
+                )
+
+            market_refresh_result = _refresh_market_intelligence(progress_callback=market_progress)
             market_summary = market_refresh_result.get("summary") or {}
             _update_rebuild(
                 task_id,
@@ -474,7 +505,10 @@ def opportunities_rebuild(
     if analyze and not settings.is_llm_configured:
         raise HTTPException(409, "LLM is not configured; set Qiniu or SenseNova, or call with analyze=false")
     now = now_iso()
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(timespec="seconds")
+    stale_cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(minutes=max(5, int(settings.rebuild_task_stale_minutes)))
+    ).isoformat(timespec="seconds")
     with conn() as c:
         # Serialize the active-task check and insert so two rapid clicks/processes cannot
         # both pass the check and start duplicate paid Agent work.

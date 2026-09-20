@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     etsy_enrich_shop_sales: bool = True
     etsy_shop_enrich_limit: int = 8
     etsy_digital_verify_limit: int = 30
+    # Interactive rebuilds only need top market signals; cap refresh breadth so a
+    # marketplace cannot monopolize the whole opportunity rebuild.
+    market_refresh_source_limit: int = 12
+    rebuild_task_stale_minutes: int = 10
+    xianyu_market_detail_limit: int = 9
+    xianyu_market_detail_workers: int = 3
+    xianyu_market_detail_timeout_seconds: int = 40
 
     # Real Etsy Open API v3 publishing. No fake success when credentials are absent.
     etsy_api_key: str = ""

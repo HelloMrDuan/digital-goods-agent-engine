@@ -6,6 +6,7 @@ from typing import Any
 
 from .agent_reach import collect as collect_agent_reach
 from .base import CollectedItem, CollectorError
+from ..config import settings
 
 
 _DIGITAL_MARKERS = (
@@ -78,7 +79,10 @@ def collect_xianyu_market(query: str, limit: int = 30) -> list[CollectedItem]:
         query,
         limit=min(50, max(requested * 2, requested)),
         enrich=True,
-        detail_limit=min(30, max(requested * 2, requested)),
+        detail_limit=min(
+            max(1, int(settings.xianyu_market_detail_limit)),
+            max(requested * 2, requested),
+        ),
         comments_limit=0,
     )
     result: list[CollectedItem] = []

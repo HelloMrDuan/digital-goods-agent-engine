@@ -560,3 +560,34 @@ def test_v9_different_corroboration_topics_never_merge_even_if_generic_words_ove
     clusters, _, _ = clustering._legacy._cluster_rows(rows)
 
     assert len(clusters) == 2
+
+
+
+def test_invoice_topic_requires_invoice_or_billing_core_semantics():
+    from app.services.demand_topics import detect_topic
+
+    good = detect_topic(
+        "Need affordable invoice automation",
+        "I want billing with a saved item catalog for my rental business.",
+    )
+    assert good and good["key"] == "invoice_contract_workflow"
+
+    assert detect_topic(
+        "Which AI agent tasks are safe?",
+        "I run an automation agency and want practical client handoff guidance instead of AI hype.",
+    ) is None
+
+    assert detect_topic(
+        "Contract eligibility review stuck",
+        "My payroll platform has me in an eligibility review loop and I need emergency access to funds.",
+    ) is None
+
+
+def test_stale_wrong_corroboration_tag_is_revalidated_against_current_taxonomy():
+    row = {
+        "title": "Which AI agent tasks are safe?",
+        "content": "Automation agency owner wants practical AI handoff guidance.",
+        "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+    }
+
+    assert clustering._legacy._evidence_topic_key(row) is None

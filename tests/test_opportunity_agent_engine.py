@@ -351,3 +351,58 @@ def test_signal_schema_still_rejects_arbitrary_structured_fields():
 
     with pytest.raises(ValueError, match="unsupported fields"):
         opportunity_agent._validate_agent_output("signal", output, {101})
+
+
+
+def test_product_schema_normalizes_string_deliverables_from_model():
+    output = {
+        "recommended_products": [
+            {
+                "name": "OCR Import Workbook",
+                "format": "xlsx",
+                "why": "Matches the validated workflow.",
+                "deliverables": "A robust .xlsx file with protected headers and validation lists.",
+            },
+            {
+                "name": "OCR Helper Script",
+                "format": "python",
+                "why": "Automates preprocessing.",
+                "deliverables": ["main.py", "README.md"],
+            },
+        ],
+        "primary_product": "OCR Import Workbook",
+        "price_range": {"currency": "USD", "min": 19, "max": 49, "reason": "test"},
+        "production_complexity": 40,
+        "automation_fit": 90,
+        "confidence": 80,
+        "reasoning": "grounded",
+    }
+
+    value = opportunity_agent._validate_agent_output("product", output, {101})
+
+    assert value["recommended_products"][0]["deliverables"] == [
+        "A robust .xlsx file with protected headers and validation lists."
+    ]
+    assert value["recommended_products"][1]["deliverables"] == ["main.py", "README.md"]
+
+
+def test_product_schema_still_rejects_non_string_non_list_deliverables():
+    output = {
+        "recommended_products": [
+            {
+                "name": "Bad Product",
+                "format": "xlsx",
+                "why": "test",
+                "deliverables": {"file": "bad.xlsx"},
+            }
+        ],
+        "primary_product": "Bad Product",
+        "price_range": {"currency": "USD", "min": 1, "max": 2, "reason": "test"},
+        "production_complexity": 10,
+        "automation_fit": 90,
+        "confidence": 80,
+        "reasoning": "grounded",
+    }
+
+    with pytest.raises(ValueError, match="product agent output schema invalid"):
+        opportunity_agent._validate_agent_output("product", output, {101})

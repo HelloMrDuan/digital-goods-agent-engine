@@ -46,13 +46,18 @@ DEMAND_TOPICS: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "invoice_contract_workflow",
+        # The core signal is invoicing/billing. "contract" or generic automation alone
+        # is too broad and previously pulled AI-agent and eligibility-review threads
+        # into the same commercial opportunity.
         "match_groups": (
-            ("invoice", "invoicing", "contract", "agreement", "发票", "账单", "合同"),
-            ("automation", "automate", "generator", "catalog", "paperwork", "自动化", "生成", "目录"),
+            ("invoice", "invoicing", "billing", "发票", "账单", "开票"),
+        ),
+        "exclude_any": (
+            "ai agent", "agentic", "contract eligibility", "eligibility review",
         ),
         "queries": {
             "xiaohongshu": ("求 发票 合同 自动化 表格",),
-            "reddit": ("need invoice contract automation",),
+            "reddit": ("need invoice billing automation",),
         },
     },
     {
@@ -85,6 +90,9 @@ TOPIC_BY_KEY = {str(topic["key"]): topic for topic in DEMAND_TOPICS}
 
 def topic_matches_text(text: str, topic: dict[str, Any]) -> bool:
     value = str(text or "").lower()
+    excluded = tuple(str(alias).lower() for alias in (topic.get("exclude_any") or ()) if str(alias).strip())
+    if excluded and any(alias in value for alias in excluded):
+        return False
     groups = topic.get("match_groups") or ()
     if not groups:
         return False

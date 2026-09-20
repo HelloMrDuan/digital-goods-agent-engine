@@ -11,7 +11,7 @@ from typing import Any
 
 from ..config import BASE_DIR, settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
-from .demand_topics import detect_topic, valid_topic_key
+from .demand_topics import TOPIC_BY_KEY, detect_topic, topic_matches_text, valid_topic_key
 
 _METHOD = "real_evidence_tfidf_v5_content_intent_gate"
 _CJK_RE = re.compile(r"[\u3400-\u9fff]+")
@@ -259,11 +259,16 @@ def _load_evidence() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 def _evidence_topic_key(row: dict[str, Any]) -> str | None:
+    text = f"{row.get('title') or ''} {row.get('content') or ''}"
     raw = loads(row.get("raw_json"), {}) or {}
     if isinstance(raw, dict):
         tagged = valid_topic_key(raw.get("_corroboration_topic"))
         if tagged:
-            return tagged
+            topic = TOPIC_BY_KEY.get(tagged)
+            # Stored tags are provenance hints, not permanent truth. Taxonomy changes
+            # must be able to invalidate an old overly-broad tag.
+            if topic and topic_matches_text(text, topic):
+                return tagged
     topic = detect_topic(row.get("title"), row.get("content"))
     return str(topic["key"]) if topic else None
 

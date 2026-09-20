@@ -43,6 +43,7 @@ _STOP = {
     "一个", "这个", "那个", "什么", "怎么", "如何", "有没有", "没有", "可以", "能不能", "需要", "求助", "请问", "推荐",
     "大家", "有人", "哪个", "哪些", "一下", "现在", "目前", "有没有人", "工具", "模板", "分享", "求", "问题", "使用",
     "the", "and", "for", "with", "this", "that", "what", "how", "any", "need", "looking", "look", "best", "good", "help",
+    "template", "templates", "tool", "tools", "recommend", "recommendation", "recommendations",
 }
 
 

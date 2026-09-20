@@ -58,7 +58,7 @@ def test_install_sources_retires_old_narrow_p0():
             ),
         )
     result = demand_discovery.install_sources()
-    assert result["created"] == 4
+    assert result["created"] == 6
     assert result["retired_legacy"] == 1
     with conn() as c:
         old = c.execute("SELECT enabled,config_json FROM sources WHERE name='Reddit - productivity template demand'").fetchone()
@@ -185,7 +185,17 @@ def test_dynamic_corroboration_uses_real_matching_topic_results(monkeypatch):
     def fake_collect(platform, query, limit=20, **kwargs):
         calls.append((platform, query))
         return [
-            _item(f"{platform}-inventory", f"{platform}-buyer", 1, platform=platform),
+            CollectedItem(
+                platform=platform,
+                source_type=f"agent_reach_{platform}",
+                source_item_id=f"{platform}-inventory",
+                source_url=f"https://example.com/{platform}-inventory",
+                title="Need inventory spreadsheet",
+                content="Looking for an inventory spreadsheet template for a small store.",
+                author=f"{platform}-buyer",
+                published_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+                raw={"id": f"{platform}-inventory"},
+            ),
             CollectedItem(
                 platform=platform,
                 source_type=f"agent_reach_{platform}",

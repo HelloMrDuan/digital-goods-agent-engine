@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Query
 from .config import settings
 from .db import conn, dumps, loads, now_iso, row_to_dict
 from .services.analyze import analyze_one
-from .services.demand_discovery import run_demand_discovery
+from .services.demand_discovery import run_demand_discovery, refresh_opportunity_corroboration
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity
 from .services.sources import collect_source, list_sources
 from .services.market_intel import market_intel_summary
@@ -502,6 +502,93 @@ def _rebuild_task_payload(task_id: int) -> dict[str, Any]:
         if analysis:
             data["current_analysis"] = row_to_dict(analysis)
     return data
+
+
+
+def _resolve_watch_opportunity_after_rebuild(
+    original_opportunity_id: int,
+    seed_evidence_ids: list[int],
+) -> int:
+    if not seed_evidence_ids:
+        raise ValueError("targeted corroboration has no seed evidence ids")
+    placeholders = ",".join("?" for _ in seed_evidence_ids)
+    with conn() as c:
+        rows = c.execute(
+            f"""SELECT oe.opportunity_id,COUNT(*) overlap_count,
+                       CASE WHEN oe.opportunity_id=? THEN 1 ELSE 0 END preferred
+                FROM opportunity_evidence oe
+                JOIN opportunities o ON o.id=oe.opportunity_id
+                WHERE oe.evidence_id IN ({placeholders})
+                  AND o.cluster_active=1
+                  AND oe.relation_type IN ('demand','context')
+                GROUP BY oe.opportunity_id
+                ORDER BY overlap_count DESC,preferred DESC,oe.opportunity_id DESC""",
+            (original_opportunity_id, *seed_evidence_ids),
+        ).fetchall()
+    if not rows:
+        raise ValueError("target opportunity could not be resolved after clustering rebuild")
+    return int(rows[0]["opportunity_id"])
+
+
+@router.post("/api/opportunities/{opportunity_id}/watch-refresh")
+def opportunity_watch_refresh(
+    opportunity_id: int,
+    analyze: bool = True,
+    refresh_market: bool = False,
+    per_platform_limit: int = Query(default=12, ge=1, le=20),
+):
+    card = get_card_for_opportunity(opportunity_id)
+    if not card:
+        raise HTTPException(404, "opportunity card not found")
+    if str(card.get("decision") or "").upper() != "WATCH":
+        raise HTTPException(409, "targeted corroboration is only available for WATCH opportunities")
+
+    try:
+        targeted = refresh_opportunity_corroboration(
+            opportunity_id,
+            per_platform_limit=per_platform_limit,
+        )
+        market_refresh = (
+            _refresh_market_intelligence()
+            if refresh_market
+            else {
+                "processed": 0,
+                "successful": 0,
+                "failed": 0,
+                "skipped": True,
+                "reason": "refresh_market=false",
+                "summary": market_intel_summary(),
+            }
+        )
+        cluster_run = build_from_unlinked_evidence()
+        resolved_id = _resolve_watch_opportunity_after_rebuild(
+            opportunity_id,
+            [int(value) for value in targeted.get("seed_evidence_ids") or []],
+        )
+        gate_a = evaluate_gate_a(resolved_id)
+        analysis = None
+        if analyze and str(gate_a.get("decision") or "").upper() == "PASS":
+            analysis = analyze_one(resolved_id)
+
+        return {
+            "requested_opportunity_id": opportunity_id,
+            "resolved_opportunity_id": resolved_id,
+            "targeted_corroboration": targeted,
+            "market_refresh": market_refresh,
+            "cluster_run": cluster_run,
+            "gate_a": gate_a,
+            "analysis": analysis,
+            "policy": (
+                "real same-topic demand only; no direct evidence attachment; "
+                "recluster + Gate A + six-Agent reanalysis required before BUILD"
+            ),
+        }
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
 
 
 @router.post("/api/opportunities/rebuild")

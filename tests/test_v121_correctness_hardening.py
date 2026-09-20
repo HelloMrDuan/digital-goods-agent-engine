@@ -591,3 +591,59 @@ def test_stale_wrong_corroboration_tag_is_revalidated_against_current_taxonomy()
     }
 
     assert clustering._legacy._evidence_topic_key(row) is None
+
+
+
+def test_watch_refresh_reclusters_revalidates_and_reanalyzes(monkeypatch):
+    monkeypatch.setattr(
+        routes_v12,
+        "get_card_for_opportunity",
+        lambda opportunity_id: {"opportunity_id": opportunity_id, "decision": "WATCH"},
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "refresh_opportunity_corroboration",
+        lambda opportunity_id, per_platform_limit=12: {
+            "opportunity_id": opportunity_id,
+            "topic": "invoice_contract_workflow",
+            "seed_evidence_ids": [10, 11],
+            "observed_evidence_ids": [20, 21],
+            "new_author_slots": ["reddit:new-buyer"],
+        },
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "build_from_unlinked_evidence",
+        lambda: {"method": "real_evidence_tfidf_v9_topic_provenance", "candidate_groups": 3},
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "_resolve_watch_opportunity_after_rebuild",
+        lambda original_opportunity_id, seed_evidence_ids: 52,
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "evaluate_gate_a",
+        lambda opportunity_id: {"opportunity_id": opportunity_id, "decision": "PASS", "score": 100},
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "analyze_one",
+        lambda opportunity_id: {
+            "id": opportunity_id,
+            "status": "ANALYZED",
+            "analysis": {"decision": "BUILD", "final_score": 78},
+        },
+    )
+
+    result = routes_v12.opportunity_watch_refresh(
+        52,
+        analyze=True,
+        refresh_market=False,
+        per_platform_limit=12,
+    )
+
+    assert result["requested_opportunity_id"] == 52
+    assert result["resolved_opportunity_id"] == 52
+    assert result["gate_a"]["decision"] == "PASS"
+    assert result["analysis"]["analysis"]["decision"] == "BUILD"

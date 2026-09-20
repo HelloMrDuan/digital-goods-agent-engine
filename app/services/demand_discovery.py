@@ -11,6 +11,7 @@ from ..collectors.base import CollectedItem
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .ingest import ingest_items
 from .demand_topics import DEMAND_TOPICS, detect_topic, topic_matches_text
+from .opportunities import get_evidence_for_opportunity, get_opportunity
 
 STRATEGY_VERSION = "demand-discovery-v5-topic-provenance"
 MAX_AGE_DAYS = 30
@@ -568,6 +569,176 @@ def _run_dynamic_corroboration(
         "results": results,
         "observed_evidence_ids": sorted(observed_ids),
         "direct_demand_signals": int(direct.get("explicit_demand") or 0) + int(direct.get("probable_demand") or 0),
+    }
+
+
+
+def _opportunity_corroboration_topic(opportunity_id: int) -> dict[str, Any]:
+    opportunity = get_opportunity(opportunity_id)
+    if not opportunity:
+        raise KeyError("opportunity not found")
+
+    evidence = get_evidence_for_opportunity(opportunity_id, 120)
+    demand_rows = [
+        item for item in evidence
+        if str(item.get("relation_type") or "").lower() == "demand"
+        and str(item.get("intent_class") or "").lower() in {"explicit_demand", "probable_demand"}
+    ]
+    topics: dict[str, dict[str, Any]] = {}
+    for item in demand_rows:
+        topic = detect_topic(item.get("title"), item.get("content"))
+        if not topic:
+            continue
+        key = str(topic["key"])
+        bucket = topics.setdefault(
+            key,
+            {
+                "key": key,
+                "topic": topic,
+                "evidence_ids": [],
+                "authors": set(),
+                "platforms": set(),
+            },
+        )
+        bucket["evidence_ids"].append(int(item["id"]))
+        author = str(item.get("author") or "").strip().lower()
+        platform = str(item.get("platform") or "").strip().lower()
+        if author:
+            bucket["authors"].add(f"{platform}:{author}")
+        if platform:
+            bucket["platforms"].add(platform)
+
+    if not topics:
+        fallback = detect_topic(
+            opportunity.get("title"),
+            opportunity.get("normalized_need"),
+        )
+        if not fallback:
+            raise ValueError("WATCH opportunity has no deterministic corroboration topic")
+        topics[str(fallback["key"])] = {
+            "key": str(fallback["key"]),
+            "topic": fallback,
+            "evidence_ids": [int(item["id"]) for item in demand_rows if item.get("id") is not None],
+            "authors": {
+                f"{str(item.get('platform') or '').strip().lower()}:{str(item.get('author') or '').strip().lower()}"
+                for item in demand_rows
+                if str(item.get("author") or "").strip()
+            },
+            "platforms": {
+                str(item.get("platform") or "").strip().lower()
+                for item in demand_rows
+                if str(item.get("platform") or "").strip()
+            },
+        }
+
+    if len(topics) != 1:
+        raise ValueError(
+            "WATCH opportunity contains multiple deterministic demand topics; "
+            "split/rebuild clustering before targeted corroboration: "
+            + ",".join(sorted(topics))
+        )
+
+    result = next(iter(topics.values()))
+    result["evidence_ids"] = sorted(set(result["evidence_ids"]))
+    result["authors"] = sorted(result["authors"])
+    result["platforms"] = sorted(result["platforms"])
+    return result
+
+
+def refresh_opportunity_corroboration(
+    opportunity_id: int,
+    *,
+    per_platform_limit: int = 12,
+) -> dict[str, Any]:
+    """Collect real same-topic demand for one WATCH opportunity.
+
+    New hits are ingested through the normal evidence pipeline. They are not attached
+    directly to the opportunity; clustering must decide whether they belong together.
+    """
+    install_sources()
+    topic_info = _opportunity_corroboration_topic(opportunity_id)
+    doctor = agent_reach_doctor()
+    ready_platforms = {
+        platform
+        for platform in {"xiaohongshu", "reddit"}
+        if _channel_ready(doctor, platform)
+    }
+    if not ready_platforms:
+        raise RuntimeError(
+            "targeted corroboration unavailable: Xiaohongshu/Reddit OpenCLI channels are not ready"
+        )
+
+    limit = max(1, min(int(per_platform_limit), 20))
+    results: list[dict[str, Any]] = []
+    observed_ids: set[int] = set()
+    seed_authors = set(topic_info["authors"])
+
+    for platform in sorted(ready_platforms):
+        queries = tuple(topic_info["topic"]["queries"].get(platform, ()))
+        for query in queries:
+            fetched = 0
+            retained_count = 0
+            error: str | None = None
+            intent_counts = _intent_counts([])
+            try:
+                items = collect_agent_reach(platform, str(query), limit=limit, enrich=False)
+                fetched = len(items)
+                matching = [
+                    item for item in items
+                    if _item_matches_topic(item, topic_info["topic"])
+                ]
+                retained = _prepare_items(matching, limit)
+                retained = [
+                    _tag_corroboration_item(item, str(topic_info["key"]), str(query))
+                    for item in retained
+                ]
+                retained_count = len(retained)
+                stats = ingest_items(_corroboration_source(platform), retained)
+                ids = [int(value) for value in stats.get("observed_evidence_ids") or []]
+                observed_ids.update(ids)
+                intent_counts = _intent_counts(ids)
+            except Exception as exc:
+                error = str(exc)
+
+            results.append({
+                "topic": topic_info["key"],
+                "platform": platform,
+                "query": str(query),
+                "fetched": fetched,
+                "retained_recent": retained_count,
+                "intent_counts": intent_counts,
+                "error": error,
+            })
+
+    observed_author_slots: set[str] = set()
+    if observed_ids:
+        placeholders = ",".join("?" for _ in observed_ids)
+        with conn() as c:
+            rows = c.execute(
+                f"SELECT platform,author FROM evidence WHERE id IN ({placeholders})",
+                tuple(sorted(observed_ids)),
+            ).fetchall()
+        for row in rows:
+            author = str(row["author"] or "").strip().lower()
+            platform = str(row["platform"] or "").strip().lower()
+            if author:
+                observed_author_slots.add(f"{platform}:{author}")
+
+    intents = _intent_counts(sorted(observed_ids))
+    return {
+        "opportunity_id": opportunity_id,
+        "mode": "watch-targeted-corroboration-v1",
+        "topic": topic_info["key"],
+        "seed_evidence_ids": topic_info["evidence_ids"],
+        "seed_authors": sorted(seed_authors),
+        "seed_platforms": topic_info["platforms"],
+        "ready_platforms": sorted(ready_platforms),
+        "queries": len(results),
+        "results": results,
+        "observed_evidence_ids": sorted(observed_ids),
+        "new_author_slots": sorted(observed_author_slots - seed_authors),
+        "direct_demand_signals": int(intents.get("explicit_demand") or 0)
+        + int(intents.get("probable_demand") or 0),
     }
 
 

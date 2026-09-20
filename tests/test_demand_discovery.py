@@ -254,3 +254,111 @@ def test_broad_automation_is_not_a_corroboration_topic():
         "Need automation script",
         "I want to automate a random workflow",
     ) is None
+
+
+
+def test_targeted_watch_corroboration_collects_only_one_deterministic_topic(monkeypatch):
+    demand_discovery.install_sources()
+    monkeypatch.setattr(
+        demand_discovery,
+        "get_opportunity",
+        lambda opportunity_id: {
+            "id": opportunity_id,
+            "title": "Rental billing automation",
+            "normalized_need": "invoice billing automation for rental catalogs",
+        },
+    )
+    monkeypatch.setattr(
+        demand_discovery,
+        "get_evidence_for_opportunity",
+        lambda opportunity_id, limit=120: [
+            {
+                "id": 501,
+                "relation_type": "demand",
+                "intent_class": "explicit_demand",
+                "title": "Need invoice automation",
+                "content": "Need billing automation from a saved rental item catalog.",
+                "author": "seed",
+                "platform": "reddit",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        demand_discovery,
+        "agent_reach_doctor",
+        lambda: {"opencli": {"connected": True}, "channels": {}},
+    )
+
+    calls = []
+
+    def fake_collect(platform, query, limit=20, **kwargs):
+        calls.append((platform, query, limit))
+        return [
+            CollectedItem(
+                platform=platform,
+                source_type=f"agent_reach_{platform}",
+                source_item_id=f"{platform}-invoice",
+                source_url=f"https://example.com/{platform}-invoice",
+                title="Need invoice billing automation",
+                content="Looking for invoicing automation for a rental business.",
+                author=f"{platform}-buyer",
+                published_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+                raw={"id": f"{platform}-invoice"},
+            ),
+            CollectedItem(
+                platform=platform,
+                source_type=f"agent_reach_{platform}",
+                source_item_id=f"{platform}-noise",
+                source_url=f"https://example.com/{platform}-noise",
+                title="AI agent ideas",
+                content="Completely unrelated.",
+                author="noise",
+                published_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+                raw={"id": f"{platform}-noise"},
+            ),
+        ]
+
+    monkeypatch.setattr(demand_discovery, "collect_agent_reach", fake_collect)
+
+    result = demand_discovery.refresh_opportunity_corroboration(52, per_platform_limit=5)
+
+    assert result["topic"] == "invoice_contract_workflow"
+    assert result["queries"] == 2
+    assert result["direct_demand_signals"] >= 1
+    assert all(item["retained_recent"] == 1 for item in result["results"])
+    assert all(call[2] == 5 for call in calls)
+
+
+def test_targeted_watch_corroboration_rejects_mixed_demand_topics(monkeypatch):
+    monkeypatch.setattr(
+        demand_discovery,
+        "get_opportunity",
+        lambda opportunity_id: {"id": opportunity_id, "title": "mixed", "normalized_need": "mixed"},
+    )
+    monkeypatch.setattr(
+        demand_discovery,
+        "get_evidence_for_opportunity",
+        lambda opportunity_id, limit=120: [
+            {
+                "id": 1,
+                "relation_type": "demand",
+                "intent_class": "explicit_demand",
+                "title": "Need PDF to Excel OCR",
+                "content": "Need PDF OCR output to Excel.",
+                "author": "a",
+                "platform": "reddit",
+            },
+            {
+                "id": 2,
+                "relation_type": "demand",
+                "intent_class": "explicit_demand",
+                "title": "Need invoice billing automation",
+                "content": "Need invoicing for my rental business.",
+                "author": "b",
+                "platform": "reddit",
+            },
+        ],
+    )
+
+    with pytest.raises(ValueError, match="multiple deterministic demand topics"):
+        demand_discovery._opportunity_corroboration_topic(80)

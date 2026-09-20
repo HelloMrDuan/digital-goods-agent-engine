@@ -12,6 +12,8 @@ from .db import conn, dumps, loads, now_iso, row_to_dict
 from .services.analyze import analyze_one
 from .services.demand_discovery import run_demand_discovery
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity
+from .services.sources import collect_source, list_sources
+from .services.market_intel import market_intel_summary
 from .services.validation import evaluate_gate_a, get_gate_a
 from .services.opportunity_agent import (
     get_card_for_opportunity,
@@ -107,6 +109,62 @@ def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict
         message = str(exc)
         _analysis_task_finish(analysis_task_id, error=message)
         return {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
+
+
+def _refresh_market_intelligence() -> dict[str, Any]:
+    """Refresh every enabled market-intelligence source without faking availability.
+
+    A single marketplace failure is reported but does not discard successful fresh
+    observations from the other real sources. Opportunity clustering rematches the
+    resulting verified digital market rows immediately afterwards.
+    """
+    market_sources = [
+        source
+        for source in list_sources()
+        if source.get("enabled") and str(source.get("role") or "").lower() == "market"
+    ]
+    results: list[dict[str, Any]] = []
+    if market_sources:
+        worker_count = min(3, len(market_sources))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="market-refresh") as pool:
+            future_map = {
+                pool.submit(collect_source, int(source["id"]), None, True): source
+                for source in market_sources
+            }
+            for future in as_completed(future_map):
+                source = future_map[future]
+                try:
+                    item = future.result()
+                    results.append({
+                        "source_id": int(source["id"]),
+                        "source_name": source.get("name"),
+                        "platform": source.get("platform"),
+                        "status": item.get("status"),
+                        "fetched": int(item.get("fetched") or 0),
+                        "inserted": int(item.get("inserted") or 0),
+                        "duplicates": int(item.get("duplicates") or 0),
+                        "rejected_invalid": int(item.get("rejected_invalid") or 0),
+                    })
+                except Exception as exc:
+                    results.append({
+                        "source_id": int(source["id"]),
+                        "source_name": source.get("name"),
+                        "platform": source.get("platform"),
+                        "status": "FAILED",
+                        "error": str(exc),
+                    })
+
+    results.sort(key=lambda item: int(item.get("source_id") or 0))
+    summary = market_intel_summary()
+    success_like = {"SUCCESS", "EMPTY", "SKIPPED"}
+    return {
+        "processed": len(results),
+        "successful": sum(str(item.get("status") or "").upper() in success_like for item in results),
+        "failed": sum(str(item.get("status") or "").upper() == "FAILED" for item in results),
+        "results": results,
+        "summary": summary,
+        "truth_policy": "only verified digital market rows are stored; sales contributes only when the upstream source explicitly exposes a verified sales metric",
+    }
 
 
 def _validate_recent_demand_candidates(limit: int = 100) -> dict[str, Any]:
@@ -208,13 +266,43 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 ),
             )
 
-        _update_rebuild(task_id, status="RUNNING", progress=12, stage="重建候选", message="正在从最新真实 evidence 重建商机候选")
+            _update_rebuild(
+                task_id,
+                status="RUNNING",
+                progress=12,
+                stage="刷新市场情报",
+                message="正在刷新闲鱼/Etsy/Creative Market 等真实数字商品热度与可验证销量信号",
+            )
+            market_refresh_result = _refresh_market_intelligence()
+            market_summary = market_refresh_result.get("summary") or {}
+            _update_rebuild(
+                task_id,
+                progress=18,
+                stage="市场刷新完成",
+                message=(
+                    f"市场源 {market_refresh_result.get('successful', 0)}/{market_refresh_result.get('processed', 0)} 成功；"
+                    f"高热 {int(market_summary.get('high_heat') or 0)}；"
+                    f"高销 {int(market_summary.get('high_sales') or 0)}"
+                ),
+            )
+        else:
+            market_refresh_result = {
+                "processed": 0,
+                "successful": 0,
+                "failed": 0,
+                "results": [],
+                "summary": market_intel_summary(),
+                "skipped": True,
+                "reason": "refresh=false",
+            }
+
+        _update_rebuild(task_id, status="RUNNING", progress=20, stage="重建候选", message="正在从最新真实需求与市场情报重建并匹配商机候选")
         cluster_result = build_from_unlinked_evidence()
 
         _update_rebuild(
             task_id,
             status="RUNNING",
-            progress=14,
+            progress=22,
             stage="Gate A 商业验证",
             message="正在对近期真实直接需求候选执行确定性 Gate A；context-only 候选不会进入自动商品链路",
         )
@@ -223,6 +311,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
         if not analyze_enabled:
             payload = {
                 "demand_discovery": discovery_result,
+                "market_refresh": market_refresh_result,
                 "cluster_run": cluster_result,
                 "gate_a": gate_a_result,
                 "agent_analysis": [],
@@ -245,7 +334,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
         worker_count = _rebuild_worker_count(total)
         _update_rebuild(
             task_id,
-            progress=15,
+            progress=25,
             stage="准备 Agent",
             message=f"最近 {_RECENT_DEMAND_DAYS} 天有效需求候选 {total} 个；并发 {worker_count} 路",
             total=total,
@@ -282,7 +371,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                         for pending_future, oid in future_map.items()
                         if not pending_future.done()
                     ]
-                    progress = 15 + int(processed / max(1, total) * 80)
+                    progress = 25 + int(processed / max(1, total) * 70)
                     _update_rebuild(
                         task_id,
                         progress=progress,
@@ -304,6 +393,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
         ordered_results = [result_by_id[opportunity_id] for opportunity_id in ids if opportunity_id in result_by_id]
         payload = {
             "demand_discovery": discovery_result,
+            "market_refresh": market_refresh_result,
             "cluster_run": cluster_result,
             "gate_a": gate_a_result,
             "agent_analysis": ordered_results,
@@ -341,7 +431,11 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
             stage="失败",
             message=str(exc),
             error=str(exc),
-            result_json=dumps({"demand_discovery": discovery_result, "agent_analysis": results}),
+            result_json=dumps({
+                "demand_discovery": discovery_result,
+                "market_refresh": locals().get("market_refresh_result"),
+                "agent_analysis": results,
+            }),
         )
 
 

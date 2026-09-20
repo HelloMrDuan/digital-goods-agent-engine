@@ -263,3 +263,93 @@ def test_rebuild_without_ai_still_runs_gate_a(monkeypatch):
     assert payload["gate_a"]["passed"] == 1
     assert payload["agent_analysis"] == []
     assert "PASS 1/2" in final["message"]
+
+
+
+def test_market_refresh_collects_enabled_market_sources_and_reports_partial_failure(monkeypatch):
+    monkeypatch.setattr(routes_v12, "list_sources", lambda: [
+        {"id": 1, "name": "xianyu", "platform": "xianyu", "role": "market", "enabled": True},
+        {"id": 2, "name": "etsy", "platform": "etsy", "role": "market", "enabled": True},
+        {"id": 3, "name": "disabled", "platform": "market", "role": "market", "enabled": False},
+        {"id": 4, "name": "demand", "platform": "reddit", "role": "demand", "enabled": True},
+    ])
+
+    calls: list[tuple[int, bool]] = []
+
+    def fake_collect(source_id: int, limit=None, force=False):
+        calls.append((source_id, force))
+        if source_id == 2:
+            raise RuntimeError("etsy unavailable")
+        return {"status": "SUCCESS", "fetched": 5, "inserted": 3, "duplicates": 2, "rejected_invalid": 0}
+
+    monkeypatch.setattr(routes_v12, "collect_source", fake_collect)
+    monkeypatch.setattr(routes_v12, "market_intel_summary", lambda: {
+        "total": 12,
+        "high_heat": 4,
+        "high_sales": 1,
+        "hot_and_selling": 1,
+        "max_heat": 93.2,
+        "max_sales": 88.0,
+    })
+
+    result = routes_v12._refresh_market_intelligence()
+
+    assert sorted(calls) == [(1, True), (2, True)]
+    assert result["processed"] == 2
+    assert result["successful"] == 1
+    assert result["failed"] == 1
+    assert result["summary"]["high_heat"] == 4
+    assert result["summary"]["high_sales"] == 1
+
+
+def test_rebuild_without_ai_refreshes_market_before_clustering(monkeypatch):
+    events: list[str] = []
+    updates: list[dict] = []
+
+    monkeypatch.setattr(routes_v12, "run_demand_discovery", lambda **kwargs: {
+        "retained_recent": 4,
+        "direct_demand_signals": 3,
+    })
+
+    def fake_market_refresh():
+        events.append("market")
+        return {
+            "processed": 3,
+            "successful": 3,
+            "failed": 0,
+            "results": [],
+            "summary": {"high_heat": 2, "high_sales": 1},
+        }
+
+    def fake_cluster():
+        events.append("cluster")
+        return {"candidate_groups": 2, "processed_evidence": 3, "market_intel_links": 5}
+
+    monkeypatch.setattr(routes_v12, "_refresh_market_intelligence", fake_market_refresh)
+    monkeypatch.setattr(routes_v12, "build_from_unlinked_evidence", fake_cluster)
+    monkeypatch.setattr(routes_v12, "_validate_recent_demand_candidates", lambda limit=100: {
+        "processed": 1,
+        "passed": 1,
+        "review_required": 0,
+        "rejected": 0,
+        "errors": 0,
+        "passed_ids": [99],
+        "results": [],
+        "policy": "test",
+    })
+    monkeypatch.setattr(routes_v12, "_update_rebuild", lambda task_id, **values: updates.append(values))
+
+    routes_v12._run_rebuild(
+        task_id=456,
+        analyze_enabled=False,
+        limit=8,
+        refresh_enabled=True,
+        refresh_queries_per_probe=2,
+    )
+
+    assert events == ["market", "cluster"]
+    final = updates[-1]
+    payload = routes_v12.loads(final["result_json"], {})
+    assert payload["market_refresh"]["summary"]["high_heat"] == 2
+    assert payload["market_refresh"]["summary"]["high_sales"] == 1
+    assert payload["cluster_run"]["market_intel_links"] == 5

@@ -406,3 +406,57 @@ def test_product_schema_still_rejects_non_string_non_list_deliverables():
 
     with pytest.raises(ValueError, match="product agent output schema invalid"):
         opportunity_agent._validate_agent_output("product", output, {101})
+
+
+
+def test_market_schema_normalizes_structured_buyer_profiles_from_model():
+    output = {
+        "category": "Automation Services",
+        "market_score": 78,
+        "purchase_intent": 82,
+        "competition_level": 44,
+        "competition_gaps": ["clear implementation roadmap"],
+        "buyer_profile": [
+            {
+                "persona": "The Pre-Launch Solo Operator",
+                "characteristics": "Technical enough to build stacks but anxious about client acquisition and marketing strategy.",
+                "urgency_driver": "Resolve strategic doubts before activating campaigns and generating first revenue.",
+            },
+            {
+                "persona": "The Efficiency-Seeking Agency Owner",
+                "characteristics": "Uses generic AI tools but wants dedicated automation agents to scale content production.",
+                "urgency_driver": "Replace semi-manual workflows as client volume grows.",
+            },
+        ],
+        "confidence": 84,
+        "reasoning": "grounded in supplied evidence",
+    }
+
+    value = opportunity_agent._validate_agent_output("market", output, {101})
+
+    assert len(value["buyer_profile"]) == 2
+    assert value["buyer_profile"][0].startswith("The Pre-Launch Solo Operator")
+    assert "Urgency:" in value["buyer_profile"][0]
+    assert all(isinstance(item, str) for item in value["buyer_profile"])
+
+
+def test_market_schema_rejects_unknown_buyer_profile_object_fields():
+    output = {
+        "category": "Automation Services",
+        "market_score": 78,
+        "purchase_intent": 82,
+        "competition_level": 44,
+        "competition_gaps": ["clear implementation roadmap"],
+        "buyer_profile": [
+            {
+                "persona": "Buyer",
+                "characteristics": "Needs automation.",
+                "invented_score": 99,
+            }
+        ],
+        "confidence": 84,
+        "reasoning": "grounded",
+    }
+
+    with pytest.raises(ValueError, match="unsupported fields"):
+        opportunity_agent._validate_agent_output("market", output, {101})

@@ -272,3 +272,26 @@ def test_etsy_collection_keeps_only_verified_digital_listings(monkeypatch):
     assert rows[0].source_item_id == "102"
     assert rows[0].raw["digital_product_verified"] is True
     assert "is_digital" in rows[0].raw["digital_verification"]
+
+
+
+def test_market_similarity_matches_cross_language_semantic_aliases():
+    from app.services import market_intel
+
+    score = market_intel._similarity(
+        "Excel 库存管理表格模板",
+        "Need an inventory spreadsheet for a small business",
+    )
+
+    assert score >= settings.market_intel_match_threshold
+
+
+def test_market_similarity_does_not_match_unrelated_single_template_term():
+    from app.services import market_intel
+
+    score = market_intel._similarity(
+        "简历模板",
+        "Need an inventory spreadsheet",
+    )
+
+    assert score < settings.market_intel_match_threshold

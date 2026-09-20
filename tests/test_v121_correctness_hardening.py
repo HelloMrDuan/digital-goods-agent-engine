@@ -366,3 +366,61 @@ def test_rebuild_without_ai_refreshes_market_before_clustering(monkeypatch):
     assert payload["market_refresh"]["summary"]["high_heat"] == 2
     assert payload["market_refresh"]["summary"]["high_sales"] == 1
     assert payload["cluster_run"]["market_intel_links"] == 5
+
+
+
+def test_semantic_topic_clustering_can_join_same_specific_business_need():
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            "id": 1001,
+            "title": "Need inventory spreadsheet for a small shop",
+            "content": "Looking for a stock management sheet with reorder tracking",
+            "demand_signal_score": 90,
+            "evidence_quality_score": 85,
+            "intent_weight": 1.0,
+            "_event_dt": now,
+        },
+        {
+            "id": 1002,
+            "title": "求一个门店库存Excel表格",
+            "content": "最好可以做出入库和库存预警",
+            "demand_signal_score": 88,
+            "evidence_quality_score": 84,
+            "intent_weight": 1.0,
+            "_event_dt": now,
+        },
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 1
+    assert {int(item["id"]) for item in clusters[0]} == {1001, 1002}
+
+
+def test_generic_template_word_alone_does_not_force_merge():
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            "id": 2001,
+            "title": "Need a resume template",
+            "content": "Looking for a resume layout",
+            "demand_signal_score": 90,
+            "evidence_quality_score": 85,
+            "intent_weight": 1.0,
+            "_event_dt": now,
+        },
+        {
+            "id": 2002,
+            "title": "Need a bookkeeping template",
+            "content": "Looking for an accounting sheet",
+            "demand_signal_score": 90,
+            "evidence_quality_score": 85,
+            "intent_weight": 1.0,
+            "_event_dt": now,
+        },
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 2

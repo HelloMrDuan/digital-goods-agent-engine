@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import math
 import re
+from functools import lru_cache
 from typing import Any
 
-from ..config import settings
+from ..config import BASE_DIR, settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
 
 
@@ -75,6 +77,20 @@ def _scores(metrics: dict[str, Any]) -> tuple[float, float | None, float]:
     return heat, sales_score, market
 
 
+@lru_cache(maxsize=1)
+def _semantic_aliases() -> dict[str, list[str]]:
+    path = BASE_DIR / "config" / "semantic_aliases.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return {
+            str(key): [str(value).lower() for value in values if str(value).strip()]
+            for key, values in raw.items()
+            if isinstance(values, list)
+        }
+    except Exception:
+        return {}
+
+
 def _tokens(text: Any) -> set[str]:
     value = str(text or "").lower()
     words = {x for x in re.findall(r"[a-z0-9]{2,}", value)}
@@ -84,14 +100,38 @@ def _tokens(text: Any) -> set[str]:
         grams.update(run[i:i+2] for i in range(max(0, len(run) - 1)))
         if len(run) == 1:
             grams.add(run)
-    return words | grams
+    concepts: set[str] = set()
+    for concept, aliases in _semantic_aliases().items():
+        for alias in aliases:
+            if alias.isascii() and len(alias) <= 3:
+                matched = re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", value, re.I)
+            else:
+                matched = alias in value
+            if matched:
+                concepts.add("@" + concept)
+                break
+    return words | grams | concepts
 
 
 def _similarity(left: Any, right: Any) -> float:
     a, b = _tokens(left), _tokens(right)
     if not a or not b:
         return 0.0
-    return len(a & b) / len(a | b)
+    lexical = len(a & b) / len(a | b)
+    ca = {token for token in a if token.startswith("@")}
+    cb = {token for token in b if token.startswith("@")}
+    shared = ca & cb
+    if not shared:
+        return lexical
+    generic = {"@template", "@spreadsheet", "@automation", "@document"}
+    strong = shared - generic
+    if strong:
+        concept_score = len(shared) / max(1, len(ca | cb))
+        return max(lexical, 0.34 + concept_score * 0.46)
+    if len(shared & generic) >= 2:
+        concept_score = len(shared) / max(1, len(ca | cb))
+        return max(lexical, 0.22 + concept_score * 0.34)
+    return lexical
 
 
 def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any]:

@@ -251,14 +251,24 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 message="正在用高意图关键词矩阵刷新小红书/Reddit最近30天真实需求",
             )
             def refresh_progress(event: dict[str, Any]) -> None:
-                completed = int(event.get("completed_queries") or 0)
-                total_queries = max(1, int(event.get("total_queries") or 1))
-                progress = min(9, 3 + int(completed / total_queries * 6))
                 platform = str(event.get("platform") or "")
                 query = str(event.get("query") or "")
                 fetched = int(event.get("fetched") or 0)
                 error = event.get("error")
                 status_text = f"失败: {str(error)[:100]}" if error else f"返回 {fetched} 条"
+                if event.get("phase") == "corroboration":
+                    index = int(event.get("corroboration_index") or 0)
+                    total = max(1, int(event.get("corroboration_total") or 1))
+                    _update_rebuild(
+                        task_id,
+                        progress=9,
+                        stage=f"同主题需求佐证 {index}/{total}",
+                        message=f"{platform} | {query} | {status_text}",
+                    )
+                    return
+                completed = int(event.get("completed_queries") or 0)
+                total_queries = max(1, int(event.get("total_queries") or 1))
+                progress = min(9, 3 + int(completed / total_queries * 6))
                 _update_rebuild(
                     task_id,
                     progress=progress,

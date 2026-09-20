@@ -151,3 +151,65 @@ def test_v4_probe_matrix_targets_buildable_corroboration_topics():
 def test_all_v4_probes_fill_the_eight_query_refresh_cap():
     assert len(demand_discovery._PROBES) == 4
     assert all(len(probe["queries"]) == 8 for probe in demand_discovery._PROBES)
+
+
+
+def test_dynamic_corroboration_uses_real_matching_topic_results(monkeypatch):
+    demand_discovery.install_sources()
+    now = datetime.now(timezone.utc).isoformat()
+    with conn() as c:
+        source = c.execute("SELECT id FROM sources WHERE name='Reddit - direct demand scan v3'").fetchone()
+        source_id = int(source["id"])
+        c.execute(
+            """INSERT INTO evidence(
+                source_id,platform,source_type,source_item_id,source_url,title,content,author,
+                published_at,collected_at,engagement_json,raw_json,raw_hash,canonical_key,
+                content_fingerprint,evidence_quality_score,published_time_quality,demand_signal_score,
+                content_kind,intent_class,intent_confidence,intent_weight,intent_reason_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                source_id,"reddit","agent_reach_reddit","seed-1","https://reddit.com/seed-1",
+                "Need an inventory spreadsheet","Looking for inventory spreadsheet for my store",
+                "seed-author",now,now,"{}","{}","rh1","ck1","fp1",80,"source",85,
+                "post","explicit_demand",0.9,1.0,"[]",
+            ),
+        )
+        evidence_id = int(c.execute("SELECT id FROM evidence WHERE canonical_key='ck1'").fetchone()["id"])
+        c.execute(
+            "INSERT INTO evidence_sources(evidence_id,source_id,first_seen_at,last_seen_at,observation_count) VALUES(?,?,?,?,1)",
+            (evidence_id,source_id,now,now),
+        )
+
+    calls = []
+
+    def fake_collect(platform, query, limit=20, **kwargs):
+        calls.append((platform, query))
+        return [
+            _item(f"{platform}-inventory", f"{platform}-buyer", 1, platform=platform),
+            CollectedItem(
+                platform=platform,
+                source_type=f"agent_reach_{platform}",
+                source_item_id=f"{platform}-noise",
+                source_url=f"https://example.com/{platform}-noise",
+                title="Completely unrelated request",
+                content="Need help with a different topic",
+                author="noise",
+                published_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+                raw={"id": f"{platform}-noise"},
+            ),
+        ]
+
+    original_item = demand_discovery._item_matches_topic
+    monkeypatch.setattr(
+        demand_discovery,
+        "_item_matches_topic",
+        lambda item, topic: "inventory" in (item.title + " " + (item.content or "")).lower(),
+    )
+    monkeypatch.setattr(demand_discovery, "collect_agent_reach", fake_collect)
+
+    result = demand_discovery._run_dynamic_corroboration({"reddit", "xiaohongshu"})
+
+    assert result["queries"] == 2
+    assert {platform for platform, _ in calls} == {"reddit", "xiaohongshu"}
+    assert result["topics"][0]["key"] == "inventory_spreadsheet"
+    assert result["direct_demand_signals"] >= 1

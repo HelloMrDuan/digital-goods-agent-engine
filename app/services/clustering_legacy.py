@@ -131,6 +131,28 @@ def _cosine(a: dict[str, float], b: dict[str, float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+_GENERIC_CONCEPTS = {"@template", "@spreadsheet", "@automation", "@document"}
+_STRONG_TOPIC_CONCEPTS = {
+    "@payroll", "@attendance", "@scheduling", "@inventory", "@expense", "@resume",
+    "@job_search", "@content_creator", "@short_video", "@social_media", "@copywriting",
+    "@ai_agent", "@prompt", "@notion", "@presentation", "@study_plan", "@flashcard",
+    "@small_business", "@finance", "@crm", "@quotation", "@contract", "@calendar",
+}
+
+
+def _concept_keys(vector: dict[str, float]) -> set[str]:
+    return {key for key in vector if key.startswith("@")}
+
+
+def _shared_business_topic(a: dict[str, float], b: dict[str, float]) -> bool:
+    shared = _concept_keys(a) & _concept_keys(b)
+    if shared & _STRONG_TOPIC_CONCEPTS:
+        return True
+    # Generic concepts can corroborate each other only when there is more than one
+    # shared product concept, e.g. spreadsheet+template. A lone "template" never merges.
+    return len(shared & _GENERIC_CONCEPTS) >= 2
+
+
 def _centroid(vecs: list[dict[str, float]]) -> dict[str, float]:
     if not vecs:
         return {}
@@ -220,6 +242,7 @@ def _cluster_rows(rows: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any]]
     by_id = {int(r["id"]): vecs[i] for i, r in enumerate(rows)}
     threshold = float(settings.cluster_similarity_threshold)
     compact_floor = max(0.16, threshold * 0.68)
+    semantic_floor = max(0.14, threshold * 0.42)
     clusters: list[list[dict[str, Any]]] = []
     cluster_vecs: list[list[dict[str, float]]] = []
 
@@ -240,13 +263,17 @@ def _cluster_rows(rows: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any]]
         for idx, members in enumerate(clusters):
             cent = _centroid(cluster_vecs[idx])
             sim = _cosine(v, cent)
-            if sim < threshold:
-                continue
-            # Avoid transitive chain pollution by requiring reasonable similarity to the
-            # representative and the least-similar sampled member.
             sample_vecs = cluster_vecs[idx][:12]
+            semantic_topic_match = bool(sample_vecs) and all(
+                _shared_business_topic(v, member_vector) for member_vector in sample_vecs
+            )
+            if sim < threshold and not (semantic_topic_match and sim >= semantic_floor):
+                continue
+            # Avoid transitive chain pollution. The lower semantic floor is allowed only
+            # when every sampled member shares the same conservative business concept.
             min_member_sim = min((_cosine(v, mv) for mv in sample_vecs), default=sim)
-            if min_member_sim < compact_floor:
+            required_floor = semantic_floor if semantic_topic_match else compact_floor
+            if min_member_sim < required_floor:
                 continue
             if sim > best_score:
                 best_idx, best_score = idx, sim

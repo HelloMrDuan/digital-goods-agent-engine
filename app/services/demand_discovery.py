@@ -96,6 +96,74 @@ _LEGACY_NARROW_P0 = {
 }
 
 
+_CORROBORATION_SOURCES: tuple[dict[str, str], ...] = (
+    {"name": "小红书 - 动态同主题佐证 v4", "platform": "xiaohongshu"},
+    {"name": "Reddit - dynamic corroboration v4", "platform": "reddit"},
+)
+
+# Ordered from specific to generic so a payroll/inventory request is not reduced to
+# the generic "spreadsheet" bucket. Corroboration remains real search evidence only.
+_CORROBORATION_TOPICS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "inventory_spreadsheet",
+        "aliases": ("库存", "inventory", "stock management", "出入库"),
+        "queries": {
+            "xiaohongshu": ("求 库存 Excel 表格",),
+            "reddit": ("need inventory spreadsheet",),
+        },
+    },
+    {
+        "key": "bookkeeping_spreadsheet",
+        "aliases": ("记账", "bookkeeping", "accounting spreadsheet", "expense tracker", "报销", "费用"),
+        "queries": {
+            "xiaohongshu": ("求 记账 Excel 表格",),
+            "reddit": ("need bookkeeping spreadsheet",),
+        },
+    },
+    {
+        "key": "scheduling_spreadsheet",
+        "aliases": ("排班", "轮班", "scheduling spreadsheet", "rota", "shift schedule"),
+        "queries": {
+            "xiaohongshu": ("求 排班 Excel 表格",),
+            "reddit": ("need scheduling spreadsheet",),
+        },
+    },
+    {
+        "key": "payroll_spreadsheet",
+        "aliases": ("工资", "薪资", "薪酬", "payroll", "salary spreadsheet", "wage"),
+        "queries": {
+            "xiaohongshu": ("求 工资 Excel 表格",),
+            "reddit": ("need payroll spreadsheet",),
+        },
+    },
+    {
+        "key": "resume_template",
+        "aliases": ("简历", "resume", "curriculum vitae", "cv template"),
+        "queries": {
+            "xiaohongshu": ("求 简历 模板",),
+            "reddit": ("need resume template",),
+        },
+    },
+    {
+        "key": "automation",
+        "aliases": ("自动化", "批量处理", "automation", "automate", "script", "脚本"),
+        "queries": {
+            "xiaohongshu": ("求 自动化 脚本",),
+            "reddit": ("looking for automation script",),
+        },
+    },
+    {
+        "key": "spreadsheet",
+        "aliases": ("excel", "spreadsheet", "表格", "电子表格"),
+        "queries": {
+            "xiaohongshu": ("求 Excel 表格 模板",),
+            "reddit": ("need spreadsheet template",),
+        },
+    },
+)
+_MAX_CORROBORATION_TOPICS = 4
+
+
 def _parse_dt(value: Any) -> datetime | None:
     if value in (None, ""):
         return None
@@ -216,6 +284,33 @@ def install_sources() -> dict[str, int]:
                     """INSERT INTO sources(name,source_type,platform,query,url,config_json,enabled,status,created_at,updated_at)
                        VALUES(?,?,?,?,NULL,?,0,'NOT_CHECKED',?,?)""",
                     (probe["name"], "agent_reach", probe["platform"], primary, dumps(cfg), now, now),
+                )
+                created += 1
+
+        for managed in _CORROBORATION_SOURCES:
+            cfg = {
+                "role": "demand",
+                "priority": "P0",
+                "business_group": "core_demand",
+                "recommended": True,
+                "managed_refresh": True,
+                "strategy_version": STRATEGY_VERSION,
+                "max_age_days": MAX_AGE_DAYS,
+                "mode": "dynamic_corroboration",
+            }
+            row = c.execute("SELECT id FROM sources WHERE name=?", (managed["name"],)).fetchone()
+            if row:
+                c.execute(
+                    """UPDATE sources SET source_type='agent_reach',platform=?,query='dynamic',url=NULL,config_json=?,
+                       enabled=0,updated_at=? WHERE id=?""",
+                    (managed["platform"], dumps(cfg), now, int(row["id"])),
+                )
+                updated += 1
+            else:
+                c.execute(
+                    """INSERT INTO sources(name,source_type,platform,query,url,config_json,enabled,status,created_at,updated_at)
+                       VALUES(?,?,?,'dynamic',NULL,?,0,'NOT_CHECKED',?,?)""",
+                    (managed["name"], "agent_reach", managed["platform"], dumps(cfg), now, now),
                 )
                 created += 1
     return {"created": created, "updated": updated, "retired_legacy": retired}
@@ -359,6 +454,168 @@ def _collect_probe(
     }
 
 
+def _corroboration_source(platform: str) -> dict[str, Any]:
+    managed = next((item for item in _CORROBORATION_SOURCES if item["platform"] == platform), None)
+    if not managed:
+        raise RuntimeError(f"no corroboration source for {platform}")
+    with conn() as c:
+        row = c.execute("SELECT * FROM sources WHERE name=?", (managed["name"],)).fetchone()
+    if not row:
+        raise RuntimeError(f"managed corroboration source missing: {managed['name']}")
+    return row_to_dict(row) or {}
+
+
+def _topic_for_text(title: str | None, content: str | None) -> dict[str, Any] | None:
+    text = f"{title or ''} {content or ''}".lower()
+    for topic in _CORROBORATION_TOPICS:
+        if any(str(alias).lower() in text for alias in topic["aliases"]):
+            return topic
+    return None
+
+
+def _recent_direct_topics(limit: int = 120) -> list[dict[str, Any]]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)).isoformat(timespec="seconds")
+    with conn() as c:
+        source_rows = c.execute("SELECT id,config_json FROM sources").fetchall()
+        eligible_source_ids = []
+        for row in source_rows:
+            cfg = loads(row["config_json"], {}) or {}
+            if str(cfg.get("role") or "demand").lower() != "demand":
+                continue
+            if str(cfg.get("business_group") or "core_demand") != "core_demand":
+                continue
+            eligible_source_ids.append(int(row["id"]))
+        if not eligible_source_ids:
+            return []
+        placeholders = ",".join("?" for _ in eligible_source_ids)
+        rows = c.execute(
+            f"""SELECT DISTINCT e.id,e.platform,e.title,e.content,e.author,e.intent_class,
+                       e.evidence_quality_score,e.demand_signal_score,e.collected_at
+                FROM evidence e
+                JOIN evidence_sources es ON es.evidence_id=e.id
+                WHERE es.source_id IN ({placeholders})
+                  AND e.intent_class IN ('explicit_demand','probable_demand')
+                  AND e.collected_at>=?
+                ORDER BY e.demand_signal_score DESC,e.evidence_quality_score DESC,e.id DESC
+                LIMIT ?""",
+            (*eligible_source_ids, cutoff, max(1, min(int(limit), 500))),
+        ).fetchall()
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        data = row_to_dict(row) or {}
+        topic = _topic_for_text(data.get("title"), data.get("content"))
+        if not topic:
+            continue
+        key = str(topic["key"])
+        bucket = grouped.setdefault(
+            key,
+            {
+                "key": key,
+                "topic": topic,
+                "evidence_ids": set(),
+                "authors": set(),
+                "platforms": set(),
+                "signal_score": 0.0,
+            },
+        )
+        bucket["evidence_ids"].add(int(data["id"]))
+        author = str(data.get("author") or "").strip().lower()
+        if author:
+            bucket["authors"].add(author)
+        platform = str(data.get("platform") or "").strip().lower()
+        if platform:
+            bucket["platforms"].add(platform)
+        bucket["signal_score"] = max(bucket["signal_score"], float(data.get("demand_signal_score") or 0))
+
+    values = list(grouped.values())
+    values.sort(
+        key=lambda item: (
+            len(item["authors"]),
+            len(item["platforms"]),
+            -float(item["signal_score"]),
+            item["key"],
+        )
+    )
+    for item in values:
+        item["evidence_ids"] = sorted(item["evidence_ids"])
+        item["authors"] = sorted(item["authors"])
+        item["platforms"] = sorted(item["platforms"])
+    return values[:_MAX_CORROBORATION_TOPICS]
+
+
+def _item_matches_topic(item: CollectedItem, topic: dict[str, Any]) -> bool:
+    text = f"{item.title or ''} {item.content or ''}".lower()
+    return any(str(alias).lower() in text for alias in topic["aliases"])
+
+
+def _run_dynamic_corroboration(
+    ready_platforms: set[str],
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    topics = _recent_direct_topics()
+    plan: list[tuple[dict[str, Any], str, str]] = []
+    for item in topics:
+        topic = item["topic"]
+        for platform in sorted(ready_platforms):
+            for query in topic["queries"].get(platform, ()):
+                plan.append((item, platform, str(query)))
+
+    results: list[dict[str, Any]] = []
+    observed_ids: set[int] = set()
+    for index, (topic_info, platform, query) in enumerate(plan, start=1):
+        fetched = retained_count = 0
+        error: str | None = None
+        intent_counts = _intent_counts([])
+        try:
+            items = collect_agent_reach(platform, query, limit=10, enrich=False)
+            fetched = len(items)
+            matching = [item for item in items if _item_matches_topic(item, topic_info["topic"])]
+            retained = _prepare_items(matching, 8)
+            retained_count = len(retained)
+            stats = ingest_items(_corroboration_source(platform), retained)
+            ids = [int(value) for value in stats.get("observed_evidence_ids") or []]
+            observed_ids.update(ids)
+            intent_counts = _intent_counts(ids)
+        except Exception as exc:
+            error = str(exc)
+        result = {
+            "topic": topic_info["key"],
+            "platform": platform,
+            "query": query,
+            "fetched": fetched,
+            "retained_recent": retained_count,
+            "intent_counts": intent_counts,
+            "error": error,
+        }
+        results.append(result)
+        if progress_callback is not None:
+            progress_callback({
+                **result,
+                "phase": "corroboration",
+                "corroboration_index": index,
+                "corroboration_total": len(plan),
+            })
+
+    direct = _intent_counts(sorted(observed_ids))
+    return {
+        "topics": [
+            {
+                "key": item["key"],
+                "seed_evidence_ids": item["evidence_ids"],
+                "seed_authors": item["authors"],
+                "seed_platforms": item["platforms"],
+            }
+            for item in topics
+        ],
+        "queries": len(plan),
+        "results": results,
+        "observed_evidence_ids": sorted(observed_ids),
+        "direct_demand_signals": int(direct.get("explicit_demand") or 0) + int(direct.get("probable_demand") or 0),
+    }
+
+
 def run_demand_discovery(
     *,
     max_queries_per_probe: int | None = None,
@@ -432,12 +689,18 @@ def run_demand_discovery(
         errors = "; ".join(str(x.get("error") or "collection failed") for x in results)
         raise RuntimeError(f"fresh demand discovery failed: {errors}")
 
+    corroboration = _run_dynamic_corroboration(
+        ready_platforms,
+        progress_callback=progress_callback,
+    )
+    direct_signals += int(corroboration.get("direct_demand_signals") or 0)
+
     return {
         "status": "SUCCESS" if len(successful) == len(results) else "PARTIAL",
         "strategy": STRATEGY_VERSION,
         "max_age_days": MAX_AGE_DAYS,
         "max_queries_per_probe": max_queries_per_probe,
-        "total_queries": total_queries,
+        "total_queries": total_queries + int(corroboration.get("queries") or 0),
         "ready_platforms": sorted(ready_platforms),
         "probes": results,
         "probe_count": len(results),
@@ -445,6 +708,7 @@ def run_demand_discovery(
         "retained_recent": retained,
         "independent_author_slots": authors,
         "direct_demand_signals": direct_signals,
+        "corroboration": corroboration,
         "source_install": install,
         "generated_at": now_iso(),
     }

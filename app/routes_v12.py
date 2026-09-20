@@ -109,6 +109,63 @@ def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict
         return {"opportunity_id": opportunity_id, "status": "FAILED", "error": message}
 
 
+def _validate_recent_demand_candidates(limit: int = 100) -> dict[str, Any]:
+    """Run deterministic Gate A for recent clusters that contain real demand.
+
+    Context-only clusters stay visible for discovery, but they are intentionally
+    excluded from the commercial automation path. Only Gate-A PASS candidates
+    may consume paid Agent analysis in a rebuild.
+    """
+    recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=_RECENT_DEMAND_DAYS)).isoformat(timespec="seconds")
+    with conn() as c:
+        rows = c.execute(
+            """SELECT id FROM opportunities
+               WHERE cluster_active=1
+                 AND coalesce(last_seen_at,'')>=?
+                 AND (coalesce(explicit_demand_count,0)+coalesce(probable_demand_count,0))>0
+               ORDER BY coalesce(effective_signal_count,0) DESC,
+                        coalesce(platform_count,0) DESC,
+                        coalesce(trusted_trend_score,0) DESC,
+                        coalesce(data_quality_score,0) DESC,
+                        evidence_count DESC,id DESC
+               LIMIT ?""",
+            (recent_cutoff, max(1, min(int(limit), 500))),
+        ).fetchall()
+
+    results: list[dict[str, Any]] = []
+    passed_ids: list[int] = []
+    for row in rows:
+        opportunity_id = int(row["id"])
+        try:
+            gate = evaluate_gate_a(opportunity_id)
+            decision = str(gate.get("decision") or "REVIEW_REQUIRED").upper()
+            results.append({
+                "opportunity_id": opportunity_id,
+                "decision": decision,
+                "score": gate.get("score"),
+                "reasons": list(gate.get("reasons") or []),
+            })
+            if decision == "PASS":
+                passed_ids.append(opportunity_id)
+        except Exception as exc:
+            results.append({
+                "opportunity_id": opportunity_id,
+                "decision": "ERROR",
+                "error": str(exc),
+            })
+
+    return {
+        "processed": len(results),
+        "passed": sum(item.get("decision") == "PASS" for item in results),
+        "review_required": sum(item.get("decision") == "REVIEW_REQUIRED" for item in results),
+        "rejected": sum(item.get("decision") == "REJECT" for item in results),
+        "errors": sum(item.get("decision") == "ERROR" for item in results),
+        "passed_ids": passed_ids,
+        "results": results,
+        "policy": "recent direct-demand clusters are deterministically Gate-A validated before paid Agent analysis",
+    }
+
+
 def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enabled: bool, refresh_queries_per_probe: int) -> None:
     results: list[dict[str, Any]] = []
     discovery_result: dict[str, Any] | None = None
@@ -153,10 +210,21 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
 
         _update_rebuild(task_id, status="RUNNING", progress=12, stage="重建候选", message="正在从最新真实 evidence 重建商机候选")
         cluster_result = build_from_unlinked_evidence()
+
+        _update_rebuild(
+            task_id,
+            status="RUNNING",
+            progress=14,
+            stage="Gate A 商业验证",
+            message="正在对近期真实直接需求候选执行确定性 Gate A；context-only 候选不会进入自动商品链路",
+        )
+        gate_a_result = _validate_recent_demand_candidates(limit=max(50, limit * 5))
+
         if not analyze_enabled:
             payload = {
                 "demand_discovery": discovery_result,
                 "cluster_run": cluster_result,
+                "gate_a": gate_a_result,
                 "agent_analysis": [],
             }
             _update_rebuild(
@@ -164,28 +232,15 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 status="SUCCESS",
                 progress=100,
                 stage="完成",
-                message="真实需求刷新和候选重建完成；未执行付费 AI",
+                message=(
+                    f"真实需求刷新、候选重建和 Gate A 完成；"
+                    f"PASS {gate_a_result['passed']}/{gate_a_result['processed']}；未执行付费 AI"
+                ),
                 result_json=dumps(payload),
             )
             return
 
-        recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=_RECENT_DEMAND_DAYS)).isoformat(timespec="seconds")
-        with conn() as c:
-            rows = c.execute(
-                """SELECT id FROM opportunities
-                   WHERE cluster_active=1
-                     AND coalesce(last_seen_at,'')>=?
-                     AND (coalesce(explicit_demand_count,0)+coalesce(probable_demand_count,0))>0
-                   ORDER BY CASE WHEN validation_status='PASSED' THEN 1 ELSE 0 END DESC,
-                            coalesce(effective_signal_count,0) DESC,
-                            coalesce(platform_count,0) DESC,
-                            coalesce(trusted_trend_score,0) DESC,
-                            coalesce(data_quality_score,0) DESC,
-                            evidence_count DESC,id DESC
-                   LIMIT ?""",
-                (recent_cutoff, limit),
-            ).fetchall()
-        ids = [int(row["id"]) for row in rows]
+        ids = [int(value) for value in gate_a_result.get("passed_ids", [])[:limit]]
         total = len(ids)
         worker_count = _rebuild_worker_count(total)
         _update_rebuild(
@@ -250,16 +305,18 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
         payload = {
             "demand_discovery": discovery_result,
             "cluster_run": cluster_result,
+            "gate_a": gate_a_result,
             "agent_analysis": ordered_results,
             "concurrency": worker_count,
             "selection_policy": {
                 "recent_demand_days": _RECENT_DEMAND_DAYS,
                 "requires_explicit_or_probable_demand": True,
-                "order": "validation, signal_count, platform_diversity, trusted_trend, data_quality",
+                "requires_gate_a_pass": True,
+                "order": "Gate A PASS, signal_count, platform_diversity, trusted_trend, data_quality",
             },
         }
         final_message = (
-            f"最近 {_RECENT_DEMAND_DAYS} 天没有可进入 Agent 的真实需求候选"
+            f"最近 {_RECENT_DEMAND_DAYS} 天没有 Gate A=PASS 的真实需求候选；未执行付费 Agent"
             if total == 0
             else f"处理 {total} 个商机：成功 {succeeded}，失败 {failed}；并发 {worker_count} 路"
         )

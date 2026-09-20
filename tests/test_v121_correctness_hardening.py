@@ -178,3 +178,88 @@ def test_async_single_analysis_does_not_require_commercial_validation_and_dedupl
             (opportunity_id,),
         ).fetchone()
     assert int(tasks["c"]) == 1
+
+
+
+def test_rebuild_gate_a_filters_context_and_non_pass_candidates(monkeypatch):
+    now = now_iso()
+    with conn() as c:
+        direct_pass = c.execute(
+            """INSERT INTO opportunities(
+                   title,candidate_key,normalized_need,status,evidence_count,created_at,updated_at,
+                   cluster_active,last_seen_at,explicit_demand_count,probable_demand_count,effective_signal_count
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("direct pass", "direct-pass", "direct pass", "NEW", 2, now, now, 1, now, 2, 0, 2),
+        ).lastrowid
+        direct_fail = c.execute(
+            """INSERT INTO opportunities(
+                   title,candidate_key,normalized_need,status,evidence_count,created_at,updated_at,
+                   cluster_active,last_seen_at,explicit_demand_count,probable_demand_count,effective_signal_count
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("direct fail", "direct-fail", "direct fail", "NEW", 1, now, now, 1, now, 1, 0, 1),
+        ).lastrowid
+        c.execute(
+            """INSERT INTO opportunities(
+                   title,candidate_key,normalized_need,status,evidence_count,created_at,updated_at,
+                   cluster_active,last_seen_at,explicit_demand_count,probable_demand_count,effective_signal_count
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("context only", "context-only", "context only", "NEW", 5, now, now, 1, now, 0, 0, 0),
+        )
+
+    calls: list[int] = []
+
+    def fake_gate(opportunity_id: int):
+        calls.append(opportunity_id)
+        if opportunity_id == int(direct_pass):
+            return {"decision": "PASS", "score": 88, "reasons": []}
+        return {"decision": "REJECT", "score": 30, "reasons": ["insufficient_independent_demand"]}
+
+    monkeypatch.setattr(routes_v12, "evaluate_gate_a", fake_gate)
+    result = routes_v12._validate_recent_demand_candidates()
+
+    assert result["processed"] == 2
+    assert result["passed"] == 1
+    assert result["rejected"] == 1
+    assert result["passed_ids"] == [int(direct_pass)]
+    assert int(direct_pass) in calls
+    assert int(direct_fail) in calls
+    assert len(calls) == 2
+
+
+def test_rebuild_without_ai_still_runs_gate_a(monkeypatch):
+    updates: list[dict] = []
+
+    monkeypatch.setattr(routes_v12, "run_demand_discovery", lambda **kwargs: {
+        "retained_recent": 4,
+        "direct_demand_signals": 3,
+    })
+    monkeypatch.setattr(routes_v12, "build_from_unlinked_evidence", lambda: {
+        "candidate_groups": 2,
+        "processed_evidence": 3,
+    })
+    monkeypatch.setattr(routes_v12, "_validate_recent_demand_candidates", lambda limit=100: {
+        "processed": 2,
+        "passed": 1,
+        "review_required": 0,
+        "rejected": 1,
+        "errors": 0,
+        "passed_ids": [99],
+        "results": [],
+        "policy": "test",
+    })
+    monkeypatch.setattr(routes_v12, "_update_rebuild", lambda task_id, **values: updates.append(values))
+
+    routes_v12._run_rebuild(
+        task_id=123,
+        analyze_enabled=False,
+        limit=8,
+        refresh_enabled=True,
+        refresh_queries_per_probe=2,
+    )
+
+    final = updates[-1]
+    assert final["status"] == "SUCCESS"
+    payload = routes_v12.loads(final["result_json"], {})
+    assert payload["gate_a"]["passed"] == 1
+    assert payload["agent_analysis"] == []
+    assert "PASS 1/2" in final["message"]

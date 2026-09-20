@@ -119,3 +119,35 @@ def test_run_demand_discovery_reports_query_progress_and_respects_cap(monkeypatc
     assert len(progress) == 8
     assert sorted(event["completed_queries"] for event in progress) == list(range(1, 9))
     assert all(event["total_queries"] == 8 for event in progress)
+
+
+
+def test_v4_probe_matrix_targets_buildable_corroboration_topics():
+    assert demand_discovery.STRATEGY_VERSION == "demand-discovery-v4-buildable-corroboration"
+    queries_by_platform = {
+        platform: [
+            query.lower()
+            for probe in demand_discovery._PROBES
+            if probe["platform"] == platform
+            for query in probe["queries"]
+        ]
+        for platform in {"xiaohongshu", "reddit"}
+    }
+
+    xhs = queries_by_platform["xiaohongshu"]
+    reddit = queries_by_platform["reddit"]
+
+    assert any("excel" in query for query in xhs)
+    assert any("表格" in query for query in xhs)
+    assert any("自动化" in query or "脚本" in query for query in xhs)
+    assert any("spreadsheet" in query for query in reddit)
+    assert any("automation" in query for query in reddit)
+
+    # Keep queries demand-first instead of silently using marketplace supply as demand.
+    assert any("求" in query for query in xhs)
+    assert any("need " in query or "looking for" in query for query in reddit)
+
+
+def test_all_v4_probes_fill_the_eight_query_refresh_cap():
+    assert len(demand_discovery._PROBES) == 4
+    assert all(len(probe["queries"]) == 8 for probe in demand_discovery._PROBES)

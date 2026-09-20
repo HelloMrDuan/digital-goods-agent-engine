@@ -11,12 +11,16 @@ from ..collectors.base import CollectedItem
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .ingest import ingest_items
 
-STRATEGY_VERSION = "demand-discovery-v3-intent-fanout"
+STRATEGY_VERSION = "demand-discovery-v4-buildable-corroboration"
 MAX_AGE_DAYS = 30
 MAX_WORKERS = 2
 
-# Do not search product categories first. Search the language people use when they have
-# an unmet need or payment intent, then let clustering discover the product category.
+# V4 keeps real-demand language as the hard requirement, but corroborates it around
+# digital goods this project can actually build and deliver (xlsx/csv/scripts/text/web).
+# V3's generic "template/tool/help" probes produced many unrelated one-off requests:
+# real signals existed, but almost every signal formed a singleton cluster and could
+# never satisfy independent-demand validation. These queries remain demand-first;
+# they do not treat marketplace supply as demand and do not fabricate corroboration.
 _PROBES: tuple[dict[str, Any], ...] = (
     {
         "name": "小红书 - 直接需求扫描 v3",
@@ -24,8 +28,14 @@ _PROBES: tuple[dict[str, Any], ...] = (
         "limit": 60,
         "per_query_limit": 12,
         "queries": (
-            "求 模板", "有没有 好用 工具", "求 表格 模板", "想找 模板",
-            "有没有办法 自动", "不会做 求助", "求 运营 模板", "求 效率 工具",
+            "求 Excel 模板",
+            "求 表格 模板",
+            "有没有 自动统计 表格",
+            "求 记账 表格",
+            "求 库存 表格",
+            "求 排班 表格",
+            "有没有 批量处理 工具",
+            "求 自动化 脚本",
         ),
     },
     {
@@ -34,8 +44,14 @@ _PROBES: tuple[dict[str, Any], ...] = (
         "limit": 50,
         "per_query_limit": 10,
         "queries": (
-            "付费 求 模板", "愿意付费 求助", "预算 求 工具", "哪里买 模板",
-            "付费 求 表格", "求靠谱 模板", "求定制 模板",
+            "付费 求 Excel 模板",
+            "愿意付费 表格 模板",
+            "预算 自动化 脚本",
+            "哪里买 Excel 模板",
+            "求定制 Excel 表格",
+            "付费 求 自动化 工具",
+            "小店 记账 表格 求",
+            "库存 表格 求推荐",
         ),
     },
     {
@@ -44,9 +60,14 @@ _PROBES: tuple[dict[str, Any], ...] = (
         "limit": 60,
         "per_query_limit": 12,
         "queries": (
-            "looking for a template", "need a spreadsheet template", "looking for a tool to automate",
-            "any recommendations for a template", "how do you automate this workflow", "need a checklist",
-            "need a notion template", "trying to find a tool",
+            "need spreadsheet template",
+            "looking for excel template",
+            "need inventory spreadsheet",
+            "need bookkeeping spreadsheet",
+            "need scheduling spreadsheet",
+            "looking for automation script",
+            "need a tool to automate spreadsheet",
+            "small business spreadsheet template",
         ),
     },
     {
@@ -55,9 +76,14 @@ _PROBES: tuple[dict[str, Any], ...] = (
         "limit": 50,
         "per_query_limit": 10,
         "queries": (
-            "willing to pay for template", "where can I buy a template", "best paid template",
-            "paid tool recommendation", "budget for a tool", "would pay for automation",
             "paid spreadsheet template",
+            "where can I buy spreadsheet template",
+            "willing to pay for excel template",
+            "budget for automation script",
+            "paid automation tool recommendation",
+            "would pay for spreadsheet automation",
+            "buy small business spreadsheet template",
+            "paid inventory spreadsheet",
         ),
     },
 )
@@ -149,7 +175,7 @@ def _probe_config(probe: dict[str, Any]) -> dict[str, Any]:
 
 
 def install_sources() -> dict[str, int]:
-    """Install v3 broad demand probes and retire the narrow v2 probes.
+    """Install managed high-intent demand probes and retire the narrow v2 probes.
 
     Historical evidence is preserved. Only future collection strategy changes.
     """

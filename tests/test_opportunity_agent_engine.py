@@ -283,3 +283,71 @@ def test_market_intel_reaches_market_and_judge_agents(monkeypatch):
     assert captured["market"]["market_intel"]["items"][0]["rating"] == 4.9
     assert captured["market"]["market_intel"]["items"][0]["sales_scope"] == "shop"
     assert captured["judge"]["market_intel"]["items"][0]["sales_verified"] is True
+
+
+
+@pytest.mark.parametrize(
+    "structured_signals",
+    [
+        [
+            {
+                "type": "explicit_demand",
+                "topic": "PDF to Excel Conversion with OCR and Image Preservation",
+                "specifics": "Automation for converting MCQ PDFs into custom Excel formats without altering content.",
+            },
+            {
+                "type": "explicit_demand",
+                "topic": "Clay to Cold Email Automation",
+                "specifics": "Eliminating manual CSV export/upload steps between enrichment and sending tools.",
+            },
+        ],
+        [
+            {
+                "type": "explicit_demand",
+                "topic": "Affordable Invoice and Contract Automation for Small Business",
+                "description": "Small business owners are explicitly seeking affordable paperwork automation.",
+            },
+            {
+                "type": "market_sentiment",
+                "topic": "Practical Utility Over Hyped AI Agents",
+                "description": "Users want boring but useful automation rather than flashy demos.",
+            },
+        ],
+    ],
+)
+def test_signal_schema_normalizes_supported_structured_model_output(structured_signals):
+    output = {
+        "signals": structured_signals,
+        "signal_strength": 82,
+        "demand_pattern": "repeated practical automation requests",
+        "evidence_refs": [101, 102],
+        "confidence": 84,
+        "reasoning": "grounded in supplied evidence",
+    }
+
+    value = opportunity_agent._validate_agent_output("signal", output, {101, 102})
+
+    assert len(value["signals"]) == 2
+    assert all(isinstance(item, str) and item for item in value["signals"])
+    assert "explicit_demand" in value["signals"][0]
+
+
+def test_signal_schema_still_rejects_arbitrary_structured_fields():
+    output = {
+        "signals": [
+            {
+                "type": "explicit_demand",
+                "topic": "Payroll automation",
+                "specifics": "Need a payroll workbook.",
+                "invented_metric": 999,
+            }
+        ],
+        "signal_strength": 82,
+        "demand_pattern": "payroll",
+        "evidence_refs": [101],
+        "confidence": 84,
+        "reasoning": "grounded",
+    }
+
+    with pytest.raises(ValueError, match="unsupported fields"):
+        opportunity_agent._validate_agent_output("signal", output, {101})

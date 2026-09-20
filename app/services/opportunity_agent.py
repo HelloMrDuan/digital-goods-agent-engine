@@ -560,6 +560,53 @@ def _decision(final_score: float, market_score: float, risk_score: float) -> str
     return "DROP"
 
 
+def _build_readiness(
+    final_score: float,
+    market_score: float,
+    risk_score: float,
+    validation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    validation_status = str((validation or {}).get("status") or "NOT_VALIDATED").upper()
+    thresholds = {
+        "final_score_min": float(settings.agent_build_score),
+        "market_score_min": float(settings.agent_build_market_score),
+        "risk_score_max_exclusive": float(settings.high_risk_threshold),
+        "commercial_validation_required": "PASSED",
+    }
+    gaps: list[dict[str, Any]] = []
+    if validation_status != "PASSED":
+        gaps.append({
+            "code": "commercial_validation_not_passed",
+            "actual": validation_status,
+            "required": "PASSED",
+        })
+    if final_score < settings.agent_build_score:
+        gaps.append({
+            "code": "final_score_below_build_threshold",
+            "actual": round(final_score, 2),
+            "required": float(settings.agent_build_score),
+            "shortfall": round(float(settings.agent_build_score) - final_score, 2),
+        })
+    if market_score < settings.agent_build_market_score:
+        gaps.append({
+            "code": "market_score_below_build_threshold",
+            "actual": round(market_score, 2),
+            "required": float(settings.agent_build_market_score),
+            "shortfall": round(float(settings.agent_build_market_score) - market_score, 2),
+        })
+    if risk_score >= settings.high_risk_threshold:
+        gaps.append({
+            "code": "risk_score_too_high",
+            "actual": round(risk_score, 2),
+            "required": f"< {float(settings.high_risk_threshold):g}",
+        })
+    return {
+        "eligible": not gaps,
+        "thresholds": thresholds,
+        "gaps": gaps,
+    }
+
+
 def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
     _ensure_schema()
     opportunity = get_opportunity(opportunity_id)
@@ -687,6 +734,7 @@ def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
         "warnings": outputs["risk"].get("warnings") or [],
         "blockers": outputs["risk"].get("blockers") or [],
         "commercial_validation": validation,
+        "build_readiness": _build_readiness(final_score, market_score, risk_score, validation),
         "snapshot_hash": digest["snapshot_hash"],
         "provider": last_meta.get("provider"),
         "model": last_meta.get("model"),
@@ -811,18 +859,40 @@ def get_card_for_opportunity(opportunity_id: int) -> dict[str, Any] | None:
     return _decode_card_row(row) if row else None
 
 
-def list_opportunity_cards(limit: int = 100, decision: str | None = None) -> list[dict[str, Any]]:
+def list_opportunity_cards(
+    limit: int = 100,
+    decision: str | None = None,
+    *,
+    current_only: bool = True,
+) -> list[dict[str, Any]]:
     _ensure_schema()
-    sql = "SELECT * FROM opportunity_cards"
+    sql = """SELECT c.* FROM opportunity_cards c
+             JOIN opportunities o ON o.id=c.opportunity_id"""
+    clauses: list[str] = []
     params: list[Any] = []
+    if current_only:
+        clauses.append("coalesce(o.cluster_active,0)=1")
+        clauses.append("coalesce(o.analysis_stale,0)=0")
     if decision:
-        sql += " WHERE decision=?"
+        clauses.append("c.decision=?")
         params.append(str(decision).upper())
-    sql += " ORDER BY final_score DESC,id DESC LIMIT ?"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY c.final_score DESC,c.id DESC LIMIT ?"
     params.append(max(1, min(limit, 500)))
     with conn() as c:
         rows = c.execute(sql, tuple(params)).fetchall()
-    return [_decode_card_row(row) for row in rows]
+    cards = [_decode_card_row(row) for row in rows]
+    for card in cards:
+        payload = card.get("card") if isinstance(card.get("card"), dict) else {}
+        validation = payload.get("commercial_validation") if isinstance(payload, dict) else {}
+        card["build_readiness"] = _build_readiness(
+            float(card.get("final_score") or 0),
+            float(card.get("market_score") or 0),
+            float(card.get("risk_score") or 0),
+            validation if isinstance(validation, dict) else {},
+        )
+    return cards
 
 
 def list_agent_runs(opportunity_id: int, limit: int = 50) -> list[dict[str, Any]]:

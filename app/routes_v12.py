@@ -577,23 +577,29 @@ def opportunity_rebuild_task(task_id: int):
 @router.get("/api/opportunity-cards")
 def opportunity_cards_list(
     decision: str | None = None,
+    include_history: bool = False,
     limit: int = Query(default=100, ge=1, le=500),
 ):
     if decision and decision.upper() not in {"BUILD", "WATCH", "DROP"}:
         raise HTTPException(400, "decision must be BUILD, WATCH or DROP")
-    cards = list_opportunity_cards(limit=limit, decision=decision)
+    cards = list_opportunity_cards(
+        limit=limit,
+        decision=decision,
+        current_only=not include_history,
+    )
     if not cards:
         return []
     ids = [int(card["opportunity_id"]) for card in cards]
     placeholders = ",".join("?" for _ in ids)
     with conn() as c:
         rows = c.execute(
-            f"SELECT id,analysis_stale,validation_status,validation_score,trend_score,trusted_trend_score,data_quality_score FROM opportunities WHERE id IN ({placeholders})",
+            f"SELECT id,cluster_active,analysis_stale,validation_status,validation_score,trend_score,trusted_trend_score,data_quality_score FROM opportunities WHERE id IN ({placeholders})",
             tuple(ids),
         ).fetchall()
     metadata = {int(row["id"]): row_to_dict(row) or {} for row in rows}
     for card in cards:
         meta = metadata.get(int(card["opportunity_id"]), {})
+        card["active"] = bool(meta.get("cluster_active"))
         card["stale"] = bool(meta.get("analysis_stale"))
         card["validation_status"] = meta.get("validation_status")
         card["validation_score"] = meta.get("validation_score")

@@ -460,3 +460,40 @@ def test_market_schema_rejects_unknown_buyer_profile_object_fields():
 
     with pytest.raises(ValueError, match="unsupported fields"):
         opportunity_agent._validate_agent_output("market", output, {101})
+
+
+
+def test_build_readiness_explains_exact_build_gaps():
+    readiness = opportunity_agent._build_readiness(
+        final_score=68,
+        market_score=72,
+        risk_score=38,
+        validation={"status": "PASSED"},
+    )
+
+    assert readiness["eligible"] is False
+    assert readiness["gaps"] == [
+        {
+            "code": "final_score_below_build_threshold",
+            "actual": 68,
+            "required": float(settings.agent_build_score),
+            "shortfall": float(settings.agent_build_score) - 68,
+        }
+    ]
+
+
+def test_card_list_defaults_to_current_active_non_stale_only(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", _fake_chat)
+    opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+
+    current = opportunity_agent.list_opportunity_cards()
+    assert [int(card["opportunity_id"]) for card in current] == [opportunity_id]
+    assert current[0]["build_readiness"]["eligible"] is True
+
+    with conn() as c:
+        c.execute("UPDATE opportunities SET cluster_active=0 WHERE id=?", (opportunity_id,))
+
+    assert opportunity_agent.list_opportunity_cards() == []
+    history = opportunity_agent.list_opportunity_cards(current_only=False)
+    assert [int(card["opportunity_id"]) for card in history] == [opportunity_id]

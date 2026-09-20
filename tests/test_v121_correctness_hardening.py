@@ -424,3 +424,82 @@ def test_generic_template_word_alone_does_not_force_merge():
     clusters, _, _ = clustering._legacy._cluster_rows(rows)
 
     assert len(clusters) == 2
+
+
+
+def _cluster_test_row(row_id: int, title: str, content: str, now):
+    return {
+        "id": row_id,
+        "title": title,
+        "content": content,
+        "demand_signal_score": 90,
+        "evidence_quality_score": 90,
+        "intent_weight": 1.0,
+        "_event_dt": now,
+    }
+
+
+def test_v8_does_not_merge_pdf_ocr_with_clay_email_automation():
+    now = datetime.now(timezone.utc)
+    rows = [
+        _cluster_test_row(
+            3001,
+            "Need PDF to Excel conversion with OCR and image preservation",
+            "Need Gujarati English MCQ PDFs with math and images converted into Excel without rewriting content.",
+            now,
+        ),
+        _cluster_test_row(
+            3002,
+            "Need Clay to cold email automation",
+            "Need to remove manual CSV export between Clay enrichment and cold email sending tools.",
+            now,
+        ),
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 2
+
+
+def test_v8_does_not_merge_invoice_contract_need_with_ai_agent_skepticism():
+    now = datetime.now(timezone.utc)
+    rows = [
+        _cluster_test_row(
+            3101,
+            "Affordable invoice and contract automation for small business",
+            "Event rental owner needs affordable invoices and contracts generated from a saved item catalog.",
+            now,
+        ),
+        _cluster_test_row(
+            3102,
+            "Which AI agent tasks are actually useful for a small business?",
+            "Small business owner wants practical safe AI agent tasks instead of marketing hype.",
+            now,
+        ),
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 2
+
+
+def test_v8_still_merges_same_inventory_need_across_languages():
+    now = datetime.now(timezone.utc)
+    rows = [
+        _cluster_test_row(
+            3201,
+            "Need inventory spreadsheet for a small store",
+            "Need stock management and reorder tracking.",
+            now,
+        ),
+        _cluster_test_row(
+            3202,
+            "求门店库存 Excel 表格",
+            "需要出入库、库存预警和库存管理。",
+            now,
+        ),
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 1

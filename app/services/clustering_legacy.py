@@ -133,11 +133,12 @@ def _cosine(a: dict[str, float], b: dict[str, float]) -> float:
 
 
 _GENERIC_CONCEPTS = {"@template", "@spreadsheet", "@automation", "@document"}
+_BROAD_CONTEXT_CONCEPTS = {"@small_business", "@content_creator", "@social_media"}
 _STRONG_TOPIC_CONCEPTS = {
     "@payroll", "@attendance", "@scheduling", "@inventory", "@expense", "@resume",
-    "@job_search", "@content_creator", "@short_video", "@social_media", "@copywriting",
-    "@ai_agent", "@prompt", "@notion", "@presentation", "@study_plan", "@flashcard",
-    "@small_business", "@finance", "@crm", "@quotation", "@contract", "@calendar",
+    "@job_search", "@short_video", "@copywriting", "@ai_agent", "@prompt", "@notion",
+    "@presentation", "@study_plan", "@flashcard", "@finance", "@crm", "@quotation",
+    "@contract", "@calendar",
 }
 
 
@@ -150,8 +151,36 @@ def _shared_business_topic(a: dict[str, float], b: dict[str, float]) -> bool:
     if shared & _STRONG_TOPIC_CONCEPTS:
         return True
     # Generic concepts can corroborate each other only when there is more than one
-    # shared product concept, e.g. spreadsheet+template. A lone "template" never merges.
+    # shared product concept, e.g. spreadsheet+template. A lone "automation" never merges.
     return len(shared & _GENERIC_CONCEPTS) >= 2
+
+
+def _topic_compatible(a: dict[str, float], b: dict[str, float], cosine: float) -> bool:
+    """Hard semantic guard applied before any cluster merge.
+
+    V7 only consulted semantic topics when cosine fell below the normal threshold.
+    That allowed unrelated workflow requests to merge whenever generic wording pushed
+    cosine above the threshold. V8 requires a compatible business topic regardless of
+    cosine, except for near-duplicate text with very high lexical similarity.
+    """
+    ca = _concept_keys(a)
+    cb = _concept_keys(b)
+    if not ca or not cb:
+        return cosine >= 0.72
+
+    specific_a = ca - _GENERIC_CONCEPTS - _BROAD_CONTEXT_CONCEPTS
+    specific_b = cb - _GENERIC_CONCEPTS - _BROAD_CONTEXT_CONCEPTS
+
+    if specific_a and specific_b:
+        return bool(specific_a & specific_b)
+
+    if _shared_business_topic(a, b):
+        return True
+
+    # Broad audience labels such as small_business are never sufficient on their own.
+    # Generic automation/template overlap is also insufficient unless there are at
+    # least two shared generic product concepts.
+    return cosine >= 0.72
 
 
 def _centroid(vecs: list[dict[str, float]]) -> dict[str, float]:
@@ -265,14 +294,25 @@ def _cluster_rows(rows: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any]]
             cent = _centroid(cluster_vecs[idx])
             sim = _cosine(v, cent)
             sample_vecs = cluster_vecs[idx][:12]
-            semantic_topic_match = bool(sample_vecs) and all(
+            if not sample_vecs:
+                continue
+
+            member_sims = [_cosine(v, member_vector) for member_vector in sample_vecs]
+            if not all(
+                _topic_compatible(v, member_vector, member_sim)
+                for member_vector, member_sim in zip(sample_vecs, member_sims)
+            ):
+                continue
+
+            semantic_topic_match = all(
                 _shared_business_topic(v, member_vector) for member_vector in sample_vecs
             )
             if sim < threshold and not (semantic_topic_match and sim >= semantic_floor):
                 continue
-            # Avoid transitive chain pollution. The lower semantic floor is allowed only
-            # when every sampled member shares the same conservative business concept.
-            min_member_sim = min((_cosine(v, mv) for mv in sample_vecs), default=sim)
+
+            # Avoid transitive chain pollution. Semantic lowering is allowed only when
+            # every sampled member shares the same specific business concept.
+            min_member_sim = min(member_sims, default=sim)
             required_floor = semantic_floor if semantic_topic_match else compact_floor
             if min_member_sim < required_floor:
                 continue

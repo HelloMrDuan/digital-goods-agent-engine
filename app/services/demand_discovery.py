@@ -10,8 +10,9 @@ from ..collectors import agent_reach_doctor, collect_agent_reach
 from ..collectors.base import CollectedItem
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .ingest import ingest_items
+from .demand_topics import DEMAND_TOPICS, detect_topic, topic_matches_text
 
-STRATEGY_VERSION = "demand-discovery-v4-buildable-corroboration"
+STRATEGY_VERSION = "demand-discovery-v5-topic-provenance"
 MAX_AGE_DAYS = 30
 MAX_WORKERS = 2
 
@@ -101,67 +102,11 @@ _CORROBORATION_SOURCES: tuple[dict[str, str], ...] = (
     {"name": "Reddit - dynamic corroboration v4", "platform": "reddit"},
 )
 
-# Ordered from specific to generic so a payroll/inventory request is not reduced to
-# the generic "spreadsheet" bucket. Corroboration remains real search evidence only.
-_CORROBORATION_TOPICS: tuple[dict[str, Any], ...] = (
-    {
-        "key": "inventory_spreadsheet",
-        "aliases": ("库存", "inventory", "stock management", "出入库"),
-        "queries": {
-            "xiaohongshu": ("求 库存 Excel 表格",),
-            "reddit": ("need inventory spreadsheet",),
-        },
-    },
-    {
-        "key": "bookkeeping_spreadsheet",
-        "aliases": ("记账", "bookkeeping", "accounting spreadsheet", "expense tracker", "报销", "费用"),
-        "queries": {
-            "xiaohongshu": ("求 记账 Excel 表格",),
-            "reddit": ("need bookkeeping spreadsheet",),
-        },
-    },
-    {
-        "key": "scheduling_spreadsheet",
-        "aliases": ("排班", "轮班", "scheduling spreadsheet", "rota", "shift schedule"),
-        "queries": {
-            "xiaohongshu": ("求 排班 Excel 表格",),
-            "reddit": ("need scheduling spreadsheet",),
-        },
-    },
-    {
-        "key": "payroll_spreadsheet",
-        "aliases": ("工资", "薪资", "薪酬", "payroll", "salary spreadsheet", "wage"),
-        "queries": {
-            "xiaohongshu": ("求 工资 Excel 表格",),
-            "reddit": ("need payroll spreadsheet",),
-        },
-    },
-    {
-        "key": "resume_template",
-        "aliases": ("简历", "resume", "curriculum vitae", "cv template"),
-        "queries": {
-            "xiaohongshu": ("求 简历 模板",),
-            "reddit": ("need resume template",),
-        },
-    },
-    {
-        "key": "automation",
-        "aliases": ("自动化", "批量处理", "automation", "automate", "script", "脚本"),
-        "queries": {
-            "xiaohongshu": ("求 自动化 脚本",),
-            "reddit": ("looking for automation script",),
-        },
-    },
-    {
-        "key": "spreadsheet",
-        "aliases": ("excel", "spreadsheet", "表格", "电子表格"),
-        "queries": {
-            "xiaohongshu": ("求 Excel 表格 模板",),
-            "reddit": ("need spreadsheet template",),
-        },
-    },
-)
-_MAX_CORROBORATION_TOPICS = 4
+# Corroboration topics live in demand_topics.py so discovery and clustering use the
+# exact same deterministic taxonomy. Broad "automation"/"spreadsheet" buckets are
+# intentionally excluded because they created false commercial corroboration.
+_CORROBORATION_TOPICS = DEMAND_TOPICS
+_MAX_CORROBORATION_TOPICS = 5
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -466,11 +411,7 @@ def _corroboration_source(platform: str) -> dict[str, Any]:
 
 
 def _topic_for_text(title: str | None, content: str | None) -> dict[str, Any] | None:
-    text = f"{title or ''} {content or ''}".lower()
-    for topic in _CORROBORATION_TOPICS:
-        if any(str(alias).lower() in text for alias in topic["aliases"]):
-            return topic
-    return None
+    return detect_topic(title, content)
 
 
 def _recent_direct_topics(limit: int = 120) -> list[dict[str, Any]]:
@@ -546,7 +487,17 @@ def _recent_direct_topics(limit: int = 120) -> list[dict[str, Any]]:
 
 def _item_matches_topic(item: CollectedItem, topic: dict[str, Any]) -> bool:
     text = f"{item.title or ''} {item.content or ''}".lower()
-    return any(str(alias).lower() in text for alias in topic["aliases"])
+    return topic_matches_text(text, topic)
+
+
+def _tag_corroboration_item(item: CollectedItem, topic_key: str, query: str) -> CollectedItem:
+    # This is provenance metadata about why the real item was retained. It does not
+    # alter its title/content/author/intent and therefore cannot fabricate demand.
+    raw = dict(item.raw or {})
+    raw["_corroboration_topic"] = topic_key
+    raw["_corroboration_query"] = query
+    item.raw = raw
+    return item
 
 
 def _run_dynamic_corroboration(
@@ -573,6 +524,10 @@ def _run_dynamic_corroboration(
             fetched = len(items)
             matching = [item for item in items if _item_matches_topic(item, topic_info["topic"])]
             retained = _prepare_items(matching, 8)
+            retained = [
+                _tag_corroboration_item(item, str(topic_info["key"]), query)
+                for item in retained
+            ]
             retained_count = len(retained)
             stats = ingest_items(_corroboration_source(platform), retained)
             ids = [int(value) for value in stats.get("observed_evidence_ids") or []]

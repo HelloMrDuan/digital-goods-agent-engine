@@ -123,7 +123,7 @@ def test_run_demand_discovery_reports_query_progress_and_respects_cap(monkeypatc
 
 
 def test_v4_probe_matrix_targets_buildable_corroboration_topics():
-    assert demand_discovery.STRATEGY_VERSION == "demand-discovery-v4-buildable-corroboration"
+    assert demand_discovery.STRATEGY_VERSION == "demand-discovery-v5-topic-provenance"
     queries_by_platform = {
         platform: [
             query.lower()
@@ -223,3 +223,34 @@ def test_dynamic_corroboration_uses_real_matching_topic_results(monkeypatch):
     assert {platform for platform, _ in calls} == {"reddit", "xiaohongshu"}
     assert result["topics"][0]["key"] == "inventory_spreadsheet"
     assert result["direct_demand_signals"] >= 1
+
+
+
+def test_corroboration_item_persists_topic_provenance():
+    item = CollectedItem(
+        platform="reddit",
+        source_type="agent_reach_reddit",
+        source_item_id="topic-1",
+        source_url="https://reddit.com/topic-1",
+        title="Need inventory spreadsheet",
+        content="Need stock management for a shop",
+        author="buyer",
+        published_at=datetime.now(timezone.utc).isoformat(),
+        raw={"id": "topic-1"},
+    )
+
+    tagged = demand_discovery._tag_corroboration_item(
+        item,
+        "inventory_spreadsheet",
+        "need inventory spreadsheet",
+    )
+
+    assert tagged.raw["_corroboration_topic"] == "inventory_spreadsheet"
+    assert tagged.raw["_corroboration_query"] == "need inventory spreadsheet"
+
+
+def test_broad_automation_is_not_a_corroboration_topic():
+    assert demand_discovery._topic_for_text(
+        "Need automation script",
+        "I want to automate a random workflow",
+    ) is None

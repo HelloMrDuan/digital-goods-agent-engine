@@ -11,6 +11,7 @@ from typing import Any
 
 from ..config import BASE_DIR, settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
+from .demand_topics import detect_topic, valid_topic_key
 
 _METHOD = "real_evidence_tfidf_v5_content_intent_gate"
 _CJK_RE = re.compile(r"[\u3400-\u9fff]+")
@@ -148,6 +149,8 @@ def _concept_keys(vector: dict[str, float]) -> set[str]:
 
 def _shared_business_topic(a: dict[str, float], b: dict[str, float]) -> bool:
     shared = _concept_keys(a) & _concept_keys(b)
+    if any(token.startswith("@demand_topic:") for token in shared):
+        return True
     if shared & _STRONG_TOPIC_CONCEPTS:
         return True
     # Generic concepts can corroborate each other only when there is more than one
@@ -167,6 +170,11 @@ def _topic_compatible(a: dict[str, float], b: dict[str, float], cosine: float) -
     cb = _concept_keys(b)
     if not ca or not cb:
         return cosine >= 0.72
+
+    topic_a = {token for token in ca if token.startswith("@demand_topic:")}
+    topic_b = {token for token in cb if token.startswith("@demand_topic:")}
+    if topic_a or topic_b:
+        return bool(topic_a & topic_b)
 
     specific_a = ca - _GENERIC_CONCEPTS - _BROAD_CONTEXT_CONCEPTS
     specific_b = cb - _GENERIC_CONCEPTS - _BROAD_CONTEXT_CONCEPTS
@@ -250,12 +258,39 @@ def _load_evidence() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     return demand, support
 
 
+def _evidence_topic_key(row: dict[str, Any]) -> str | None:
+    raw = loads(row.get("raw_json"), {}) or {}
+    if isinstance(raw, dict):
+        tagged = valid_topic_key(raw.get("_corroboration_topic"))
+        if tagged:
+            return tagged
+    topic = detect_topic(row.get("title"), row.get("content"))
+    return str(topic["key"]) if topic else None
+
+
+def _topic_token(row: dict[str, Any]) -> str | None:
+    key = _evidence_topic_key(row)
+    return f"@demand_topic:{key}" if key else None
+
+
 def _build_vectors(rows: list[dict[str, Any]]) -> tuple[list[dict[str, float]], dict[str, float], Counter[str]]:
-    doc_sets = [_tokens((r.get("title") or "") + " " + (r.get("content") or "")[:1000]) for r in rows]
+    doc_sets = []
+    for row in rows:
+        tokens = _tokens((row.get("title") or "") + " " + (row.get("content") or "")[:1000])
+        topic = _topic_token(row)
+        if topic:
+            tokens.add(topic)
+        doc_sets.append(tokens)
     df = Counter(t for toks in doc_sets for t in toks)
     n = max(1, len(rows))
     idf = {t: math.log((n + 1) / (cnt + 1)) + 1.0 for t, cnt in df.items()}
-    vecs = [_vector(r.get("title") or "", r.get("content") or "", idf) for r in rows]
+    vecs = []
+    for row in rows:
+        vector = _vector(row.get("title") or "", row.get("content") or "", idf)
+        topic = _topic_token(row)
+        if topic:
+            vector[topic] = max(vector.get(topic, 0.0), idf.get(topic, 1.0) * 5.0)
+        vecs.append(vector)
     return vecs, idf, df
 
 

@@ -503,3 +503,60 @@ def test_v8_still_merges_same_inventory_need_across_languages():
     clusters, _, _ = clustering._legacy._cluster_rows(rows)
 
     assert len(clusters) == 1
+
+
+
+def test_v9_topic_provenance_merges_corroborated_cross_language_inventory():
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            **_cluster_test_row(
+                3301,
+                "Need inventory spreadsheet for my store",
+                "Looking for stock management and reorder tracking.",
+                now,
+            ),
+            "raw_json": "{}",
+        },
+        {
+            **_cluster_test_row(
+                3302,
+                "求一个门店库存表格",
+                "需要出入库和库存预警。",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"inventory_spreadsheet"}',
+        },
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 1
+
+
+def test_v9_different_corroboration_topics_never_merge_even_if_generic_words_overlap():
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            **_cluster_test_row(
+                3401,
+                "Need business automation spreadsheet",
+                "Need an invoice contract generator for a small business.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+        },
+        {
+            **_cluster_test_row(
+                3402,
+                "Need business automation spreadsheet",
+                "Need PDF OCR output to Excel.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"pdf_excel_ocr"}',
+        },
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 2

@@ -30,7 +30,10 @@ DEMAND_TOPICS: tuple[dict[str, Any], ...] = (
     },
     {
         "key": "payroll_spreadsheet",
-        "match_groups": (("工资", "薪资", "薪酬", "payroll", "salary spreadsheet", "wage"),),
+        "match_groups": (
+            ("工资", "薪资", "薪酬", "payroll", "salary", "wage"),
+            ("spreadsheet", "excel", "template", "表格", "模板"),
+        ),
         "queries": {
             "xiaohongshu": ("求 工资 Excel 表格",),
             "reddit": ("need payroll spreadsheet",),

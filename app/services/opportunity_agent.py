@@ -882,8 +882,9 @@ def list_opportunity_cards(
     params.append(max(1, min(limit, 500)))
     with conn() as c:
         rows = c.execute(sql, tuple(params)).fetchall()
-    cards = [_decode_card_row(row) for row in rows]
-    for card in cards:
+    decoded = [_decode_card_row(row) for row in rows]
+    cards: list[dict[str, Any]] = []
+    for card in decoded:
         payload = card.get("card") if isinstance(card.get("card"), dict) else {}
         validation = payload.get("commercial_validation") if isinstance(payload, dict) else {}
         card["build_readiness"] = _build_readiness(
@@ -892,6 +893,24 @@ def list_opportunity_cards(
             float(card.get("risk_score") or 0),
             validation if isinstance(validation, dict) else {},
         )
+
+        snapshot_current = False
+        current_snapshot_hash = None
+        try:
+            digest = build_evidence_digest(int(card["opportunity_id"]))
+            current_snapshot_hash = digest.get("snapshot_hash")
+            snapshot_current = bool(
+                current_snapshot_hash
+                and str(card.get("snapshot_hash") or "") == str(current_snapshot_hash)
+            )
+        except Exception:
+            snapshot_current = False
+
+        card["snapshot_current"] = snapshot_current
+        card["current_snapshot_hash"] = current_snapshot_hash
+        if current_only and not snapshot_current:
+            continue
+        cards.append(card)
     return cards
 
 

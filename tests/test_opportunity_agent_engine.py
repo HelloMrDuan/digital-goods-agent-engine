@@ -497,3 +497,28 @@ def test_card_list_defaults_to_current_active_non_stale_only(monkeypatch):
     assert opportunity_agent.list_opportunity_cards() == []
     history = opportunity_agent.list_opportunity_cards(current_only=False)
     assert [int(card["opportunity_id"]) for card in history] == [opportunity_id]
+
+
+
+def test_card_list_excludes_snapshot_mismatch_even_when_flags_look_current(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", _fake_chat)
+    result = opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+    assert result["card"]["snapshot_hash"]
+
+    with conn() as c:
+        c.execute(
+            "UPDATE opportunity_cards SET snapshot_hash='stale-snapshot' WHERE opportunity_id=?",
+            (opportunity_id,),
+        )
+        c.execute(
+            "UPDATE opportunities SET cluster_active=1,analysis_stale=0 WHERE id=?",
+            (opportunity_id,),
+        )
+
+    assert opportunity_agent.list_opportunity_cards() == []
+
+    history = opportunity_agent.list_opportunity_cards(current_only=False)
+    assert len(history) == 1
+    assert history[0]["snapshot_current"] is False
+    assert history[0]["current_snapshot_hash"]

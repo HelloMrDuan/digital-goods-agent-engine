@@ -115,3 +115,50 @@ def test_resolve_cli_command_keeps_arguments_unchanged(monkeypatch):
     assert resolved[2] == "C:/Program Files/nodejs/opencli.cmd"
     assert resolved[3:] == original[1:]
     assert original[0] == "opencli"
+
+
+def test_xiaohongshu_most_liked_search_builds_ranked_opencli_command(monkeypatch):
+    monkeypatch.setattr(
+        agent_reach.shutil,
+        "which",
+        lambda name: "C:/fake/opencli.cmd" if name == "opencli" else None,
+    )
+
+    commands = agent_reach._commands(
+        "xiaohongshu",
+        "Excel模板",
+        30,
+        "OpenCLI Browser Bridge",
+        sort="most-liked",
+    )
+
+    assert commands == [[
+        "opencli",
+        "xiaohongshu",
+        "search",
+        "Excel模板",
+        "--limit",
+        "30",
+        "--sort",
+        "most-liked",
+        "-f",
+        "json",
+    ]]
+
+
+def test_xiaohongshu_real_like_text_is_preserved_as_engagement():
+    item = agent_reach._normalize(
+        "xiaohongshu",
+        {
+            "id": "note-1",
+            "title": "Excel模板",
+            "url": "https://www.xiaohongshu.com/search_result/note-1",
+            "author": "real-author",
+            "likes": "6.7万",
+            "published_at": "2026-09-20",
+        },
+    )
+
+    assert item is not None
+    assert item.engagement["likes"] == "6.7万"
+    assert item.source_item_id == "note-1"

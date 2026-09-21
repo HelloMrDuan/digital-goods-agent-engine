@@ -13,7 +13,7 @@ from .services.analyze import analyze_one
 from .services.demand_discovery import run_demand_discovery, refresh_opportunity_corroboration
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity
 from .services.sources import collect_source, list_sources
-from .services.market_intel import market_intel_summary
+from .services.market_intel import market_intel_summary, collect_targeted_market_intel
 from .services.validation import evaluate_gate_a, get_gate_a
 from .services.opportunity_agent import (
     get_card_for_opportunity,
@@ -528,6 +528,61 @@ def _resolve_watch_opportunity_after_rebuild(
     if not rows:
         raise ValueError("target opportunity could not be resolved after clustering rebuild")
     return int(rows[0]["opportunity_id"])
+
+
+@router.post("/api/opportunities/{opportunity_id}/market-refresh")
+def opportunity_market_refresh(
+    opportunity_id: int,
+    analyze: bool = True,
+    per_query_limit: int = Query(default=12, ge=1, le=20),
+):
+    card = get_card_for_opportunity(opportunity_id)
+    if not card:
+        raise HTTPException(404, "opportunity card not found")
+    if str(card.get("decision") or "").upper() != "WATCH":
+        raise HTTPException(409, "targeted market validation is only available for WATCH opportunities")
+
+    payload = card.get("card") if isinstance(card.get("card"), dict) else {}
+    primary_product = str(
+        payload.get("primary_product")
+        or card.get("primary_product")
+        or ""
+    ).strip()
+    if not primary_product:
+        raise HTTPException(409, "WATCH opportunity has no primary product")
+
+    try:
+        targeted = collect_targeted_market_intel(
+            opportunity_id,
+            primary_product,
+            per_query_limit=per_query_limit,
+        )
+        gate_a = evaluate_gate_a(opportunity_id)
+        analysis = None
+        analysis_reason = "market intel unchanged"
+        if analyze and targeted.get("market_changed"):
+            if str(gate_a.get("decision") or "").upper() == "PASS":
+                analysis = analyze_one(opportunity_id)
+                analysis_reason = "market intel changed; six-Agent analysis rerun"
+            else:
+                analysis_reason = "market intel changed but Gate A is not PASS"
+
+        return {
+            "opportunity_id": opportunity_id,
+            "primary_product": primary_product,
+            "targeted_market": targeted,
+            "gate_a": gate_a,
+            "analysis": analysis,
+            "analysis_reason": analysis_reason,
+            "policy": (
+                "targeted market validation only; no demand evidence mutation; "
+                "only verified digital market items may change market_intel"
+            ),
+        }
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
 
 
 @router.post("/api/opportunities/{opportunity_id}/watch-refresh")

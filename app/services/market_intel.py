@@ -8,6 +8,7 @@ from typing import Any
 
 from ..config import BASE_DIR, settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
+from ..collectors import collect_etsy_market, collect_xianyu_market
 
 
 def _num(value: Any) -> float | None:
@@ -353,6 +354,170 @@ def market_intel_for_opportunity(opportunity_id: int, limit: int = 12) -> dict[s
         "max_sales_score": max((float(item.get("sales_score") or 0) for item in verified_sales), default=0.0),
         "items": items,
         "truth_policy": "sales_count is stored only when the source explicitly exposes a sales metric; sales_scope identifies listing/shop/account scope and is never silently promoted to product sales.",
+    }
+
+
+
+_MARKET_QUERY_STOPWORDS = {
+    "solo", "agency", "agencies", "gtm", "playbook", "checklist", "validator",
+    "stack", "guide", "kit", "toolkit", "template", "blueprint", "setup",
+    "operations", "operation", "specification", "workflow", "workflows",
+}
+
+
+def targeted_market_queries(primary_product: str, max_queries: int = 2) -> list[str]:
+    title = " ".join(str(primary_product or "").split())
+    if not title:
+        raise ValueError("primary product is required for targeted market validation")
+
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+._-]*", title)
+    concise_words = [
+        word
+        for word in words
+        if word.lower() not in _MARKET_QUERY_STOPWORDS
+        and len(word) > 1
+    ]
+    queries: list[str] = []
+    if title:
+        queries.append(title)
+    concise = " ".join(concise_words[:6]).strip()
+    if concise and concise.lower() != title.lower():
+        queries.append(concise)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+    return unique[:max(1, min(int(max_queries), 3))]
+
+
+def _target_market_source(
+    opportunity_id: int,
+    platform: str,
+    query: str,
+) -> dict[str, Any]:
+    source_type = {
+        "etsy": "etsy_market",
+        "xianyu": "xianyu_market",
+    }.get(platform)
+    if not source_type:
+        raise ValueError(f"unsupported targeted market platform: {platform}")
+
+    name = f"WATCH market validation #{opportunity_id} {platform}"
+    config = {
+        "role": "market",
+        "priority": "P1",
+        "business_group": "market_intel",
+        "recommended": False,
+        "managed_refresh": False,
+        "mode": "watch_targeted_market_validation",
+        "opportunity_id": opportunity_id,
+    }
+    now = now_iso()
+    with conn() as c:
+        row = c.execute("SELECT id FROM sources WHERE name=?", (name,)).fetchone()
+        if row:
+            source_id = int(row["id"])
+            c.execute(
+                """UPDATE sources
+                   SET source_type=?,platform=?,query=?,url=NULL,config_json=?,enabled=0,updated_at=?
+                   WHERE id=?""",
+                (source_type, platform, query, dumps(config), now, source_id),
+            )
+        else:
+            cur = c.execute(
+                """INSERT INTO sources(
+                       name,source_type,platform,query,url,config_json,enabled,status,created_at,updated_at
+                   ) VALUES(?,?,?,?,NULL,?,0,'NOT_CHECKED',?,?)""",
+                (name, source_type, platform, query, dumps(config), now, now),
+            )
+            source_id = int(cur.lastrowid)
+        source = c.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+    return row_to_dict(source) or {}
+
+
+def _market_signal_signature(intel: dict[str, Any]) -> tuple[Any, ...]:
+    rows = []
+    for item in intel.get("items") or []:
+        rows.append((
+            int(item.get("id") or 0),
+            round(float(item.get("similarity") or 0), 4),
+            round(float(item.get("heat_score") or 0), 2),
+            None if item.get("sales_score") is None else round(float(item.get("sales_score") or 0), 2),
+            bool(item.get("sales_verified")),
+            item.get("sales_count"),
+            item.get("sales_scope"),
+        ))
+    return tuple(sorted(rows))
+
+
+def collect_targeted_market_intel(
+    opportunity_id: int,
+    primary_product: str,
+    *,
+    per_query_limit: int = 12,
+) -> dict[str, Any]:
+    """Validate one WATCH product against real digital-market supply signals.
+
+    This never creates demand evidence. Etsy/Xianyu results must pass each collector's
+    existing digital-product verification before entering market_intel.
+    """
+    queries = targeted_market_queries(primary_product)
+    limit = max(1, min(int(per_query_limit), 20))
+    before = market_intel_for_opportunity(opportunity_id, 50)
+    before_signature = _market_signal_signature(before)
+
+    results: list[dict[str, Any]] = []
+    for platform, collector in (
+        ("etsy", collect_etsy_market),
+        ("xianyu", collect_xianyu_market),
+    ):
+        for query in queries:
+            source = _target_market_source(opportunity_id, platform, query)
+            try:
+                items = collector(query, limit=limit)
+                stats = sync_market_items(source, items)
+                results.append({
+                    "platform": platform,
+                    "query": query,
+                    "status": "SUCCESS" if items else "EMPTY",
+                    "fetched": len(items),
+                    "inserted": int(stats.get("inserted") or 0),
+                    "updated": int(stats.get("updated") or 0),
+                    "rejected_invalid": int(stats.get("rejected_invalid") or 0),
+                    "matched_links": int(stats.get("matched_links") or 0),
+                })
+            except Exception as exc:
+                results.append({
+                    "platform": platform,
+                    "query": query,
+                    "status": "FAILED",
+                    "fetched": 0,
+                    "error": str(exc),
+                })
+
+    after = market_intel_for_opportunity(opportunity_id, 50)
+    after_signature = _market_signal_signature(after)
+    return {
+        "opportunity_id": opportunity_id,
+        "primary_product": primary_product,
+        "queries": queries,
+        "results": results,
+        "before": before,
+        "after": after,
+        "market_changed": before_signature != after_signature,
+        "new_matched_count": max(
+            0,
+            int(after.get("matched_count") or 0) - int(before.get("matched_count") or 0),
+        ),
+        "policy": (
+            "real verified digital-market supply only; market intel never counts as demand; "
+            "missing results remain unknown rather than low competition"
+        ),
     }
 
 

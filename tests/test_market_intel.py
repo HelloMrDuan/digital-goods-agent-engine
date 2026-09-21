@@ -10,6 +10,7 @@ from app.collectors.marketplaces import _creative_market_product_links, _etsy_li
 from app.config import settings
 from app.db import conn, init_db, now_iso
 from app.services import sources
+from app.services import market_intel
 from app.services.market_intel import list_market_intel, market_intel_for_opportunity, market_intel_summary
 from app.services.sources import collect_source, create_source
 
@@ -295,3 +296,68 @@ def test_market_similarity_does_not_match_unrelated_single_template_term():
     )
 
     assert score < settings.market_intel_match_threshold
+
+
+
+def test_targeted_market_queries_remove_generic_packaging_words():
+    queries = market_intel.targeted_market_queries(
+        "WhatsApp Automation Agency GTM Checklist & Stack Validator"
+    )
+    assert queries[0] == "WhatsApp Automation Agency GTM Checklist & Stack Validator"
+    assert queries[1] == "WhatsApp Automation"
+
+
+def test_targeted_market_validation_writes_market_intel_not_demand(monkeypatch):
+    now = now_iso()
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO opportunities(title,candidate_key,normalized_need,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (
+                "WhatsApp Automation Agency GTM Checklist",
+                "watch-market-1",
+                "WhatsApp automation launch checklist",
+                "NEW",
+                now,
+                now,
+            ),
+        )
+        opportunity_id = int(cur.lastrowid)
+        c.execute("UPDATE opportunities SET cluster_active=1 WHERE id=?", (opportunity_id,))
+
+    def fake_etsy(query, limit=12):
+        return [
+            _market_item(
+                "watch-etsy-1",
+                "WhatsApp Automation Agency Checklist Template",
+                rank=1,
+                sales_count=9000,
+                sales_scope="shop",
+            )
+        ]
+
+    monkeypatch.setattr(market_intel, "collect_etsy_market", fake_etsy)
+    monkeypatch.setattr(
+        market_intel,
+        "collect_xianyu_market",
+        lambda query, limit=12: (_ for _ in ()).throw(RuntimeError("xianyu unavailable")),
+    )
+
+    result = market_intel.collect_targeted_market_intel(
+        opportunity_id,
+        "WhatsApp Automation Agency GTM Checklist & Stack Validator",
+        per_query_limit=5,
+    )
+
+    assert result["market_changed"] is True
+    assert result["after"]["matched_count"] >= 1
+    assert result["after"]["high_heat_count"] >= 1
+    assert result["after"]["high_sales_count"] >= 1
+    assert any(item["platform"] == "xianyu" and item["status"] == "FAILED" for item in result["results"])
+    with conn() as c:
+        assert c.execute("SELECT COUNT(*) c FROM evidence").fetchone()["c"] == 0
+        source = c.execute(
+            "SELECT enabled,config_json FROM sources WHERE name=?",
+            (f"WATCH market validation #{opportunity_id} etsy",),
+        ).fetchone()
+    assert source["enabled"] == 0
+    assert "watch_targeted_market_validation" in source["config_json"]

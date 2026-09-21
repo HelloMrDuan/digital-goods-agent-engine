@@ -735,3 +735,79 @@ def test_v10_same_specific_invoice_need_can_still_merge():
 
     assert len(clusters) == 1
     assert {int(item["id"]) for item in clusters[0]} == {3521, 3522}
+
+
+
+def test_rebuild_can_refresh_demand_without_refreshing_market(monkeypatch):
+    events: list[str] = []
+    updates: list[dict] = []
+
+    monkeypatch.setattr(
+        routes_v12,
+        "run_demand_discovery",
+        lambda **kwargs: events.append("demand") or {
+            "retained_recent": 2,
+            "direct_demand_signals": 2,
+        },
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "_refresh_market_intelligence",
+        lambda progress_callback=None: (_ for _ in ()).throw(
+            AssertionError("market refresh must stay skipped")
+        ),
+    )
+    monkeypatch.setattr(
+        routes_v12,
+        "build_from_unlinked_evidence",
+        lambda: events.append("cluster") or {"candidate_groups": 1, "market_intel_links": 0},
+    )
+    monkeypatch.setattr(routes_v12, "_validate_recent_demand_candidates", lambda limit=100: {
+        "processed": 0,
+        "passed": 0,
+        "review_required": 0,
+        "rejected": 0,
+        "errors": 0,
+        "passed_ids": [],
+        "results": [],
+        "policy": "test",
+    })
+    monkeypatch.setattr(routes_v12, "_update_rebuild", lambda task_id, **values: updates.append(values))
+
+    routes_v12._run_rebuild(
+        task_id=789,
+        analyze_enabled=False,
+        limit=8,
+        refresh_enabled=True,
+        refresh_queries_per_probe=2,
+        market_refresh_enabled=False,
+    )
+
+    assert events == ["demand", "cluster"]
+    payload = routes_v12.loads(updates[-1]["result_json"], {})
+    assert payload["market_refresh"]["skipped"] is True
+    assert payload["market_refresh"]["reason"] == "refresh_market=false"
+
+
+def test_rebuild_candidate_selection_skips_current_snapshot_cards(monkeypatch):
+    monkeypatch.setattr(routes_v12, "list_opportunity_cards", lambda limit=500, current_only=True: [
+        {"opportunity_id": 85, "snapshot_current": True},
+        {"opportunity_id": 86, "snapshot_current": True},
+    ])
+
+    selected, skipped = routes_v12._select_agent_candidate_ids(
+        [85, 86, 101, 102],
+        limit=8,
+        reanalyze_current=False,
+    )
+
+    assert selected == [101, 102]
+    assert skipped == [85, 86]
+
+    forced, forced_skipped = routes_v12._select_agent_candidate_ids(
+        [85, 86, 101],
+        limit=2,
+        reanalyze_current=True,
+    )
+    assert forced == [85, 86]
+    assert forced_skipped == []

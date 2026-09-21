@@ -47,6 +47,8 @@ def _ensure_rebuild_schema() -> None:
                 current_opportunity_id INTEGER,
                 analyze_enabled INTEGER NOT NULL DEFAULT 1,
                 refresh_enabled INTEGER NOT NULL DEFAULT 1,
+                market_refresh_enabled INTEGER NOT NULL DEFAULT 1,
+                reanalyze_current INTEGER NOT NULL DEFAULT 0,
                 requested_limit INTEGER NOT NULL DEFAULT 8,
                 total INTEGER NOT NULL DEFAULT 0,
                 processed INTEGER NOT NULL DEFAULT 0,
@@ -62,6 +64,10 @@ def _ensure_rebuild_schema() -> None:
         columns = {str(row["name"]) for row in c.execute("PRAGMA table_info(opportunity_rebuild_tasks)").fetchall()}
         if "refresh_enabled" not in columns:
             c.execute("ALTER TABLE opportunity_rebuild_tasks ADD COLUMN refresh_enabled INTEGER NOT NULL DEFAULT 1")
+        if "market_refresh_enabled" not in columns:
+            c.execute("ALTER TABLE opportunity_rebuild_tasks ADD COLUMN market_refresh_enabled INTEGER NOT NULL DEFAULT 1")
+        if "reanalyze_current" not in columns:
+            c.execute("ALTER TABLE opportunity_rebuild_tasks ADD COLUMN reanalyze_current INTEGER NOT NULL DEFAULT 0")
 
 
 def _update_rebuild(task_id: int, **values: Any) -> None:
@@ -238,7 +244,34 @@ def _validate_recent_demand_candidates(limit: int = 100) -> dict[str, Any]:
     }
 
 
-def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enabled: bool, refresh_queries_per_probe: int) -> None:
+def _select_agent_candidate_ids(
+    passed_ids: list[int],
+    *,
+    limit: int,
+    reanalyze_current: bool,
+) -> tuple[list[int], list[int]]:
+    ordered = [int(value) for value in passed_ids]
+    if reanalyze_current:
+        return ordered[:limit], []
+
+    current_ids = {
+        int(card["opportunity_id"])
+        for card in list_opportunity_cards(limit=500, current_only=True)
+    }
+    skipped = [opportunity_id for opportunity_id in ordered if opportunity_id in current_ids]
+    selected = [opportunity_id for opportunity_id in ordered if opportunity_id not in current_ids][:limit]
+    return selected, skipped
+
+
+def _run_rebuild(
+    task_id: int,
+    analyze_enabled: bool,
+    limit: int,
+    refresh_enabled: bool,
+    refresh_queries_per_probe: int,
+    market_refresh_enabled: bool = True,
+    reanalyze_current: bool = False,
+) -> None:
     results: list[dict[str, Any]] = []
     discovery_result: dict[str, Any] | None = None
     try:
@@ -290,6 +323,7 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 ),
             )
 
+        if market_refresh_enabled:
             _update_rebuild(
                 task_id,
                 status="RUNNING",
@@ -334,10 +368,10 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 "results": [],
                 "summary": market_intel_summary(),
                 "skipped": True,
-                "reason": "refresh=false",
+                "reason": "refresh_market=false",
             }
 
-        _update_rebuild(task_id, status="RUNNING", progress=20, stage="重建候选", message="正在从最新真实需求与市场情报重建并匹配商机候选")
+        _update_rebuild(task_id, status="RUNNING", progress=20, stage="重建候选", message="正在从最新真实需求与已有市场情报重建并匹配商机候选")
         cluster_result = build_from_unlinked_evidence()
 
         _update_rebuild(
@@ -370,7 +404,11 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
             )
             return
 
-        ids = [int(value) for value in gate_a_result.get("passed_ids", [])[:limit]]
+        ids, skipped_current_ids = _select_agent_candidate_ids(
+            [int(value) for value in gate_a_result.get("passed_ids", [])],
+            limit=limit,
+            reanalyze_current=reanalyze_current,
+        )
         total = len(ids)
         worker_count = _rebuild_worker_count(total)
         _update_rebuild(
@@ -443,14 +481,21 @@ def _run_rebuild(task_id: int, analyze_enabled: bool, limit: int, refresh_enable
                 "recent_demand_days": _RECENT_DEMAND_DAYS,
                 "requires_explicit_or_probable_demand": True,
                 "requires_gate_a_pass": True,
+                "reanalyze_current": reanalyze_current,
+                "skip_current_snapshot_cards": not reanalyze_current,
+                "skipped_current_ids": skipped_current_ids,
                 "order": "Gate A PASS, signal_count, platform_diversity, trusted_trend, data_quality",
             },
         }
-        final_message = (
-            f"最近 {_RECENT_DEMAND_DAYS} 天没有 Gate A=PASS 的真实需求候选；未执行付费 Agent"
-            if total == 0
-            else f"处理 {total} 个商机：成功 {succeeded}，失败 {failed}；并发 {worker_count} 路"
-        )
+        if total == 0 and skipped_current_ids:
+            final_message = (
+                f"Gate A=PASS 候选均已有当前快照分析，跳过 {len(skipped_current_ids)} 个；"
+                "未重复执行付费 Agent"
+            )
+        elif total == 0:
+            final_message = f"最近 {_RECENT_DEMAND_DAYS} 天没有新的 Gate A=PASS 真实需求候选；未执行付费 Agent"
+        else:
+            final_message = f"处理 {total} 个新/变化商机：成功 {succeeded}，失败 {failed}；并发 {worker_count} 路"
         _update_rebuild(
             task_id,
             status=status,
@@ -489,6 +534,8 @@ def _rebuild_task_payload(task_id: int) -> dict[str, Any]:
     data = row_to_dict(row) or {}
     data["analyze_enabled"] = bool(data.get("analyze_enabled"))
     data["refresh_enabled"] = bool(data.get("refresh_enabled"))
+    data["market_refresh_enabled"] = bool(data.get("market_refresh_enabled"))
+    data["reanalyze_current"] = bool(data.get("reanalyze_current"))
     data["result"] = loads(data.pop("result_json", None), None)
     data["concurrency"] = _rebuild_worker_count(int(data.get("total") or data.get("requested_limit") or 0)) if data["analyze_enabled"] else 0
     current_id = data.get("current_opportunity_id")
@@ -650,6 +697,8 @@ def opportunity_watch_refresh(
 def opportunities_rebuild(
     analyze: bool = True,
     refresh: bool = True,
+    refresh_market: bool = True,
+    reanalyze_current: bool = False,
     limit: int = Query(default=8, ge=1, le=20),
     refresh_queries_per_probe: int = Query(default=3, ge=1, le=8),
 ):
@@ -691,17 +740,31 @@ def opportunities_rebuild(
             )
         cur = c.execute(
             """INSERT INTO opportunity_rebuild_tasks(
-                   status,progress,stage,message,analyze_enabled,refresh_enabled,requested_limit,created_at,updated_at
-               ) VALUES(?,?,?,?,?,?,?,?,?)""",
-            ("PENDING", 0, "排队", "等待刷新真实需求并重建", 1 if analyze else 0, 1 if refresh else 0, limit, now, now),
+                   status,progress,stage,message,analyze_enabled,refresh_enabled,market_refresh_enabled,
+                   reanalyze_current,requested_limit,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "PENDING", 0, "排队", "等待刷新真实需求并重建",
+                1 if analyze else 0,
+                1 if refresh else 0,
+                1 if refresh_market else 0,
+                1 if reanalyze_current else 0,
+                limit, now, now,
+            ),
         )
         task_id = int(cur.lastrowid)
-    threading.Thread(target=_run_rebuild, args=(task_id, analyze, limit, refresh, refresh_queries_per_probe), daemon=True).start()
+    threading.Thread(
+        target=_run_rebuild,
+        args=(task_id, analyze, limit, refresh, refresh_queries_per_probe, refresh_market, reanalyze_current),
+        daemon=True,
+    ).start()
     return {
         "task_id": task_id,
         "status": "PENDING",
         "analyze": analyze,
         "refresh": refresh,
+        "refresh_market": refresh_market,
+        "reanalyze_current": reanalyze_current,
         "limit": limit,
         "refresh_queries_per_probe": refresh_queries_per_probe,
         "concurrency": _rebuild_worker_count(limit) if analyze else 0,

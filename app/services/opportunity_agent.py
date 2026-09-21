@@ -19,9 +19,9 @@ from .quality import assert_real_opportunity_provenance
 AGENT_ORDER = ("signal", "pain", "market", "product", "risk", "judge")
 
 _AGENT_SYSTEM = {
-    "signal": """你是 Signal Agent。只依据输入中的真实 evidence digest 识别需求信号，不得编造搜索量、销量、用户量或趋势。输出 JSON 对象：signals(array of strings；每一项必须是字符串，不得输出对象), signal_strength(0-100), demand_pattern(string), evidence_refs(array of evidence ids), confidence(0-100), reasoning(string)。""",
+    "signal": """你是 Signal Agent。只依据输入中的真实 evidence digest 识别需求信号，不得编造搜索量、销量、用户量或趋势。输入中的 social_engagement 来自真实平台互动，只能作为注意力/热度佐证；点赞、收藏、评论不得当成独立需求人数、销量或支付证据。输出 JSON 对象：signals(array of strings；每一项必须是字符串，不得输出对象), signal_strength(0-100), demand_pattern(string), evidence_refs(array of evidence ids), confidence(0-100), reasoning(string)。""",
     "pain": """你是 Pain Agent。根据 Signal Agent 结果和真实 evidence digest 提取用户痛点。输出 JSON 对象：target_users(array), pain_points(array of objects with pain,severity 0-100,evidence_refs), urgency(0-100), confidence(0-100), reasoning(string)。不得补造未出现在证据中的事实。""",
-    "market": """你是 Market Agent。根据真实证据、Signal/Pain 结果和输入中的 market_intel 判断数字商品市场可做性。market_intel 中 heat_score 来自真实榜单/互动观测；sales_count 只有 sales_verified=true 时才可引用，并且必须保留 sales_scope（listing/shop/account）的语义，严禁把 shop 销量写成单商品销量。特别注意：matched_count=0、没有 heat、没有 verified sales 时，只能说明“当前没有可验证市场供给证据”，不能据此推断低竞争、蓝海、无人供给或 first mover；competition_level 在这种情况下必须表达高度不确定，而不是因为缺数据而自动给低值。所有评分都是判断，不是市场事实。输出 JSON：category(string), market_score(0-100), purchase_intent(0-100), competition_level(0-100), competition_gaps(array of strings), buyer_profile(array of strings；每一项必须是字符串，不能是对象), confidence(0-100), reasoning(string)。不得编造销量、GMV、搜索量或竞品数量。""",
+    "market": """你是 Market Agent。根据真实证据、Signal/Pain 结果和输入中的 market_intel 判断数字商品市场可做性。real_metrics.social_engagement 来自小红书等真实社交平台互动，只能表示注意力/内容热度，绝不能当成销量、GMV、买家数或独立需求数。market_intel 中 heat_score 来自真实榜单/互动观测；sales_count 只有 sales_verified=true 时才可引用，并且必须保留 sales_scope（listing/shop/account）的语义，严禁把 shop 销量写成单商品销量。特别注意：matched_count=0、没有 heat、没有 verified sales 时，只能说明“当前没有可验证市场供给证据”，不能据此推断低竞争、蓝海、无人供给或 first mover；competition_level 在这种情况下必须表达高度不确定，而不是因为缺数据而自动给低值。所有评分都是判断，不是市场事实。输出 JSON：category(string), market_score(0-100), purchase_intent(0-100), competition_level(0-100), competition_gaps(array of strings), buyer_profile(array of strings；每一项必须是字符串，不能是对象), confidence(0-100), reasoning(string)。不得编造销量、GMV、搜索量或竞品数量。""",
     "product": """你是 Product Agent。把已识别痛点转成可以原创、合法、低售后、可自动交付、并且当前系统能真实生成文件的数字商品。format 只能是 xlsx、csv、markdown、txt、json、python、javascript、html、css、yaml 之一；不得推荐 Canva/Figma/PSD/字体/图片素材/音视频/Notion 原生模板等当前系统无法真实构建的格式。多个候选都被证据支持时，primary_product 依次优先：证据贴合度、支付意愿、低外部平台依赖、低法律/专业责任、低售后、可自动交付。不要推荐 MSA/合同条款/隐私政策/法律文书/税务或专业财务意见等可能被误认为专业意见的模板；可以推荐纯运营清单、字段结构或非专业信息指南。若证据涉及非官方 API、易封禁平台或频繁变化的第三方规则，除非它是唯一能解决核心痛点的方案，否则不要把其作为 primary_product。输出 JSON：recommended_products(array of objects with name,format,why,deliverables；其中 deliverables 必须是 array of strings，不能是单个字符串), primary_product(string), price_range(object with currency,min,max,reason), production_complexity(0-100), automation_fit(0-100), confidence(0-100), reasoning(string)。primary_product 必须与 recommended_products 中一个 name 完全对应。禁止推荐盗版、破解、账号、未授权资料包。""",
     "risk": """你是 Risk Agent。你评估的是输入中的 primary_product 作为当前准备上线商品的风险，不是整个候选产品列表。审查版权、平台合规、市场饱和、需求真实性、售后和支付意愿风险。只有确实适用于 primary_product 的问题才能计入 risk_score、warnings 或 blockers；不要因为未被选中的备选商品存在法律/平台风险而抬高主产品风险。没有销量/支付证据仍应真实计入支付风险。输出 JSON：risk_score(0-100), copyright_risk(0-100), saturation_risk(0-100), payment_risk(0-100), platform_risks(array), warnings(array), blockers(array), confidence(0-100), reasoning(string)。高风险必须明确说明。""",
     "judge": """你是 Judge Agent。综合前五个 Agent 和真实证据指标，判断输入中的 primary_product 是否值得进入真实生产链。最终分数和 BUILD/WATCH/DROP 必须围绕 primary_product，而不是因为未选择的备选商品有风险就否决主产品。仍需严格考虑真实需求深度、支付证据、market_intel、主产品的平台依赖、售后和合规风险；证据不足时优先 WATCH 或 DROP，不得为了产生 BUILD 而放宽标准。你会收到 decision_policy，必须让 decision 与 final_score/market_score/risk_score 一致；如果模型主观判断与正式阈值冲突，正式阈值优先。输出 JSON：final_score(0-100), decision(BUILD|WATCH|DROP), confidence(0-100), title(string), category(string), summary(string), reasoning(string)。不得把 AI 判断包装成事实。""",
@@ -387,6 +387,60 @@ def _compact_text(value: Any, limit: int) -> str:
     return text[:limit]
 
 
+def _engagement_number(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        text = value.strip().lower().replace(",", "")
+        multiplier = 1.0
+        if text.endswith("万"):
+            multiplier, text = 10_000.0, text[:-1]
+        elif text.endswith("k"):
+            multiplier, text = 1_000.0, text[:-1]
+        elif text.endswith("m"):
+            multiplier, text = 1_000_000.0, text[:-1]
+        try:
+            return max(0.0, float(text) * multiplier)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _real_engagement_metrics(evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    totals: Counter[str] = Counter()
+    xhs_rows: list[dict[str, Any]] = []
+    for item in evidence:
+        engagement = item.get("engagement") or {}
+        if not isinstance(engagement, dict):
+            continue
+        for key in ("likes", "comments", "favorites", "shares", "views", "score"):
+            value = _engagement_number(engagement.get(key))
+            if value > 0:
+                totals[key] += value
+        if str(item.get("platform") or "").lower() == "xiaohongshu":
+            likes = _engagement_number(engagement.get("likes"))
+            if likes > 0:
+                xhs_rows.append({
+                    "evidence_id": item.get("id"),
+                    "likes": round(likes, 2),
+                    "title": _compact_text(item.get("title"), 160),
+                    "relation_type": item.get("relation_type"),
+                })
+    xhs_rows.sort(key=lambda row: float(row["likes"]), reverse=True)
+    return {
+        "metric_totals": {key: round(float(value), 2) for key, value in sorted(totals.items())},
+        "xiaohongshu": {
+            "evidence_with_likes": len(xhs_rows),
+            "likes_total": round(sum(float(row["likes"]) for row in xhs_rows), 2),
+            "max_likes": round(max((float(row["likes"]) for row in xhs_rows), default=0.0), 2),
+            "top_liked_evidence": xhs_rows[:5],
+        },
+        "semantics": "real platform interaction only; never sales, buyer count, GMV, or independent-demand count",
+    }
+
+
 def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
     opportunity = get_opportunity(opportunity_id)
     if not opportunity:
@@ -416,6 +470,8 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
                 "intent_class": item.get("intent_class"),
                 "intent_confidence": item.get("intent_confidence"),
                 "quality": item.get("evidence_quality_score"),
+                "relation_type": item.get("relation_type"),
+                "engagement": item.get("engagement") or {},
                 "author": item.get("author"),
                 "published_at": item.get("published_at"),
                 "title": _compact_text(item.get("title"), 220),
@@ -424,6 +480,7 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
             }
         )
 
+    social_engagement = _real_engagement_metrics(evidence)
     market_intel = market_intel_for_opportunity(opportunity_id)
 
     snapshot_hash = stable_hash(
@@ -462,6 +519,7 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
             "platform_counts": dict(platforms),
             "unique_authors": len(authors),
             "intent_counts": dict(intents),
+            "social_engagement": social_engagement,
         },
         "evidence": snippets,
         "market_intel": market_intel,

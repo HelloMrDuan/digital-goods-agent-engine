@@ -132,24 +132,26 @@ def doctor() -> dict[str, Any]:
         opencli = _opencli_doctor()
 
         if opencli.get("installed"):
+            connected = bool(opencli.get("connected"))
+            channel_status = "ok" if connected else "not_connected"
             return {
                 "installed": True,
-                "status": "OK",
+                "status": "OK" if connected else "NOT_CONNECTED",
                 "channels": {
                     "xiaohongshu": {
-                        "effective_status": "ok",
+                        "effective_status": channel_status,
                         "effective_backend": "OpenCLI Browser Bridge",
-                        "opencli_connected": opencli.get("connected", False),
+                        "opencli_connected": connected,
                     },
                     "reddit": {
-                        "effective_status": "ok",
+                        "effective_status": channel_status,
                         "effective_backend": "OpenCLI Browser Bridge",
-                        "opencli_connected": opencli.get("connected", False),
+                        "opencli_connected": connected,
                     },
                     "xianyu": {
-                        "effective_status": "ok",
+                        "effective_status": channel_status,
                         "effective_backend": "OpenCLI Browser Bridge",
-                        "opencli_connected": opencli.get("connected", False),
+                        "opencli_connected": connected,
                     },
                 },
                 "opencli": opencli,
@@ -233,6 +235,19 @@ def _parse_output(text: str) -> Any:
         return yaml.safe_load(text)
     except Exception:
         return {"text": text}
+
+
+def _payload_shape(value: Any) -> str:
+    if isinstance(value, list):
+        if not value:
+            return "list[0]"
+        first = value[0]
+        if isinstance(first, dict):
+            return "list[dict] keys=" + ",".join(sorted(str(k) for k in first.keys())[:12])
+        return f"list[{type(first).__name__}]"
+    if isinstance(value, dict):
+        return "dict keys=" + ",".join(sorted(str(k) for k in value.keys())[:16])
+    return type(value).__name__
 
 
 def _flatten_candidate_items(value: Any) -> list[dict[str, Any]]:
@@ -396,7 +411,7 @@ def _commands(platform: str, query: str, limit: int, active_backend: str) -> lis
     cmds: list[list[str]] = []
     if platform == "xiaohongshu":
         if "opencli" in b or (not b and shutil.which("opencli")):
-            cmds.append(["opencli", "xiaohongshu", "search", query, "-f", "yaml"])
+            cmds.append(["opencli", "xiaohongshu", "search", query, "--limit", str(limit), "-f", "json"])
         if "mcp" in b or "xiaohongshu" in b or (not b and shutil.which("mcporter")):
             call = f'xiaohongshu.search_feeds(keyword: {json.dumps(query, ensure_ascii=False)})'
             cmds.append(["mcporter", "call", call, "--timeout", "120000"])
@@ -646,7 +661,10 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
                     elif platform == "xianyu":
                         search_items = _enrich_xianyu_details(search_items, max(0, int(detail_limit)))
                 return search_items
-            errors.append(f"{cmd[0]} returned no parseable real items")
+            errors.append(
+                f"{cmd[0]} returned no parseable real items "
+                f"(raw_items={len(raw_items)}, payload={_payload_shape(body)})"
+            )
         except Exception as exc:
             errors.append(f"{cmd[0]}: {exc}")
     raise CollectorError("Agent-Reach real collection failed: " + " | ".join(errors))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -426,3 +427,56 @@ def test_normal_empty_or_success_does_not_trip_parse_failure_circuit():
 
     assert is_open is False
     assert reason is None
+
+
+
+def test_xiaohongshu_opencli_command_uses_current_json_contract(monkeypatch):
+    from app.collectors import agent_reach
+
+    monkeypatch.setattr(agent_reach.shutil, "which", lambda name: f"C:/tools/{name}.cmd" if name == "opencli" else None)
+    commands = agent_reach._commands(
+        "xiaohongshu",
+        "求 Excel 模板",
+        12,
+        "OpenCLI Browser Bridge",
+    )
+
+    assert commands == [[
+        "opencli",
+        "xiaohongshu",
+        "search",
+        "求 Excel 模板",
+        "--limit",
+        "12",
+        "-f",
+        "json",
+    ]]
+
+
+def test_opencli_installed_but_disconnected_is_not_channel_ready(monkeypatch):
+    from app.collectors import agent_reach
+
+    monkeypatch.setattr(agent_reach.shutil, "which", lambda name: None if name == "agent-reach" else "opencli.cmd")
+    monkeypatch.setattr(
+        agent_reach,
+        "_opencli_doctor",
+        lambda: {
+            "installed": True,
+            "connected": False,
+            "status": "NOT_CONNECTED",
+        },
+    )
+
+    status = agent_reach.doctor()
+
+    assert status["status"] == "NOT_CONNECTED"
+    assert status["channels"]["xiaohongshu"]["effective_status"] == "not_connected"
+    assert status["channels"]["xiaohongshu"]["opencli_connected"] is False
+
+
+def test_payload_shape_exposes_opencli_schema_drift():
+    from app.collectors import agent_reach
+
+    assert agent_reach._payload_shape([
+        {"noteId": "1", "title": "hello", "author": "buyer"}
+    ]) == "list[dict] keys=author,noteId,title"

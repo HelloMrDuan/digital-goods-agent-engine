@@ -573,3 +573,45 @@ def test_risk_and_judge_receive_primary_product_not_full_alternatives(monkeypatc
         assert captured[name]["primary_product"]["product"]["name"] == "Payroll Overtime Workbook"
         assert "product" not in captured[name]
         assert "recommended_products" not in captured[name]["primary_product"]
+
+
+
+def test_market_prompt_forbids_zero_market_intel_blue_ocean_inference():
+    prompt = opportunity_agent._AGENT_SYSTEM["market"]
+    assert "matched_count=0" in prompt
+    assert "不能据此推断低竞争" in prompt
+    assert "蓝海" in prompt
+
+
+def test_judge_payload_includes_deterministic_decision_policy(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+    captured = {}
+
+    def recording_chat(**kwargs):
+        name = str(kwargs["operation"]).replace("opportunity_agent_", "")
+        if name == "judge":
+            captured["judge"] = kwargs.get("payload") or {}
+        return _fake_chat(**kwargs)
+
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", recording_chat)
+    opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+
+    policy = captured["judge"]["decision_policy"]
+    assert policy["build_if_final_gte"] == float(settings.agent_build_score)
+    assert policy["build_if_market_gte"] == float(settings.agent_build_market_score)
+    assert policy["watch_if_final_gte"] == float(settings.agent_watch_score)
+    assert policy["drop_if_risk_gte"] == float(settings.high_risk_threshold)
+
+
+def test_decision_consistency_flags_judge_label_score_mismatch():
+    value = opportunity_agent._decision_consistency(
+        "WATCH",
+        final_score=48,
+        market_score=72,
+        risk_score=42,
+    )
+    assert value == {
+        "proposed": "WATCH",
+        "deterministic": "DROP",
+        "matches_policy": False,
+    }

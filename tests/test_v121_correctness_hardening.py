@@ -647,3 +647,91 @@ def test_watch_refresh_reclusters_revalidates_and_reanalyzes(monkeypatch):
     assert result["resolved_opportunity_id"] == 52
     assert result["gate_a"]["decision"] == "PASS"
     assert result["analysis"]["analysis"]["decision"] == "BUILD"
+
+
+
+def test_v10_provenance_topic_is_metadata_only_in_similarity_vector():
+    now = datetime.now(timezone.utc)
+    row = {
+        **_cluster_test_row(
+            3501,
+            "Need invoice billing automation",
+            "Need a billing workflow for my business.",
+            now,
+        ),
+        "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+    }
+
+    vectors, _, _ = clustering._legacy._build_vectors([row])
+
+    assert vectors[0]["@demand_topic:invoice_contract_workflow"] == 0.0
+
+
+def test_v10_same_broad_invoice_topic_does_not_force_unrelated_workflows_to_merge():
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            **_cluster_test_row(
+                3511,
+                "Complex billing tier breaks and rollover credits",
+                "Need billing calculations for tier breaks, rollover credits, and mid-month adjustments.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+        },
+        {
+            **_cluster_test_row(
+                3512,
+                "Invoice email registration into project board",
+                "Need invoice attachments extracted from email and registered into a project management board.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+        },
+        {
+            **_cluster_test_row(
+                3513,
+                "Event decor invoice and contract catalog",
+                "Need invoicing for party rentals with an item catalog and rental contract.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+        },
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+    groups = [{int(item["id"]) for item in cluster} for cluster in clusters]
+
+    assert len(clusters) == 3
+    assert {3511} in groups
+    assert {3512} in groups
+    assert {3513} in groups
+
+
+def test_v10_same_specific_invoice_need_can_still_merge():
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            **_cluster_test_row(
+                3521,
+                "Need complex billing with tier breaks and rollover credits",
+                "Our invoice calculation breaks on tiered pricing and rollover credits.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+        },
+        {
+            **_cluster_test_row(
+                3522,
+                "Billing engine for tier breaks and rollover credits",
+                "Looking for invoice automation that supports tiered pricing, rollover credits and adjustments.",
+                now,
+            ),
+            "raw_json": '{"_corroboration_topic":"invoice_contract_workflow"}',
+        },
+    ]
+
+    clusters, _, _ = clustering._legacy._cluster_rows(rows)
+
+    assert len(clusters) == 1
+    assert {int(item["id"]) for item in clusters[0]} == {3521, 3522}

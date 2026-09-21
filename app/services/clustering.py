@@ -8,7 +8,7 @@ from ..config import settings
 from ..db import conn, loads, now_iso, row_to_dict, stable_hash
 from . import clustering_legacy as _legacy
 
-_METHOD = "real_evidence_tfidf_v9_topic_provenance"
+_METHOD = "real_evidence_tfidf_v10_provenance_guard"
 _CONTEXT_MIN_QUALITY = 45.0
 
 
@@ -91,10 +91,11 @@ def _existing_for_cluster(c, evidence_ids: list[int], candidate_key: str) -> int
                 JOIN opportunities o ON o.id=oe.opportunity_id
                 WHERE oe.evidence_id IN ({placeholders})
                   AND oe.relation_type IN ('demand','context')
-                  AND o.cluster_method IN (?,?,?,?,?,?,?,?,?)
+                  AND o.cluster_method IN (?,?,?,?,?,?,?,?,?,?)
                 GROUP BY oe.opportunity_id ORDER BY overlap_count DESC""",
             tuple(evidence_ids) + (
                 _METHOD,
+                "real_evidence_tfidf_v9_topic_provenance",
                 "real_evidence_tfidf_v8_topic_guard",
                 "real_evidence_tfidf_v7_semantic_topic",
                 "real_evidence_tfidf_v6_evidence_first",
@@ -142,7 +143,7 @@ def rebuild_clusters() -> dict[str, Any]:
         # transaction. If any cluster fails, rollback restores the previously active set.
         with conn() as c:
             c.execute(
-                "UPDATE opportunities SET cluster_active=0 WHERE cluster_method IN (?,?,?,?,?,?,?,?,?)",
+                "UPDATE opportunities SET cluster_active=0 WHERE cluster_method IN (?,?,?,?,?,?,?,?,?,?)",
                 (
                     _METHOD,
                     "real_evidence_tfidf_v8_topic_guard",
@@ -158,7 +159,7 @@ def rebuild_clusters() -> dict[str, Any]:
             for cluster in clusters:
                 rep = _legacy._representative(cluster, vectors)
                 signature = _legacy._signature(cluster)
-                candidate_key = stable_hash("cluster-v9-topic-provenance", signature)
+                candidate_key = stable_hash("cluster-v10-provenance-guard", signature)
                 evidence_ids = sorted({int(row["id"]) for row in cluster})
                 support_ids = _legacy._support_matches(cluster, support_rows, vectors, idf)
                 platforms = {row.get("platform") for row in cluster if row.get("platform")}

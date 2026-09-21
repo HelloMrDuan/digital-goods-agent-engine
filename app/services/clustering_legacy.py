@@ -149,8 +149,10 @@ def _concept_keys(vector: dict[str, float]) -> set[str]:
 
 def _shared_business_topic(a: dict[str, float], b: dict[str, float]) -> bool:
     shared = _concept_keys(a) & _concept_keys(b)
-    if any(token.startswith("@demand_topic:") for token in shared):
-        return True
+    # Provenance topics are boundary guards only. They must never by themselves
+    # lower the semantic similarity floor, otherwise every invoice/billing post
+    # becomes one commercial opportunity regardless of persona or workflow.
+    shared = {token for token in shared if not token.startswith("@demand_topic:")}
     if shared & _STRONG_TOPIC_CONCEPTS:
         return True
     # Generic concepts can corroborate each other only when there is more than one
@@ -162,9 +164,9 @@ def _topic_compatible(a: dict[str, float], b: dict[str, float], cosine: float) -
     """Hard semantic guard applied before any cluster merge.
 
     V7 only consulted semantic topics when cosine fell below the normal threshold.
-    That allowed unrelated workflow requests to merge whenever generic wording pushed
-    cosine above the threshold. V8 requires a compatible business topic regardless of
-    cosine, except for near-duplicate text with very high lexical similarity.
+    V8/V9 made topic compatibility a hard guard. V10 keeps that hard boundary but
+    treats provenance as metadata only: sharing a broad topic never increases cosine
+    or lowers the similarity requirement by itself.
     """
     ca = _concept_keys(a)
     cb = _concept_keys(b)
@@ -279,13 +281,10 @@ def _topic_token(row: dict[str, Any]) -> str | None:
 
 
 def _build_vectors(rows: list[dict[str, Any]]) -> tuple[list[dict[str, float]], dict[str, float], Counter[str]]:
-    doc_sets = []
-    for row in rows:
-        tokens = _tokens((row.get("title") or "") + " " + (row.get("content") or "")[:1000])
-        topic = _topic_token(row)
-        if topic:
-            tokens.add(topic)
-        doc_sets.append(tokens)
+    doc_sets = [
+        _tokens((row.get("title") or "") + " " + (row.get("content") or "")[:1000])
+        for row in rows
+    ]
     df = Counter(t for toks in doc_sets for t in toks)
     n = max(1, len(rows))
     idf = {t: math.log((n + 1) / (cnt + 1)) + 1.0 for t, cnt in df.items()}
@@ -294,7 +293,9 @@ def _build_vectors(rows: list[dict[str, Any]]) -> tuple[list[dict[str, float]], 
         vector = _vector(row.get("title") or "", row.get("content") or "", idf)
         topic = _topic_token(row)
         if topic:
-            vector[topic] = max(vector.get(topic, 0.0), idf.get(topic, 1.0) * 5.0)
+            # Metadata-only marker: topic provenance participates in the hard
+            # compatibility guard but contributes zero cosine weight.
+            vector[topic] = 0.0
         vecs.append(vector)
     return vecs, idf, df
 

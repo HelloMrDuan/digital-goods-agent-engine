@@ -241,6 +241,63 @@ def test_agent_schema_rejects_extra_fields(monkeypatch):
 
 
 
+
+def test_real_xiaohongshu_likes_reach_agent_digest_without_becoming_sales(monkeypatch):
+    monkeypatch.setattr(
+        opportunity_agent,
+        "get_opportunity",
+        lambda oid: {
+            "id": oid,
+            "title": "Excel template demand",
+            "normalized_need": "Excel template",
+            "cluster_signature": "excel-template",
+            "trend_score": 70.0,
+            "trusted_trend_score": 61.0,
+            "data_quality_score": 80.0,
+            "current_7d": 4,
+            "previous_7d": 2,
+            "growth_7d_pct": 100.0,
+        },
+    )
+    monkeypatch.setattr(opportunity_agent, "assert_real_opportunity_provenance", lambda oid: None)
+    monkeypatch.setattr(
+        opportunity_agent,
+        "get_evidence_for_opportunity",
+        lambda oid, limit: [{
+            "id": 501,
+            "platform": "xiaohongshu",
+            "relation_type": "support",
+            "content_kind": "post",
+            "intent_class": "context",
+            "intent_confidence": 0.9,
+            "evidence_quality_score": 88.0,
+            "author": "real-author",
+            "published_at": "2026-09-20",
+            "title": "高赞 Excel 模板分享",
+            "content": "真实小红书搜索结果",
+            "source_url": "https://www.xiaohongshu.com/search_result/real-note",
+            "engagement": {"likes": "6.7万", "comments": "120"},
+            "raw_hash": "real-hash",
+        }],
+    )
+    monkeypatch.setattr(
+        opportunity_agent,
+        "market_intel_for_opportunity",
+        lambda oid: {"matched_count": 0, "items": []},
+    )
+
+    digest = opportunity_agent.build_evidence_digest(123)
+    social = digest["real_metrics"]["social_engagement"]
+
+    assert social["xiaohongshu"]["evidence_with_likes"] == 1
+    assert social["xiaohongshu"]["likes_total"] == 67000.0
+    assert social["xiaohongshu"]["max_likes"] == 67000.0
+    assert social["metric_totals"]["comments"] == 120.0
+    assert "sales" not in social["metric_totals"]
+    assert "never sales" in social["semantics"]
+    assert digest["evidence"][0]["engagement"]["likes"] == "6.7万"
+
+
 def test_market_intel_reaches_market_and_judge_agents(monkeypatch):
     opportunity_id = _opportunity_id(2)
     captured = {}

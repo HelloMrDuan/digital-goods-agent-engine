@@ -504,7 +504,7 @@ def test_opencli_empty_list_is_normal_empty_not_parse_failure(monkeypatch):
     monkeypatch.setattr(
         agent_reach,
         "_commands",
-        lambda platform, query, limit, active_backend: [[
+        lambda platform, query, limit, active_backend, sort=None: [[
             "opencli", "xiaohongshu", "search", query, "--limit", str(limit), "-f", "json"
         ]],
     )
@@ -536,7 +536,7 @@ def test_nonempty_unparseable_payload_still_counts_as_parse_failure(monkeypatch)
     monkeypatch.setattr(
         agent_reach,
         "_commands",
-        lambda platform, query, limit, active_backend: [[
+        lambda platform, query, limit, active_backend, sort=None: [[
             "opencli", "xiaohongshu", "search", query, "--limit", str(limit), "-f", "json"
         ]],
     )

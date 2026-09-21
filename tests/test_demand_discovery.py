@@ -362,3 +362,67 @@ def test_targeted_watch_corroboration_rejects_mixed_demand_topics(monkeypatch):
 
     with pytest.raises(ValueError, match="multiple deterministic demand topics"):
         demand_discovery._opportunity_corroboration_topic(80)
+
+
+
+def test_parse_failure_circuit_breaker_disables_broken_platform_for_run(monkeypatch):
+    monkeypatch.setattr(demand_discovery, "agent_reach_doctor", lambda: {
+        "opencli": {"connected": True},
+        "channels": {},
+    })
+    calls = {"xiaohongshu": 0, "reddit": 0}
+    corroboration_platforms = []
+
+    def fake_collect(platform, query, limit=20, **kwargs):
+        calls[platform] += 1
+        if platform == "xiaohongshu":
+            raise RuntimeError(
+                "Agent-Reach real collection failed: opencli returned no parseable real items"
+            )
+        return [
+            _item(
+                f"reddit-{calls[platform]}",
+                f"author-{calls[platform]}",
+                1,
+                platform=platform,
+            )
+        ]
+
+    def fake_corroboration(platforms, progress_callback=None):
+        corroboration_platforms.extend(sorted(platforms))
+        return {
+            "topics": [],
+            "queries": 0,
+            "direct_demand_signals": 0,
+        }
+
+    monkeypatch.setattr(demand_discovery, "collect_agent_reach", fake_collect)
+    monkeypatch.setattr(demand_discovery, "_run_dynamic_corroboration", fake_corroboration)
+
+    result = demand_discovery.run_demand_discovery(max_queries_per_probe=3)
+
+    assert calls["xiaohongshu"] <= 2
+    assert calls["reddit"] == 6
+    assert "xiaohongshu" in result["disabled_platforms_this_run"]
+    assert result["corroboration_platforms"] == ["reddit"]
+    assert corroboration_platforms == ["reddit"]
+    assert result["status"] == "PARTIAL"
+
+
+def test_normal_empty_or_success_does_not_trip_parse_failure_circuit():
+    state = {
+        "lock": threading.Lock(),
+        "parse_failures": {},
+        "disabled": {},
+    }
+    demand_discovery._record_platform_query_result(state, "xiaohongshu", None)
+    demand_discovery._record_platform_query_result(
+        state,
+        "xiaohongshu",
+        "EMPTY_RESULT: no matching posts",
+    )
+
+    is_open, reason = demand_discovery._platform_circuit_open(state, "xiaohongshu")
+
+    assert is_open is False
+    assert reason is None

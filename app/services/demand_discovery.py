@@ -298,11 +298,55 @@ def _intent_counts(evidence_ids: list[int]) -> dict[str, int]:
     return result
 
 
+_PLATFORM_PARSE_FAILURE_THRESHOLD = 2
+
+
+def _is_platform_parse_failure(error: str | None) -> bool:
+    text = str(error or "").lower()
+    return "no parseable real items" in text
+
+
+def _platform_circuit_open(
+    state: dict[str, Any] | None,
+    platform: str,
+) -> tuple[bool, str | None]:
+    if not state:
+        return False, None
+    lock = state["lock"]
+    with lock:
+        reason = (state.get("disabled") or {}).get(platform)
+    return bool(reason), str(reason) if reason else None
+
+
+def _record_platform_query_result(
+    state: dict[str, Any] | None,
+    platform: str,
+    error: str | None,
+) -> None:
+    if not state:
+        return
+    lock = state["lock"]
+    with lock:
+        failures = state.setdefault("parse_failures", {})
+        disabled = state.setdefault("disabled", {})
+        if _is_platform_parse_failure(error):
+            count = int(failures.get(platform) or 0) + 1
+            failures[platform] = count
+            if count >= _PLATFORM_PARSE_FAILURE_THRESHOLD and platform not in disabled:
+                disabled[platform] = (
+                    f"{platform} disabled for this discovery run after {count} consecutive "
+                    "OpenCLI parse failures"
+                )
+        elif error is None:
+            failures[platform] = 0
+
+
 def _collect_probe(
     probe: dict[str, Any],
     *,
     queries: tuple[str, ...] | list[str] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    platform_circuit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source = _source_for_probe(probe)
     started = now_iso()
@@ -317,13 +361,21 @@ def _collect_probe(
     raw_items: list[CollectedItem] = []
     query_errors: list[str] = []
     selected_queries = list(queries if queries is not None else probe["queries"])
+    attempted_queries = 0
+    circuit_reason: str | None = None
     for query_index, query in enumerate(selected_queries, start=1):
+        platform = str(probe["platform"])
+        is_open, circuit_reason = _platform_circuit_open(platform_circuit, platform)
+        if is_open:
+            break
+
+        attempted_queries += 1
         query_started = time.monotonic()
         fetched = 0
         error: str | None = None
         try:
             items = collect_agent_reach(
-                str(probe["platform"]),
+                platform,
                 str(query),
                 limit=int(probe["per_query_limit"]),
                 enrich=False,
@@ -334,10 +386,11 @@ def _collect_probe(
             error = str(exc)
             query_errors.append(f"{query}: {error}")
         finally:
+            _record_platform_query_result(platform_circuit, platform, error)
             if progress_callback is not None:
                 progress_callback({
                     "source_name": probe["name"],
-                    "platform": probe["platform"],
+                    "platform": platform,
                     "query": str(query),
                     "query_index": query_index,
                     "query_total": len(selected_queries),
@@ -346,13 +399,17 @@ def _collect_probe(
                     "duration_ms": int((time.monotonic() - query_started) * 1000),
                 })
 
+        is_open, circuit_reason = _platform_circuit_open(platform_circuit, platform)
+        if is_open:
+            break
+
     retained = _prepare_items(raw_items, int(probe["limit"]))
     stats = ingest_items(source, retained)
     observed_ids = [int(x) for x in stats.get("observed_evidence_ids") or []]
     intents = _intent_counts(observed_ids)
     unique_authors = len({str(item.author).strip().lower() for item in retained if item.author and str(item.author).strip()})
     duration_ms = int((time.monotonic() - t0) * 1000)
-    all_queries_failed = bool(selected_queries) and len(query_errors) == len(selected_queries)
+    all_queries_failed = bool(attempted_queries) and len(query_errors) == attempted_queries
     if retained:
         status = "SUCCESS"
     elif all_queries_failed:
@@ -387,8 +444,11 @@ def _collect_probe(
         "source_name": probe["name"],
         "platform": probe["platform"],
         "status": status,
-        "queries": len(selected_queries),
+        "queries": attempted_queries,
+        "queries_planned": len(selected_queries),
         "query_failures": len(query_errors),
+        "circuit_open": bool(circuit_reason),
+        "circuit_reason": circuit_reason,
         "raw_fetched": len(raw_items),
         "retained_recent": len(retained),
         "unique_authors": unique_authors,
@@ -780,6 +840,11 @@ def run_demand_discovery(
         if progress_callback is not None:
             progress_callback(payload)
 
+    platform_circuit: dict[str, Any] = {
+        "lock": threading.Lock(),
+        "parse_failures": {},
+        "disabled": {},
+    }
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(probes))), thread_name_prefix="demand-discovery") as pool:
         futures = {
@@ -788,6 +853,7 @@ def run_demand_discovery(
                 probe,
                 queries=query_plan[str(probe["name"])],
                 progress_callback=emit_query_progress,
+                platform_circuit=platform_circuit,
             ): probe
             for probe in probes
         }
@@ -815,8 +881,11 @@ def run_demand_discovery(
         errors = "; ".join(str(x.get("error") or "collection failed") for x in results)
         raise RuntimeError(f"fresh demand discovery failed: {errors}")
 
+    with platform_circuit["lock"]:
+        disabled_platforms = dict(platform_circuit.get("disabled") or {})
+    corroboration_platforms = set(ready_platforms) - set(disabled_platforms)
     corroboration = _run_dynamic_corroboration(
-        ready_platforms,
+        corroboration_platforms,
         progress_callback=progress_callback,
     )
     direct_signals += int(corroboration.get("direct_demand_signals") or 0)
@@ -828,6 +897,8 @@ def run_demand_discovery(
         "max_queries_per_probe": max_queries_per_probe,
         "total_queries": total_queries + int(corroboration.get("queries") or 0),
         "ready_platforms": sorted(ready_platforms),
+        "corroboration_platforms": sorted(corroboration_platforms),
+        "disabled_platforms_this_run": disabled_platforms,
         "probes": results,
         "probe_count": len(results),
         "successful_probes": len(successful),

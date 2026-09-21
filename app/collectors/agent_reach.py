@@ -418,12 +418,25 @@ def _run(cmd: list[str], timeout: int = 150) -> Any:
     return _parse_output(stdout)
 
 
-def _commands(platform: str, query: str, limit: int, active_backend: str) -> list[list[str]]:
+def _commands(platform: str, query: str, limit: int, active_backend: str, sort: str | None = None) -> list[list[str]]:
     b = active_backend.lower()
     cmds: list[list[str]] = []
     if platform == "xiaohongshu":
+        xhs_sort = str(sort or "comprehensive").strip().lower()
+        allowed_sorts = {"comprehensive", "latest", "most-liked", "most-commented", "most-collected"}
+        if xhs_sort not in allowed_sorts:
+            raise CollectorError(
+                "unsupported Xiaohongshu sort: "
+                + xhs_sort
+                + "; expected one of "
+                + ", ".join(sorted(allowed_sorts))
+            )
         if "opencli" in b or (not b and shutil.which("opencli")):
-            cmds.append(["opencli", "xiaohongshu", "search", query, "--limit", str(limit), "-f", "json"])
+            cmd = ["opencli", "xiaohongshu", "search", query, "--limit", str(limit)]
+            if xhs_sort != "comprehensive":
+                cmd.extend(["--sort", xhs_sort])
+            cmd.extend(["-f", "json"])
+            cmds.append(cmd)
         if "mcp" in b or "xiaohongshu" in b or (not b and shutil.which("mcporter")):
             call = f'xiaohongshu.search_feeds(keyword: {json.dumps(query, ensure_ascii=False)})'
             cmds.append(["mcporter", "call", call, "--timeout", "120000"])
@@ -617,7 +630,16 @@ def _enrich_opencli(platform: str, parents: list[CollectedItem], detail_limit: i
     return out
 
 
-def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False, detail_limit: int = 8, comments_limit: int = 15) -> list[CollectedItem]:
+def collect(
+    platform: str,
+    query: str,
+    limit: int = 20,
+    *,
+    enrich: bool = False,
+    detail_limit: int = 8,
+    comments_limit: int = 15,
+    sort: str | None = None,
+) -> list[CollectedItem]:
     """Collect real platform results through Agent-Reach-selected upstream tools.
 
     Agent-Reach is a router/installer rather than a data proxy. We run its doctor first,
@@ -628,7 +650,10 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
         base = settings.agent_reach_bridge_url.strip().rstrip("/")
         try:
             with httpx.Client(timeout=190, headers=_bridge_headers()) as client:
-                resp = client.post(base + "/collect", json={"platform": platform, "query": query, "limit": limit, "enrich": enrich, "detail_limit": detail_limit, "comments_limit": comments_limit})
+                payload = {"platform": platform, "query": query, "limit": limit, "enrich": enrich, "detail_limit": detail_limit, "comments_limit": comments_limit}
+                if sort:
+                    payload["sort"] = sort
+                resp = client.post(base + "/collect", json=payload)
                 resp.raise_for_status()
                 body = resp.json()
         except Exception as exc:
@@ -649,7 +674,7 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
         raise CollectorError("Agent-Reach is not installed")
     info = _channel_info(status, platform)
     active_backend = str(info.get("active_backend") or info.get("effective_backend") or info.get("backend") or "")
-    commands = _commands(platform, query, limit, active_backend)
+    commands = _commands(platform, query, limit, active_backend, sort=sort)
     if not commands:
         detail = info.get("message") or info.get("status") or "no documented backend command is available"
         raise CollectorError(f"Agent-Reach {platform} is not ready: {detail}")

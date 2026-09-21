@@ -522,3 +522,54 @@ def test_card_list_excludes_snapshot_mismatch_even_when_flags_look_current(monke
     assert len(history) == 1
     assert history[0]["snapshot_current"] is False
     assert history[0]["current_snapshot_hash"]
+
+
+
+def test_primary_product_view_exposes_only_selected_launch_candidate():
+    product = {
+        "recommended_products": [
+            {
+                "name": "Low Risk Guide",
+                "format": "markdown",
+                "why": "evidence backed",
+                "deliverables": ["guide.md"],
+            },
+            {
+                "name": "Legal Kit",
+                "format": "txt",
+                "why": "secondary only",
+                "deliverables": ["msa.txt", "privacy_policy.txt"],
+            },
+        ],
+        "primary_product": "Low Risk Guide",
+        "price_range": {"currency": "USD", "min": 19, "max": 39, "reason": "test"},
+        "production_complexity": 20,
+        "automation_fit": 95,
+        "confidence": 88,
+        "reasoning": "test",
+    }
+
+    view = opportunity_agent._primary_product_view(product)
+
+    assert view["product"]["name"] == "Low Risk Guide"
+    assert "recommended_products" not in view
+    assert "Legal Kit" not in str(view)
+
+
+def test_risk_and_judge_receive_primary_product_not_full_alternatives(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+    captured = {}
+
+    def recording_chat(**kwargs):
+        name = str(kwargs["operation"]).replace("opportunity_agent_", "")
+        if name in {"risk", "judge"}:
+            captured[name] = kwargs.get("payload") or {}
+        return _fake_chat(**kwargs)
+
+    monkeypatch.setattr(opportunity_agent, "chat_json_with_meta", recording_chat)
+    opportunity_agent.run_opportunity_agent_workflow(opportunity_id)
+
+    for name in ("risk", "judge"):
+        assert captured[name]["primary_product"]["product"]["name"] == "Payroll Overtime Workbook"
+        assert "product" not in captured[name]
+        assert "recommended_products" not in captured[name]["primary_product"]

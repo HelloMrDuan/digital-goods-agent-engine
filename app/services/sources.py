@@ -175,7 +175,15 @@ def _dispatch(source: dict[str, Any], config: dict[str, Any], limit: int):
     if t == "agent_reach":
         if not source.get("query"):
             raise CollectorError("Agent-Reach source missing query")
-        return collect_agent_reach(source["platform"], source["query"], limit=limit, enrich=bool(config.get("enrich", False)), detail_limit=int(config.get("detail_limit", 8)), comments_limit=int(config.get("comments_limit", 15)))
+        return collect_agent_reach(
+            source["platform"],
+            source["query"],
+            limit=limit,
+            enrich=bool(config.get("enrich", False)),
+            detail_limit=int(config.get("detail_limit", 8)),
+            comments_limit=int(config.get("comments_limit", 15)),
+            sort=str(config.get("sort") or "").strip() or None,
+        )
     if t == "bilibili":
         if not source.get("query"):
             raise CollectorError("Bilibili source missing query")
@@ -428,6 +436,12 @@ def bootstrap_sources() -> dict[str, int]:
         {"name":"Reddit - creator workflow demand","source_type":"agent_reach","platform":"reddit","query":"looking for content creator workflow template","config":cfg("demand","P0","core_demand",180,limit=30,enrich=True,detail_limit=8,comments_limit=15),"enabled":False},
 
         # P1: real trend/support sources. Search/video/news results are NOT counted as direct demand.
+        # Xiaohongshu high-like searches are real social attention evidence only:
+        # likes are preserved as engagement and never treated as sales or independent-demand count.
+        {"name":"小红书 - Excel模板高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"Excel模板","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
+        {"name":"小红书 - 简历模板高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"简历模板","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
+        {"name":"小红书 - 自动化工具高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"自动化工具","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
+        {"name":"小红书 - 短视频运营工具高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"短视频运营工具","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
         {"name":"Google News - Excel模板与自动化","source_type":"google_news","platform":"google_news","query":"Excel 模板 自动化 工具","config":cfg("trend","P1","trend_support",180,limit=50),"enabled":True},
         {"name":"Google News - 简历求职工具","source_type":"google_news","platform":"google_news","query":"简历 模板 求职 工具","config":cfg("trend","P1","trend_support",180,limit=50),"enabled":True},
         {"name":"Google News - 短视频运营工具","source_type":"google_news","platform":"google_news","query":"短视频 运营 工具 模板","config":cfg("trend","P1","trend_support",180,limit=50),"enabled":True},

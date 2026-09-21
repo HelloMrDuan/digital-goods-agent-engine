@@ -250,6 +250,18 @@ def _payload_shape(value: Any) -> str:
     return type(value).__name__
 
 
+def _is_empty_result_payload(value: Any) -> bool:
+    if value in (None, "", [], {}):
+        return True
+    if isinstance(value, dict):
+        for key in ("items", "results", "posts", "notes", "videos", "feeds", "list"):
+            if key in value and isinstance(value.get(key), list):
+                return len(value.get(key) or []) == 0
+        if "data" in value:
+            return _is_empty_result_payload(value.get("data"))
+    return False
+
+
 def _flatten_candidate_items(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
         out: list[dict[str, Any]] = []
@@ -647,6 +659,10 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
         try:
             body = _run(cmd)
             raw_items = _flatten_candidate_items(body)
+            if not raw_items and _is_empty_result_payload(body):
+                # A successful OpenCLI command returning [] (or an empty normalized
+                # envelope) is a legitimate empty search result, not a parser failure.
+                return []
             out: list[CollectedItem] = []
             for raw in raw_items:
                 item = _normalize(platform, raw)

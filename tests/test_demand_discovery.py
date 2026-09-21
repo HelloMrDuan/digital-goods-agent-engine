@@ -480,3 +480,90 @@ def test_payload_shape_exposes_opencli_schema_drift():
     assert agent_reach._payload_shape([
         {"noteId": "1", "title": "hello", "author": "buyer"}
     ]) == "list[dict] keys=author,noteId,title"
+
+
+
+def test_opencli_empty_list_is_normal_empty_not_parse_failure(monkeypatch):
+    from app.collectors import agent_reach
+
+    monkeypatch.setattr(
+        agent_reach,
+        "doctor",
+        lambda: {
+            "installed": True,
+            "status": "OK",
+            "channels": {
+                "xiaohongshu": {
+                    "effective_status": "ok",
+                    "effective_backend": "OpenCLI Browser Bridge",
+                    "opencli_connected": True,
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        agent_reach,
+        "_commands",
+        lambda platform, query, limit, active_backend: [[
+            "opencli", "xiaohongshu", "search", query, "--limit", str(limit), "-f", "json"
+        ]],
+    )
+    monkeypatch.setattr(agent_reach, "_run", lambda cmd: [])
+
+    result = agent_reach.collect("xiaohongshu", "求 Excel 模板", limit=5)
+
+    assert result == []
+
+
+def test_nonempty_unparseable_payload_still_counts_as_parse_failure(monkeypatch):
+    from app.collectors import agent_reach
+
+    monkeypatch.setattr(
+        agent_reach,
+        "doctor",
+        lambda: {
+            "installed": True,
+            "status": "OK",
+            "channels": {
+                "xiaohongshu": {
+                    "effective_status": "ok",
+                    "effective_backend": "OpenCLI Browser Bridge",
+                    "opencli_connected": True,
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        agent_reach,
+        "_commands",
+        lambda platform, query, limit, active_backend: [[
+            "opencli", "xiaohongshu", "search", query, "--limit", str(limit), "-f", "json"
+        ]],
+    )
+    # Non-empty payload exists, but has neither title nor usable normalized fields.
+    monkeypatch.setattr(agent_reach, "_run", lambda cmd: [{"foo": "bar"}])
+
+    with pytest.raises(Exception, match="no parseable real items"):
+        agent_reach.collect("xiaohongshu", "求 Excel 模板", limit=5)
+
+
+def test_empty_result_does_not_trip_discovery_circuit(monkeypatch):
+    demand_discovery.install_sources()
+    probe = next(item for item in demand_discovery._PROBES if item["platform"] == "xiaohongshu")
+    state = {
+        "lock": threading.Lock(),
+        "parse_failures": {},
+        "disabled": {},
+    }
+    monkeypatch.setattr(demand_discovery, "collect_agent_reach", lambda *args, **kwargs: [])
+
+    result = demand_discovery._collect_probe(
+        probe,
+        queries=["求 Excel 模板"],
+        platform_circuit=state,
+    )
+
+    assert result["status"] == "EMPTY"
+    assert result["query_failures"] == 0
+    assert result["circuit_open"] is False
+    assert state["disabled"] == {}

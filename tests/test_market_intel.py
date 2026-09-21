@@ -511,7 +511,7 @@ def test_etsy_html_403_tells_operator_to_configure_api_key(monkeypatch):
 
 
 
-def test_etsy_open_api_sends_oauth_when_access_token_is_configured(monkeypatch):
+def test_etsy_public_market_search_does_not_send_shop_oauth(monkeypatch):
     captured = {}
 
     class FakeResponse:
@@ -544,4 +544,4 @@ def test_etsy_open_api_sends_oauth_when_access_token_is_configured(monkeypatch):
         settings.etsy_access_token = old_token
 
     assert captured["headers"]["x-api-key"] == "key:secret"
-    assert captured["headers"]["Authorization"] == "Bearer 123.oauth-token"
+    assert "Authorization" not in captured["headers"]

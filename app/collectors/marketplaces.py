@@ -307,14 +307,14 @@ def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]],
         "is_safe": "true",
     }
     try:
+        # Public marketplace search is api_key-only per Etsy's current
+        # findAllListingsActive reference. Do not attach a shop OAuth token here:
+        # an invalid/stale private token must never break public market validation.
         headers = {
             "x-api-key": api_key,
             "Accept": "application/json",
             "User-Agent": settings.user_agent,
         }
-        access_token = str(settings.etsy_access_token or "").strip()
-        if access_token:
-            headers["Authorization"] = f"Bearer {access_token}"
         with httpx.Client(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,

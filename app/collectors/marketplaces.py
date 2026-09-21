@@ -280,47 +280,98 @@ def _etsy_shop_sales(page_html: str) -> int | None:
     return int(digits) if digits else None
 
 
-def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
-    if not query:
-        raise CollectorError("Etsy market source missing query")
-    search_url = f"https://www.etsy.com/search?q={quote_plus(query)}&explicit=1"
-    page = _get(search_url)
-    candidate_limit = min(60, max(limit, limit * 2))
-    rows = _etsy_search_rows(page, candidate_limit)
-    if not rows:
-        raise CollectorError("Etsy search returned no parseable listing data; page shape or bot protection may have changed")
+def _etsy_money(value: Any) -> tuple[float | None, str | None]:
+    if not isinstance(value, dict):
+        return None, None
+    amount = value.get("amount")
+    divisor = value.get("divisor") or 100
+    try:
+        price = float(amount) / float(divisor) if amount is not None else None
+    except Exception:
+        price = None
+    currency = value.get("currency_code") or value.get("currency")
+    return price, str(currency) if currency else None
 
-    verified_rows: list[dict[str, Any]] = []
-    verify_budget = max(1, int(settings.etsy_digital_verify_limit))
-    detail_checks = 0
-    for row in rows:
-        digital = row.get("digital")
-        verification = row.get("digital_verification")
-        if digital is False:
+
+def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]], str]:
+    api_key = str(settings.etsy_api_key or "").strip()
+    if not api_key:
+        raise CollectorError("Etsy Open API market search requires ETSY_API_KEY")
+
+    url = "https://openapi.etsy.com/v3/application/listings/active"
+    params = {
+        "keywords": query,
+        "limit": max(1, min(int(limit), 100)),
+        "sort_on": "score",
+        "sort_order": "desc",
+        "is_safe": "true",
+    }
+    try:
+        with httpx.Client(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=True,
+            headers={
+                "x-api-key": api_key,
+                "Accept": "application/json",
+                "User-Agent": settings.user_agent,
+            },
+            trust_env=bool(settings.marketplace_trust_env),
+        ) as client:
+            response = client.get(url, params=params)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        raise CollectorError(f"Etsy Open API request failed: {exc}") from exc
+
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list):
+        raise CollectorError("Etsy Open API response missing results")
+
+    rows: list[dict[str, Any]] = []
+    for obj in results:
+        if not isinstance(obj, dict):
             continue
-        if digital is not True:
-            if detail_checks >= verify_budget:
-                continue
-            detail_checks += 1
-            try:
-                digital, verification = _etsy_listing_digital_status(_get(str(row["url"])), str(row["listing_id"]))
-            except Exception:
-                digital, verification = None, None
+        digital, verification = _etsy_obj_digital_status(obj)
         if digital is not True:
             continue
-        row["digital"] = True
-        row["digital_verification"] = verification or "verified_digital"
-        verified_rows.append(row)
-        if len(verified_rows) >= limit:
+        listing_id = obj.get("listing_id")
+        title = str(obj.get("title") or "").strip()
+        if not listing_id or not title:
+            continue
+        price, currency = _etsy_money(obj.get("price"))
+        rows.append({
+            "listing_id": str(listing_id),
+            "title": title,
+            "url": str(obj.get("url") or f"https://www.etsy.com/listing/{listing_id}"),
+            "shop_name": None,
+            "price": price,
+            "currency": currency,
+            "views": None,
+            "favorites": None,
+            "review_count": None,
+            "rating": None,
+            "digital": True,
+            "digital_verification": f"etsy_open_api:{verification or 'type=download'}",
+            "search_rank": len(rows) + 1,
+            "raw": obj,
+        })
+        if len(rows) >= limit:
             break
 
-    if not verified_rows:
-        raise CollectorError("Etsy search returned no listings that could be verified as digital downloads")
+    return rows, str(response.url)
 
+
+def _etsy_rows_to_items(
+    rows: list[dict[str, Any]],
+    query: str,
+    metric_source_url: str,
+    *,
+    allow_shop_sales_enrichment: bool,
+) -> list[CollectedItem]:
     shop_sales: dict[str, tuple[int | None, str]] = {}
     shop_budget = max(0, int(settings.etsy_shop_enrich_limit))
-    if settings.etsy_enrich_shop_sales and shop_budget:
-        for shop_name in [r["shop_name"] for r in verified_rows if r.get("shop_name")]:
+    if allow_shop_sales_enrichment and settings.etsy_enrich_shop_sales and shop_budget:
+        for shop_name in [r["shop_name"] for r in rows if r.get("shop_name")]:
             if shop_name in shop_sales or len(shop_sales) >= shop_budget:
                 continue
             shop_url = f"https://www.etsy.com/shop/{quote_plus(str(shop_name))}"
@@ -330,7 +381,7 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
                 shop_sales[str(shop_name)] = (None, shop_url)
 
     result: list[CollectedItem] = []
-    for row in verified_rows:
+    for row in rows:
         sales_count = None
         sales_url = None
         if row.get("shop_name") in shop_sales:
@@ -368,7 +419,7 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
                         "sales_scope": "shop" if sales_count is not None else None,
                         "sales_verified": sales_count is not None,
                         "sales_metric_source_url": sales_url,
-                        "metric_source_url": search_url,
+                        "metric_source_url": metric_source_url,
                     },
                     "shop_name": row.get("shop_name"),
                     "query": query,
@@ -377,3 +428,69 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
             )
         )
     return result
+
+
+def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
+    if not query:
+        raise CollectorError("Etsy market source missing query")
+
+    requested = max(1, min(int(limit), 50))
+    if str(settings.etsy_api_key or "").strip():
+        rows, metric_source_url = _etsy_api_active_rows(query, requested)
+        if not rows:
+            raise CollectorError("Etsy Open API returned no verified digital downloads for this query")
+        return _etsy_rows_to_items(
+            rows,
+            query,
+            metric_source_url,
+            allow_shop_sales_enrichment=False,
+        )
+
+    search_url = f"https://www.etsy.com/search?q={quote_plus(query)}&explicit=1"
+    try:
+        page = _get(search_url)
+    except CollectorError as exc:
+        if "403" in str(exc):
+            raise CollectorError(
+                "Etsy HTML search is blocked (403); configure ETSY_API_KEY to use the official Open API"
+            ) from exc
+        raise
+
+    candidate_limit = min(60, max(requested, requested * 2))
+    rows = _etsy_search_rows(page, candidate_limit)
+    if not rows:
+        raise CollectorError("Etsy search returned no parseable listing data; page shape or bot protection may have changed")
+
+    verified_rows: list[dict[str, Any]] = []
+    verify_budget = max(1, int(settings.etsy_digital_verify_limit))
+    detail_checks = 0
+    for row in rows:
+        digital = row.get("digital")
+        verification = row.get("digital_verification")
+        if digital is False:
+            continue
+        if digital is not True:
+            if detail_checks >= verify_budget:
+                continue
+            detail_checks += 1
+            try:
+                digital, verification = _etsy_listing_digital_status(_get(str(row["url"])), str(row["listing_id"]))
+            except Exception:
+                digital, verification = None, None
+        if digital is not True:
+            continue
+        row["digital"] = True
+        row["digital_verification"] = verification or "verified_digital"
+        verified_rows.append(row)
+        if len(verified_rows) >= requested:
+            break
+
+    if not verified_rows:
+        raise CollectorError("Etsy search returned no listings that could be verified as digital downloads")
+
+    return _etsy_rows_to_items(
+        verified_rows,
+        query,
+        search_url,
+        allow_shop_sales_enrichment=True,
+    )

@@ -22,11 +22,13 @@ def isolated_db(tmp_path: Path):
         "market_intel_match_threshold": settings.market_intel_match_threshold,
         "market_intel_high_heat_score": settings.market_intel_high_heat_score,
         "market_intel_high_sales_score": settings.market_intel_high_sales_score,
+        "etsy_api_key": settings.etsy_api_key,
     }
     settings.db_path = str(tmp_path / "market-intel.db")
     settings.market_intel_match_threshold = 0.10
     settings.market_intel_high_heat_score = 65
     settings.market_intel_high_sales_score = 60
+    settings.etsy_api_key = ""
     init_db()
     yield
     for key, value in old.items():
@@ -424,3 +426,85 @@ def test_marketplace_http_collector_honors_trust_env_setting(monkeypatch):
         settings.marketplace_trust_env = old
 
     assert captured["trust_env"] is True
+
+
+
+def test_etsy_open_api_is_preferred_when_api_key_is_configured(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        url = "https://openapi.etsy.com/v3/application/listings/active?keywords=payroll"
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {
+                "count": 2,
+                "results": [
+                    {
+                        "listing_id": 901,
+                        "title": "Digital Payroll Workbook",
+                        "type": "download",
+                        "url": "https://www.etsy.com/listing/901",
+                        "price": {"amount": 1900, "divisor": 100, "currency_code": "USD"},
+                    },
+                    {
+                        "listing_id": 902,
+                        "title": "Physical Payroll Binder",
+                        "type": "physical",
+                        "url": "https://www.etsy.com/listing/902",
+                        "price": {"amount": 2900, "divisor": 100, "currency_code": "USD"},
+                    },
+                ],
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def get(self, url, params=None):
+            captured["url"] = url
+            captured["params"] = params
+            return FakeResponse()
+
+    old_key = settings.etsy_api_key
+    settings.etsy_api_key = "key:secret"
+    monkeypatch.setattr(marketplaces.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        marketplaces,
+        "_get",
+        lambda url: (_ for _ in ()).throw(AssertionError("HTML fallback must not run")),
+    )
+    try:
+        rows = collect_etsy_market("payroll workbook", limit=10)
+    finally:
+        settings.etsy_api_key = old_key
+
+    assert captured["url"].endswith("/v3/application/listings/active")
+    assert captured["params"]["keywords"] == "payroll workbook"
+    assert captured["params"]["sort_on"] == "score"
+    assert captured["client"]["headers"]["x-api-key"] == "key:secret"
+    assert len(rows) == 1
+    assert rows[0].source_item_id == "901"
+    assert rows[0].raw["digital_verification"].startswith("etsy_open_api:")
+    assert rows[0].raw["market_metrics"]["price"] == pytest.approx(19.0)
+    assert rows[0].raw["market_metrics"]["sales_verified"] is False
+
+
+def test_etsy_html_403_tells_operator_to_configure_api_key(monkeypatch):
+    old_key = settings.etsy_api_key
+    settings.etsy_api_key = ""
+    monkeypatch.setattr(
+        marketplaces,
+        "_get",
+        lambda url: (_ for _ in ()).throw(
+            marketplaces.CollectorError("marketplace request failed: 403 Forbidden")
+        ),
+    )
+    try:
+        with pytest.raises(marketplaces.CollectorError, match="configure ETSY_API_KEY"):
+            collect_etsy_market("whatsapp automation", limit=5)
+    finally:
+        settings.etsy_api_key = old_key

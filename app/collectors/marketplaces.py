@@ -307,19 +307,33 @@ def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]],
         "is_safe": "true",
     }
     try:
+        headers = {
+            "x-api-key": api_key,
+            "Accept": "application/json",
+            "User-Agent": settings.user_agent,
+        }
+        access_token = str(settings.etsy_access_token or "").strip()
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token}"
         with httpx.Client(
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
-            headers={
-                "x-api-key": api_key,
-                "Accept": "application/json",
-                "User-Agent": settings.user_agent,
-            },
+            headers=headers,
             trust_env=bool(settings.marketplace_trust_env),
         ) as client:
             response = client.get(url, params=params)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if response.status_code in {401, 403}:
+                    raise CollectorError(
+                        "Etsy Open API authorization failed; verify the app key is approved "
+                        "and configure ETSY_ACCESS_TOKEN if this endpoint/access level requires OAuth"
+                    ) from exc
+                raise
             payload = response.json()
+    except CollectorError:
+        raise
     except Exception as exc:
         raise CollectorError(f"Etsy Open API request failed: {exc}") from exc
 

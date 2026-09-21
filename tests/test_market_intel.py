@@ -508,3 +508,40 @@ def test_etsy_html_403_tells_operator_to_configure_api_key(monkeypatch):
             collect_etsy_market("whatsapp automation", limit=5)
     finally:
         settings.etsy_api_key = old_key
+
+
+
+def test_etsy_open_api_sends_oauth_when_access_token_is_configured(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        url = "https://openapi.etsy.com/v3/application/listings/active"
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"results": []}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def get(self, url, params=None):
+            return FakeResponse()
+
+    old_key = settings.etsy_api_key
+    old_token = settings.etsy_access_token
+    settings.etsy_api_key = "key:secret"
+    settings.etsy_access_token = "123.oauth-token"
+    monkeypatch.setattr(marketplaces.httpx, "Client", FakeClient)
+    try:
+        marketplaces._etsy_api_active_rows("whatsapp automation", 5)
+    finally:
+        settings.etsy_api_key = old_key
+        settings.etsy_access_token = old_token
+
+    assert captured["headers"]["x-api-key"] == "key:secret"
+    assert captured["headers"]["Authorization"] == "Bearer 123.oauth-token"

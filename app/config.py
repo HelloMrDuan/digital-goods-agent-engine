@@ -91,6 +91,9 @@ class Settings(BaseSettings):
     user_agent: str = "DigitalGoodsRealCollector/1.0 (+local-self-hosted)"
 
     request_timeout_seconds: float = 25.0
+    # Marketplace HTTP collectors may need the host's HTTP(S)_PROXY settings.
+    # Keep this configurable instead of hard-disabling proxies inside httpx.
+    marketplace_trust_env: bool = True
     collector_limit_default: int = 30
     collector_retries: int = 2
     collector_backoff_base_seconds: float = 2.0

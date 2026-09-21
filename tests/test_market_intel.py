@@ -300,11 +300,17 @@ def test_market_similarity_does_not_match_unrelated_single_template_term():
 
 
 def test_targeted_market_queries_remove_generic_packaging_words():
-    queries = market_intel.targeted_market_queries(
-        "WhatsApp Automation Agency GTM Checklist & Stack Validator"
+    etsy_queries = market_intel.targeted_market_queries(
+        "WhatsApp Automation Agency GTM Checklist & Stack Validator",
+        "etsy",
     )
-    assert queries[0] == "WhatsApp Automation Agency GTM Checklist & Stack Validator"
-    assert queries[1] == "WhatsApp Automation"
+    xianyu_queries = market_intel.targeted_market_queries(
+        "WhatsApp Automation Agency GTM Checklist & Stack Validator",
+        "xianyu",
+    )
+    assert etsy_queries[0] == "WhatsApp Automation Agency GTM Checklist & Stack Validator"
+    assert etsy_queries[1] == "WhatsApp Automation"
+    assert xianyu_queries == ["WhatsApp 自动化", "WhatsApp 工作流"]
 
 
 def test_targeted_market_validation_writes_market_intel_not_demand(monkeypatch):
@@ -353,6 +359,7 @@ def test_targeted_market_validation_writes_market_intel_not_demand(monkeypatch):
     assert result["after"]["high_heat_count"] >= 1
     assert result["after"]["high_sales_count"] >= 1
     assert any(item["platform"] == "xianyu" and item["status"] == "FAILED" for item in result["results"])
+    assert result["validation_status"] == "PARTIAL"
     with conn() as c:
         assert c.execute("SELECT COUNT(*) c FROM evidence").fetchone()["c"] == 0
         source = c.execute(
@@ -361,3 +368,59 @@ def test_targeted_market_validation_writes_market_intel_not_demand(monkeypatch):
         ).fetchone()
     assert source["enabled"] == 0
     assert "watch_targeted_market_validation" in source["config_json"]
+
+
+
+def test_targeted_market_empty_result_is_not_collector_failure():
+    exc = RuntimeError(
+        "opencli: ok: false\nerror:\n  code: EMPTY_RESULT\n  message: xianyu search returned no data"
+    )
+    assert market_intel._targeted_market_exception_status(exc) == "EMPTY"
+
+
+def test_targeted_market_validation_status_distinguishes_partial_and_inconclusive():
+    partial = market_intel._targeted_market_validation_status([
+        {"platform": "etsy", "status": "FAILED"},
+        {"platform": "xianyu", "status": "EMPTY"},
+    ])
+    assert partial == {
+        "validation_status": "PARTIAL",
+        "platform_status": {"etsy": "FAILED", "xianyu": "EMPTY"},
+    }
+
+    inconclusive = market_intel._targeted_market_validation_status([
+        {"platform": "etsy", "status": "FAILED"},
+        {"platform": "xianyu", "status": "FAILED"},
+    ])
+    assert inconclusive["validation_status"] == "INCONCLUSIVE"
+
+
+def test_marketplace_http_collector_honors_trust_env_setting(monkeypatch):
+    from app.collectors import marketplaces as marketplace_collectors
+
+    captured = {}
+
+    class FakeResponse:
+        text = "<html></html>"
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def get(self, url):
+            return FakeResponse()
+
+    old = settings.marketplace_trust_env
+    settings.marketplace_trust_env = True
+    monkeypatch.setattr(marketplace_collectors.httpx, "Client", FakeClient)
+    try:
+        marketplace_collectors._get("https://example.com")
+    finally:
+        settings.marketplace_trust_env = old
+
+    assert captured["trust_env"] is True

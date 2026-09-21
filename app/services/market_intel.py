@@ -365,7 +365,11 @@ _MARKET_QUERY_STOPWORDS = {
 }
 
 
-def targeted_market_queries(primary_product: str, max_queries: int = 2) -> list[str]:
+def targeted_market_queries(
+    primary_product: str,
+    platform: str = "etsy",
+    max_queries: int = 2,
+) -> list[str]:
     title = " ".join(str(primary_product or "").split())
     if not title:
         raise ValueError("primary product is required for targeted market validation")
@@ -377,21 +381,42 @@ def targeted_market_queries(primary_product: str, max_queries: int = 2) -> list[
         if word.lower() not in _MARKET_QUERY_STOPWORDS
         and len(word) > 1
     ]
-    queries: list[str] = []
-    if title:
-        queries.append(title)
     concise = " ".join(concise_words[:6]).strip()
-    if concise and concise.lower() != title.lower():
-        queries.append(concise)
+
+    platform = str(platform or "etsy").lower()
+    queries: list[str] = []
+    if platform == "xianyu":
+        lower = title.lower()
+        if "whatsapp" in lower:
+            queries.extend(["WhatsApp 自动化", "WhatsApp 工作流"])
+        elif "n8n" in lower:
+            queries.extend(["n8n 自动化", "n8n 工作流"])
+        elif any(token in lower for token in ("excel", "spreadsheet", "workbook")):
+            queries.extend(["Excel 模板", "Excel 自动化表格"])
+        elif any(token in lower for token in ("resume", "cv")):
+            queries.extend(["简历模板", "简历电子版模板"])
+        elif any(token in lower for token in ("invoice", "billing")):
+            queries.extend(["账单自动化", "发票表格模板"])
+        else:
+            # Xianyu search is predominantly Chinese. A concise English fallback is
+            # still preferable to an overly long product title.
+            if concise:
+                queries.append(concise)
+            queries.append(title)
+    else:
+        queries.append(title)
+        if concise and concise.lower() != title.lower():
+            queries.append(concise)
 
     unique: list[str] = []
     seen: set[str] = set()
     for query in queries:
-        key = query.lower()
-        if key in seen:
+        value = " ".join(str(query).split())
+        key = value.lower()
+        if not value or key in seen:
             continue
         seen.add(key)
-        unique.append(query)
+        unique.append(value)
     return unique[:max(1, min(int(max_queries), 3))]
 
 
@@ -455,6 +480,44 @@ def _market_signal_signature(intel: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(sorted(rows))
 
 
+def _targeted_market_exception_status(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "empty_result" in text or "returned no data" in text or "no matching" in text:
+        return "EMPTY"
+    return "FAILED"
+
+
+def _targeted_market_validation_status(results: list[dict[str, Any]]) -> dict[str, Any]:
+    platforms: dict[str, list[str]] = {}
+    for item in results:
+        platforms.setdefault(str(item.get("platform") or "unknown"), []).append(
+            str(item.get("status") or "FAILED").upper()
+        )
+
+    platform_status: dict[str, str] = {}
+    for platform, statuses in platforms.items():
+        if "SUCCESS" in statuses:
+            platform_status[platform] = "SUCCESS"
+        elif "EMPTY" in statuses and "FAILED" in statuses:
+            platform_status[platform] = "PARTIAL"
+        elif statuses and all(status == "EMPTY" for status in statuses):
+            platform_status[platform] = "EMPTY"
+        else:
+            platform_status[platform] = "FAILED"
+
+    values = list(platform_status.values())
+    if values and all(value in {"SUCCESS", "EMPTY"} for value in values):
+        overall = "COMPLETE"
+    elif values and all(value == "FAILED" for value in values):
+        overall = "INCONCLUSIVE"
+    else:
+        overall = "PARTIAL"
+    return {
+        "validation_status": overall,
+        "platform_status": platform_status,
+    }
+
+
 def collect_targeted_market_intel(
     opportunity_id: int,
     primary_product: str,
@@ -466,7 +529,10 @@ def collect_targeted_market_intel(
     This never creates demand evidence. Etsy/Xianyu results must pass each collector's
     existing digital-product verification before entering market_intel.
     """
-    queries = targeted_market_queries(primary_product)
+    queries_by_platform = {
+        "etsy": targeted_market_queries(primary_product, "etsy"),
+        "xianyu": targeted_market_queries(primary_product, "xianyu"),
+    }
     limit = max(1, min(int(per_query_limit), 20))
     before = market_intel_for_opportunity(opportunity_id, 50)
     before_signature = _market_signal_signature(before)
@@ -476,7 +542,7 @@ def collect_targeted_market_intel(
         ("etsy", collect_etsy_market),
         ("xianyu", collect_xianyu_market),
     ):
-        for query in queries:
+        for query in queries_by_platform[platform]:
             source = _target_market_source(opportunity_id, platform, query)
             try:
                 items = collector(query, limit=limit)
@@ -492,21 +558,24 @@ def collect_targeted_market_intel(
                     "matched_links": int(stats.get("matched_links") or 0),
                 })
             except Exception as exc:
+                status = _targeted_market_exception_status(exc)
                 results.append({
                     "platform": platform,
                     "query": query,
-                    "status": "FAILED",
+                    "status": status,
                     "fetched": 0,
-                    "error": str(exc),
+                    **({"error": str(exc)} if status == "FAILED" else {"reason": str(exc)}),
                 })
 
+    validation = _targeted_market_validation_status(results)
     after = market_intel_for_opportunity(opportunity_id, 50)
     after_signature = _market_signal_signature(after)
     return {
         "opportunity_id": opportunity_id,
         "primary_product": primary_product,
-        "queries": queries,
+        "queries": queries_by_platform,
         "results": results,
+        **validation,
         "before": before,
         "after": after,
         "market_changed": before_signature != after_signature,

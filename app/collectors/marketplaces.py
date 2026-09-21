@@ -47,7 +47,7 @@ def _get(url: str) -> str:
             timeout=settings.request_timeout_seconds,
             follow_redirects=True,
             headers={"User-Agent": settings.user_agent, "Accept-Language": "en-US,en;q=0.8"},
-            trust_env=False,
+            trust_env=bool(settings.marketplace_trust_env),
         ) as client:
             response = client.get(url)
             response.raise_for_status()

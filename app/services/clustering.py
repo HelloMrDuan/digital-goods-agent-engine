@@ -146,6 +146,7 @@ def rebuild_clusters() -> dict[str, Any]:
                 "UPDATE opportunities SET cluster_active=0 WHERE cluster_method IN (?,?,?,?,?,?,?,?,?,?)",
                 (
                     _METHOD,
+                    "real_evidence_tfidf_v9_topic_provenance",
                     "real_evidence_tfidf_v8_topic_guard",
                     "real_evidence_tfidf_v7_semantic_topic",
                     "real_evidence_tfidf_v6_evidence_first",

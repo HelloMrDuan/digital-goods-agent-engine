@@ -162,9 +162,11 @@ def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any
             sales_count = _num(metrics.get("sales_count"))
             if bool(metrics.get("sales_verified")) and sales_count is not None:
                 verified_sales_count += 1
-            if _num(metrics.get("rating")) is not None:
+            rating_value = _num(metrics.get("rating"))
+            if rating_value is not None and 0.0 <= rating_value <= 5.0:
                 verified_rating_count += 1
-            if _num(metrics.get("review_count")) is not None:
+            review_value = _num(metrics.get("review_count"))
+            if review_value is not None and review_value >= 0.0:
                 verified_review_count += 1
             rank_position = _num(metrics.get("rank_position"))
             values = {

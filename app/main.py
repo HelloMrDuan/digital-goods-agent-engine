@@ -87,7 +87,15 @@ async def _security_guards(request, call_next):
             ready, reason = _real_refresh_readiness()
             if not ready:
                 return JSONResponse(status_code=409, content={"detail": reason})
-    return await call_next(request)
+    response = await call_next(request)
+
+    # Windows PowerShell 5.1 may decode application/json without an explicit
+    # charset using a legacy code page, producing mojibake for Chinese text.
+    # FastAPI emits UTF-8 JSON, so advertise that encoding explicitly.
+    content_type = str(response.headers.get("content-type") or "")
+    if content_type.lower().startswith("application/json") and "charset=" not in content_type.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
 
 
 app.include_router(opportunity_v12_router)

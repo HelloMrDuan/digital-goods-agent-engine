@@ -181,6 +181,45 @@ def test_async_single_analysis_does_not_require_commercial_validation_and_dedupl
 
 
 
+def test_async_analysis_task_persists_result_json(monkeypatch):
+    import app.main_legacy as main_legacy
+
+    now = now_iso()
+    with conn() as c:
+        opportunity_id = int(c.execute(
+            "INSERT INTO opportunities(title,candidate_key,normalized_need,status,evidence_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("async candidate", "async-persist-key", "async candidate", "NEW", 1, now, now),
+        ).lastrowid)
+        c.execute("UPDATE opportunities SET cluster_active=1 WHERE id=?", (opportunity_id,))
+        task_id = int(c.execute(
+            "INSERT INTO analysis_tasks(opportunity_id,status,progress,stage,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (opportunity_id, "PENDING", 0, "排队", "等待分析", now, now),
+        ).lastrowid)
+
+    monkeypatch.setattr(
+        main_legacy,
+        "analyze_one",
+        lambda opportunity_id: {
+            "id": opportunity_id,
+            "status": "ANALYZED",
+            "analysis": {"decision": "WATCH"},
+        },
+    )
+
+    main_legacy._run_analysis_task(task_id, opportunity_id)
+
+    with conn() as c:
+        row = c.execute(
+            "SELECT status,progress,result_json,error FROM analysis_tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+
+    assert row["status"] == "SUCCESS"
+    assert int(row["progress"]) == 100
+    assert '"status":"ANALYZED"' in str(row["result_json"] or "")
+    assert row["error"] is None
+
+
 def test_rebuild_gate_a_filters_context_and_non_pass_candidates(monkeypatch):
     now = now_iso()
     with conn() as c:

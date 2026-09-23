@@ -493,6 +493,141 @@ def test_etsy_open_api_is_preferred_when_api_key_is_configured(monkeypatch):
     assert rows[0].raw["market_metrics"]["sales_verified"] is False
 
 
+def test_etsy_open_api_enriches_real_shop_sales_and_listing_reviews(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, url, payload):
+            self.url = url
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.headers = kwargs.get("headers") or {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, params=None):
+            calls.append((url, params, dict(self.headers)))
+            if url.endswith("/listings/active"):
+                return FakeResponse(
+                    url,
+                    {
+                        "results": [
+                            {
+                                "listing_id": 901,
+                                "shop_id": 77,
+                                "title": "Digital Payroll Workbook",
+                                "type": "download",
+                                "url": "https://www.etsy.com/listing/901",
+                                "num_favorers": 123,
+                                "price": {"amount": 1900, "divisor": 100, "currency_code": "USD"},
+                            }
+                        ]
+                    },
+                )
+            if url.endswith("/shops/77"):
+                return FakeResponse(
+                    url,
+                    {
+                        "shop_id": 77,
+                        "shop_name": "RealMetricsShop",
+                        "transaction_sold_count": 12345,
+                        "review_count": 820,
+                        "review_average": 4.8,
+                        "num_favorers": 900,
+                    },
+                )
+            if url.endswith("/listings/901/reviews"):
+                return FakeResponse(
+                    url,
+                    {
+                        "count": 2,
+                        "results": [{"rating": 5}, {"rating": 4}],
+                    },
+                )
+            raise AssertionError(f"unexpected Etsy API url: {url}")
+
+    old_key = settings.etsy_api_key
+    old_budget = settings.etsy_shop_enrich_limit
+    settings.etsy_api_key = "key:secret"
+    settings.etsy_shop_enrich_limit = 8
+    monkeypatch.setattr(marketplaces.httpx, "Client", FakeClient)
+    try:
+        rows = collect_etsy_market("payroll workbook", limit=5)
+    finally:
+        settings.etsy_api_key = old_key
+        settings.etsy_shop_enrich_limit = old_budget
+
+    assert len(rows) == 1
+    row = rows[0]
+    metrics = row.raw["market_metrics"]
+    assert row.author == "RealMetricsShop"
+    assert metrics["favorites_count"] == pytest.approx(123)
+    assert metrics["sales_count"] == pytest.approx(12345)
+    assert metrics["sales_scope"] == "shop"
+    assert metrics["sales_verified"] is True
+    assert metrics["review_count"] == pytest.approx(2)
+    assert metrics["review_scope"] == "listing"
+    assert metrics["rating"] == pytest.approx(4.5)
+    assert metrics["rating_scope"] == "listing"
+    assert all("Authorization" not in headers for _, _, headers in calls)
+
+
+def test_market_intel_reports_metric_scope_and_verified_counts(monkeypatch):
+    source_id = _market_source("scoped-market-metrics")
+    monkeypatch.setattr(
+        sources,
+        "_dispatch",
+        lambda source, config, limit: [
+            CollectedItem(
+                platform="etsy",
+                source_type="etsy_market_intel",
+                source_item_id="scope-1",
+                source_url="https://www.etsy.com/listing/scope-1",
+                title="Payroll Workbook",
+                author="Scoped Shop",
+                raw={
+                    "digital_product_verified": True,
+                    "digital_verification": "etsy_open_api:type=download",
+                    "market_metrics": {
+                        "rank_position": 1,
+                        "sales_count": 12000,
+                        "sales_scope": "shop",
+                        "sales_verified": True,
+                        "review_count": 900,
+                        "review_scope": "shop",
+                        "rating": 4.9,
+                        "rating_scope": "shop",
+                    },
+                },
+            )
+        ],
+    )
+
+    result = collect_source(source_id, force=True)
+
+    assert result["market_intel_sync"]["verified_sales"] == 1
+    assert result["market_intel_sync"]["verified_ratings"] == 1
+    assert result["market_intel_sync"]["verified_review_counts"] == 1
+    item = list_market_intel(10)[0]
+    assert item["metric_availability"]["sales_scope"] == "shop"
+    assert item["metric_availability"]["rating_scope"] == "shop"
+    assert item["metric_availability"]["review_scope"] == "shop"
+
+
 def test_etsy_html_403_tells_operator_to_configure_api_key(monkeypatch):
     old_key = settings.etsy_api_key
     settings.etsy_api_key = ""

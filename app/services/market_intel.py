@@ -433,9 +433,23 @@ def targeted_market_queries(
                 queries.append(concise)
             queries.append(title)
     else:
-        queries.append(title)
-        if concise and concise.lower() != title.lower():
-            queries.append(concise)
+        lower = title.lower()
+        if "whatsapp" in lower:
+            queries.extend(["WhatsApp automation", "WhatsApp workflow template"])
+        elif "n8n" in lower:
+            queries.extend(["n8n automation", "n8n workflow template"])
+        elif any(token in lower for token in ("excel", "spreadsheet", "workbook")):
+            queries.extend(["Excel spreadsheet template", "Excel automation template"])
+        elif any(token in lower for token in ("resume", "cv")):
+            queries.extend(["resume template", "CV template"])
+        elif any(token in lower for token in ("invoice", "billing")):
+            queries.extend(["invoice spreadsheet template", "billing spreadsheet template"])
+        else:
+            # Marketplaces perform better with concise buyer-facing nouns than an
+            # Agent-generated product title. Preserve the full title only as a fallback.
+            if concise:
+                queries.append(concise)
+            queries.append(title)
 
     unique: list[str] = []
     seen: set[str] = set()

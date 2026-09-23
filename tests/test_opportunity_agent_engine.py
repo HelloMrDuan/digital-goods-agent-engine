@@ -298,6 +298,60 @@ def test_real_xiaohongshu_likes_reach_agent_digest_without_becoming_sales(monkey
     assert digest["evidence"][0]["engagement"]["likes"] == "6.7万"
 
 
+def test_market_rating_scope_changes_opportunity_snapshot(monkeypatch):
+    opportunity_id = _opportunity_id(2)
+    state = {
+        "rating": 4.8,
+        "review_count": 120,
+        "rating_scope": "shop",
+        "review_scope": "shop",
+    }
+
+    def market_payload(_):
+        return {
+            "matched_count": 1,
+            "high_heat_count": 1,
+            "high_sales_count": 0,
+            "hot_and_selling_count": 0,
+            "verified_sales_count": 0,
+            "verified_rating_count": 1,
+            "verified_review_count": 1,
+            "sales_scopes": [],
+            "rating_scopes": [state["rating_scope"]],
+            "review_scopes": [state["review_scope"]],
+            "max_heat_score": 80.0,
+            "max_sales_score": 0.0,
+            "items": [{
+                "id": 99,
+                "heat_score": 80.0,
+                "sales_count": None,
+                "sales_scope": None,
+                "sales_verified": False,
+                "rating": state["rating"],
+                "review_count": state["review_count"],
+                "market_score": 80.0,
+                "last_seen_at": "2026-09-23T08:00:00+00:00",
+                "metrics": {
+                    "rating_scope": state["rating_scope"],
+                    "review_scope": state["review_scope"],
+                },
+            }],
+            "truth_policy": "real scoped market metrics only",
+        }
+
+    monkeypatch.setattr(opportunity_agent, "market_intel_for_opportunity", market_payload)
+    first = opportunity_agent.build_evidence_digest(opportunity_id)["snapshot_hash"]
+
+    state["rating"] = 4.9
+    second = opportunity_agent.build_evidence_digest(opportunity_id)["snapshot_hash"]
+    assert second != first
+
+    first = second
+    state["review_scope"] = "listing"
+    third = opportunity_agent.build_evidence_digest(opportunity_id)["snapshot_hash"]
+    assert third != first
+
+
 def test_market_intel_reaches_market_and_judge_agents(monkeypatch):
     opportunity_id = _opportunity_id(2)
     captured = {}
@@ -675,6 +729,9 @@ def test_market_prompt_forbids_zero_market_intel_blue_ocean_inference():
     assert "matched_count=0" in prompt
     assert "不能据此推断低竞争" in prompt
     assert "蓝海" in prompt
+    assert "rating_scope" in prompt
+    assert "review_scope" in prompt
+    assert "shop 评分" in prompt
 
 
 def test_judge_payload_includes_deterministic_decision_policy(monkeypatch):

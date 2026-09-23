@@ -238,6 +238,23 @@ def _normalize_product_output(output: Any) -> Any:
     return normalized
 
 
+def _normalize_judge_output(output: Any) -> Any:
+    """Drop only redundant score echoes already owned by upstream Agents.
+
+    Some JSON-capable models echo market_score/risk_score in the Judge response because
+    those values are present in the decision policy context. Judge is not authoritative
+    for either score: the final card always reads market_score from Market Agent and
+    risk_score from Risk Agent. Ignore only these two known echoes while keeping the
+    strict extra="forbid" contract for every other unexpected field.
+    """
+    if not isinstance(output, dict):
+        return output
+    normalized = dict(output)
+    normalized.pop("market_score", None)
+    normalized.pop("risk_score", None)
+    return normalized
+
+
 def _normalize_agent_output(agent_name: str, output: Any) -> Any:
     if agent_name == "signal":
         if not isinstance(output, dict):
@@ -252,6 +269,8 @@ def _normalize_agent_output(agent_name: str, output: Any) -> Any:
         return _normalize_market_output(output)
     if agent_name == "product":
         return _normalize_product_output(output)
+    if agent_name == "judge":
+        return _normalize_judge_output(output)
     return output
 
 

@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .collectors import agent_reach_doctor, rsshub_doctor
 from .config import BASE_DIR, settings
-from .db import conn, init_db, loads, now_iso, row_to_dict
+from .db import conn, dumps, init_db, loads, now_iso, row_to_dict
 from .models import DeliveryIn, SourceAssetCreate, SourceAssetUpdate, SourceCreate, SourceUpdate
 from .services.analyze import analyze_one, product_from_opportunity
 from .services.opportunities import build_from_unlinked_evidence, get_evidence_for_opportunity, get_opportunity, list_opportunities

@@ -823,6 +823,23 @@ def opportunity_card_by_opportunity(opportunity_id: int):
     card = get_card_for_opportunity(opportunity_id)
     if not card:
         raise HTTPException(404, "opportunity card not found")
+
+    # Keep detail responses consistent with the list/card payload. The normalized
+    # database columns remain authoritative for duplicated scalar fields, while
+    # Agent-only metadata stored inside card_json is surfaced at the top level so
+    # API/front-end consumers do not need to know the persistence layout.
+    payload = card.get("card") if isinstance(card.get("card"), dict) else {}
+    for key in (
+        "judge_proposed_decision",
+        "decision_consistency",
+        "commercial_validation",
+        "build_readiness",
+        "primary_product",
+        "generated_at",
+    ):
+        if key not in card and key in payload:
+            card[key] = payload[key]
+
     card["agent_runs"] = list_agent_runs(opportunity_id, 30)
     return card
 

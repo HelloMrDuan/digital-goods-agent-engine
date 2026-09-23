@@ -828,6 +828,42 @@ def test_rebuild_can_refresh_demand_without_refreshing_market(monkeypatch):
     assert payload["market_refresh"]["reason"] == "refresh_market=false"
 
 
+def test_opportunity_card_detail_surfaces_card_metadata(monkeypatch):
+    monkeypatch.setattr(
+        routes_v12,
+        "get_card_for_opportunity",
+        lambda opportunity_id: {
+            "id": 25,
+            "opportunity_id": opportunity_id,
+            "decision": "WATCH",
+            "final_score": 54.0,
+            "market_score": 58.0,
+            "risk_score": 68.0,
+            "card": {
+                "judge_proposed_decision": "WATCH",
+                "decision_consistency": {
+                    "proposed": "WATCH",
+                    "deterministic": "WATCH",
+                    "matches_policy": True,
+                },
+                "commercial_validation": {"status": "PASSED"},
+                "build_readiness": {"eligible": False, "gaps": [{"code": "final_score_below_build_threshold"}]},
+                "primary_product": "OCR Automation Script",
+                "generated_at": "2026-09-23T08:03:26+00:00",
+            },
+        },
+    )
+    monkeypatch.setattr(routes_v12, "list_agent_runs", lambda opportunity_id, limit: [])
+
+    detail = routes_v12.opportunity_card_by_opportunity(86)
+
+    assert detail["judge_proposed_decision"] == "WATCH"
+    assert detail["build_readiness"]["eligible"] is False
+    assert detail["commercial_validation"]["status"] == "PASSED"
+    assert detail["primary_product"] == "OCR Automation Script"
+    assert detail["generated_at"] == "2026-09-23T08:03:26+00:00"
+
+
 def test_rebuild_candidate_selection_skips_current_snapshot_cards(monkeypatch):
     monkeypatch.setattr(routes_v12, "list_opportunity_cards", lambda limit=500, current_only=True: [
         {"opportunity_id": 85, "snapshot_current": True},

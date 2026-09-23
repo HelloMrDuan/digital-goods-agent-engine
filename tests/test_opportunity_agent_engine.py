@@ -520,6 +520,43 @@ def test_market_schema_rejects_unknown_buyer_profile_object_fields():
 
 
 
+def test_judge_schema_ignores_redundant_market_and_risk_score_echoes():
+    output = {
+        "final_score": 54,
+        "decision": "WATCH",
+        "confidence": 78,
+        "title": "Validated automation opportunity",
+        "category": "Automation",
+        "summary": "Grounded summary.",
+        "reasoning": "Grounded reasoning.",
+        "market_score": 58,
+        "risk_score": 68,
+    }
+
+    value = opportunity_agent._validate_agent_output("judge", output, {101})
+
+    assert value["final_score"] == 54
+    assert value["decision"] == "WATCH"
+    assert "market_score" not in value
+    assert "risk_score" not in value
+
+
+def test_judge_schema_still_rejects_unknown_extra_fields():
+    output = {
+        "final_score": 54,
+        "decision": "WATCH",
+        "confidence": 78,
+        "title": "Validated automation opportunity",
+        "category": "Automation",
+        "summary": "Grounded summary.",
+        "reasoning": "Grounded reasoning.",
+        "invented_metric": 999,
+    }
+
+    with pytest.raises(ValueError, match="judge agent output schema invalid"):
+        opportunity_agent._validate_agent_output("judge", output, {101})
+
+
 def test_build_readiness_explains_exact_build_gaps():
     readiness = opportunity_agent._build_readiness(
         final_score=68,

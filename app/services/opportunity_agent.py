@@ -1,0 +1,1067 @@
+from __future__ import annotations
+
+import json
+import time
+from collections import Counter
+from typing import Any, Callable, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from ..config import settings
+from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
+from .llm import chat_json_with_meta
+from .opportunities import get_evidence_for_opportunity, get_opportunity
+from .validation import get_validation, validate_opportunity
+from .market_intel import market_intel_for_opportunity
+from .quality import assert_real_opportunity_provenance
+
+
+AGENT_ORDER = ("signal", "pain", "market", "product", "risk", "judge")
+
+_AGENT_SYSTEM = {
+    "signal": """你是 Signal Agent。只依据输入中的真实 evidence digest 识别需求信号，不得编造搜索量、销量、用户量或趋势。输入中的 social_engagement 来自真实平台互动，只能作为注意力/热度佐证；点赞、收藏、评论不得当成独立需求人数、销量或支付证据。输出 JSON 对象：signals(array of strings；每一项必须是字符串，不得输出对象), signal_strength(0-100), demand_pattern(string), evidence_refs(array of evidence ids), confidence(0-100), reasoning(string)。""",
+    "pain": """你是 Pain Agent。根据 Signal Agent 结果和真实 evidence digest 提取用户痛点。输出 JSON 对象：target_users(array), pain_points(array of objects with pain,severity 0-100,evidence_refs), urgency(0-100), confidence(0-100), reasoning(string)。不得补造未出现在证据中的事实。""",
+    "market": """你是 Market Agent。根据真实证据、Signal/Pain 结果和输入中的 market_intel 判断数字商品市场可做性。real_metrics.social_engagement 来自小红书等真实社交平台互动，只能表示注意力/内容热度，绝不能当成销量、GMV、买家数或独立需求数。market_intel 中 heat_score 来自真实榜单/互动观测；sales_count 只有 sales_verified=true 时才可引用，并且必须保留 sales_scope（listing/product/shop/seller/account）的语义，严禁把 shop 销量写成单商品销量。rating/review_count 也必须保留 rating_scope/review_scope；shop 评分或评论数只能描述店铺信誉，不能写成当前 listing 的商品评分。特别注意：matched_count=0、没有 heat、没有 verified sales 时，只能说明“当前没有可验证市场供给证据”，不能据此推断低竞争、蓝海、无人供给或 first mover；competition_level 在这种情况下必须表达高度不确定，而不是因为缺数据而自动给低值。所有评分都是判断，不是市场事实。输出 JSON：category(string), market_score(0-100), purchase_intent(0-100), competition_level(0-100), competition_gaps(array of strings), buyer_profile(array of strings；每一项必须是字符串，不能是对象), confidence(0-100), reasoning(string)。不得编造销量、GMV、搜索量或竞品数量。""",
+    "product": """你是 Product Agent。把已识别痛点转成可以原创、合法、低售后、可自动交付、并且当前系统能真实生成文件的数字商品。format 只能是 xlsx、csv、markdown、txt、json、python、javascript、html、css、yaml 之一；不得推荐 Canva/Figma/PSD/字体/图片素材/音视频/Notion 原生模板等当前系统无法真实构建的格式。多个候选都被证据支持时，primary_product 依次优先：证据贴合度、支付意愿、低外部平台依赖、低法律/专业责任、低售后、可自动交付。不要推荐 MSA/合同条款/隐私政策/法律文书/税务或专业财务意见等可能被误认为专业意见的模板；可以推荐纯运营清单、字段结构或非专业信息指南。若证据涉及非官方 API、易封禁平台或频繁变化的第三方规则，除非它是唯一能解决核心痛点的方案，否则不要把其作为 primary_product。输出 JSON：recommended_products(array of objects with name,format,why,deliverables；其中 deliverables 必须是 array of strings，不能是单个字符串), primary_product(string), price_range(object with currency,min,max,reason), production_complexity(0-100), automation_fit(0-100), confidence(0-100), reasoning(string)。primary_product 必须与 recommended_products 中一个 name 完全对应。禁止推荐盗版、破解、账号、未授权资料包。""",
+    "risk": """你是 Risk Agent。你评估的是输入中的 primary_product 作为当前准备上线商品的风险，不是整个候选产品列表。审查版权、平台合规、市场饱和、需求真实性、售后和支付意愿风险。只有确实适用于 primary_product 的问题才能计入 risk_score、warnings 或 blockers；不要因为未被选中的备选商品存在法律/平台风险而抬高主产品风险。没有销量/支付证据仍应真实计入支付风险。输出 JSON：risk_score(0-100), copyright_risk(0-100), saturation_risk(0-100), payment_risk(0-100), platform_risks(array), warnings(array), blockers(array), confidence(0-100), reasoning(string)。高风险必须明确说明。""",
+    "judge": """你是 Judge Agent。综合前五个 Agent 和真实证据指标，判断输入中的 primary_product 是否值得进入真实生产链。最终分数和 BUILD/WATCH/DROP 必须围绕 primary_product，而不是因为未选择的备选商品有风险就否决主产品。仍需严格考虑真实需求深度、支付证据、market_intel、主产品的平台依赖、售后和合规风险；证据不足时优先 WATCH 或 DROP，不得为了产生 BUILD 而放宽标准。你会收到 decision_policy，必须让 decision 与 final_score/market_score/risk_score 一致；如果模型主观判断与正式阈值冲突，正式阈值优先。输出 JSON：final_score(0-100), decision(BUILD|WATCH|DROP), confidence(0-100), title(string), category(string), summary(string), reasoning(string)。不得把 AI 判断包装成事实。""",
+}
+
+
+class _AgentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _SignalOutput(_AgentOutput):
+    signals: list[str]
+    signal_strength: float = Field(ge=0, le=100)
+    demand_pattern: str
+    evidence_refs: list[int] = Field(min_length=1)
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _PainPoint(_AgentOutput):
+    pain: str
+    severity: float = Field(ge=0, le=100)
+    evidence_refs: list[int] = Field(min_length=1)
+
+
+class _PainOutput(_AgentOutput):
+    target_users: list[str]
+    pain_points: list[_PainPoint]
+    urgency: float = Field(ge=0, le=100)
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _MarketOutput(_AgentOutput):
+    category: str
+    market_score: float = Field(ge=0, le=100)
+    purchase_intent: float = Field(ge=0, le=100)
+    competition_level: float = Field(ge=0, le=100)
+    competition_gaps: list[str]
+    buyer_profile: list[str]
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _RecommendedProduct(_AgentOutput):
+    name: str
+    format: Literal["xlsx", "csv", "markdown", "txt", "json", "python", "javascript", "html", "css", "yaml"]
+    why: str
+    deliverables: list[str]
+
+
+class _PriceRange(_AgentOutput):
+    currency: str
+    min: float = Field(ge=0)
+    max: float = Field(ge=0)
+    reason: str
+
+
+class _ProductOutput(_AgentOutput):
+    recommended_products: list[_RecommendedProduct]
+    primary_product: str
+    price_range: _PriceRange
+    production_complexity: float = Field(ge=0, le=100)
+    automation_fit: float = Field(ge=0, le=100)
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _RiskOutput(_AgentOutput):
+    risk_score: float = Field(ge=0, le=100)
+    copyright_risk: float = Field(ge=0, le=100)
+    saturation_risk: float = Field(ge=0, le=100)
+    payment_risk: float = Field(ge=0, le=100)
+    platform_risks: list[str]
+    warnings: list[str]
+    blockers: list[str]
+    confidence: float = Field(ge=0, le=100)
+    reasoning: str
+
+
+class _JudgeOutput(_AgentOutput):
+    final_score: float = Field(ge=0, le=100)
+    decision: Literal["BUILD", "WATCH", "DROP"]
+    confidence: float = Field(ge=0, le=100)
+    title: str
+    category: str
+    summary: str
+    reasoning: str
+
+
+_AGENT_SCHEMAS: dict[str, type[_AgentOutput]] = {
+    "signal": _SignalOutput,
+    "pain": _PainOutput,
+    "market": _MarketOutput,
+    "product": _ProductOutput,
+    "risk": _RiskOutput,
+    "judge": _JudgeOutput,
+}
+
+
+_SIGNAL_OBJECT_KEYS = {"type", "topic", "specifics", "description", "details", "summary"}
+
+
+def _normalize_signal_item(item: Any) -> str:
+    """Normalize a bounded structured signal into the canonical string contract.
+
+    Some JSON-capable models occasionally return signal objects even when the requested
+    contract says array<string>. Preserve the useful fields deterministically while
+    rejecting arbitrary/unbounded object shapes.
+    """
+    if isinstance(item, str):
+        value = " ".join(item.split())
+        if not value:
+            raise ValueError("signal item must not be empty")
+        return value
+    if not isinstance(item, dict):
+        raise ValueError(f"signal item must be string or supported object; got {type(item).__name__}")
+
+    extra = sorted(set(item) - _SIGNAL_OBJECT_KEYS)
+    if extra:
+        raise ValueError(f"signal object contains unsupported fields: {extra}")
+
+    signal_type = " ".join(str(item.get("type") or "").split())
+    topic = " ".join(str(item.get("topic") or "").split())
+    details = ""
+    for key in ("specifics", "description", "details", "summary"):
+        candidate = " ".join(str(item.get(key) or "").split())
+        if candidate:
+            details = candidate
+            break
+
+    if not topic and not details:
+        raise ValueError("signal object requires topic or description/details")
+
+    parts = []
+    if signal_type:
+        parts.append(f"[{signal_type}]")
+    if topic:
+        parts.append(topic)
+    if details:
+        parts.append(f"- {details}")
+    return " ".join(parts)
+
+
+_BUYER_PROFILE_OBJECT_KEYS = {"persona", "characteristics", "urgency_driver"}
+
+
+def _normalize_buyer_profile_item(item: Any) -> str:
+    if isinstance(item, str):
+        value = " ".join(item.split())
+        if not value:
+            raise ValueError("buyer_profile item must not be empty")
+        return value
+    if not isinstance(item, dict):
+        raise ValueError(
+            f"buyer_profile item must be string or supported object; got {type(item).__name__}"
+        )
+
+    extra = sorted(set(item) - _BUYER_PROFILE_OBJECT_KEYS)
+    if extra:
+        raise ValueError(f"buyer_profile object contains unsupported fields: {extra}")
+
+    persona = " ".join(str(item.get("persona") or "").split())
+    characteristics = " ".join(str(item.get("characteristics") or "").split())
+    urgency = " ".join(str(item.get("urgency_driver") or "").split())
+    if not persona and not characteristics and not urgency:
+        raise ValueError("buyer_profile object must contain persona, characteristics, or urgency_driver")
+
+    parts: list[str] = []
+    if persona:
+        parts.append(persona)
+    if characteristics:
+        parts.append(f"- {characteristics}")
+    if urgency:
+        parts.append(f"Urgency: {urgency}")
+    return " ".join(parts)
+
+
+def _normalize_market_output(output: Any) -> Any:
+    if not isinstance(output, dict):
+        return output
+    profiles = output.get("buyer_profile")
+    if not isinstance(profiles, list):
+        return output
+    normalized = dict(output)
+    normalized["buyer_profile"] = [
+        _normalize_buyer_profile_item(item) for item in profiles
+    ]
+    return normalized
+
+
+def _normalize_product_output(output: Any) -> Any:
+    if not isinstance(output, dict):
+        return output
+    products = output.get("recommended_products")
+    if not isinstance(products, list):
+        return output
+
+    normalized = dict(output)
+    normalized_products: list[Any] = []
+    for product in products:
+        if not isinstance(product, dict):
+            normalized_products.append(product)
+            continue
+        item = dict(product)
+        deliverables = item.get("deliverables")
+        if isinstance(deliverables, str):
+            value = " ".join(deliverables.split())
+            if not value:
+                raise ValueError("product deliverables string must not be empty")
+            item["deliverables"] = [value]
+        normalized_products.append(item)
+    normalized["recommended_products"] = normalized_products
+    return normalized
+
+
+def _normalize_judge_output(output: Any) -> Any:
+    """Drop only redundant score echoes already owned by upstream Agents.
+
+    Some JSON-capable models echo market_score/risk_score in the Judge response because
+    those values are present in the decision policy context. Judge is not authoritative
+    for either score: the final card always reads market_score from Market Agent and
+    risk_score from Risk Agent. Ignore only these two known echoes while keeping the
+    strict extra="forbid" contract for every other unexpected field.
+    """
+    if not isinstance(output, dict):
+        return output
+    normalized = dict(output)
+    normalized.pop("market_score", None)
+    normalized.pop("risk_score", None)
+    return normalized
+
+
+def _normalize_agent_output(agent_name: str, output: Any) -> Any:
+    if agent_name == "signal":
+        if not isinstance(output, dict):
+            return output
+        signals = output.get("signals")
+        if not isinstance(signals, list):
+            return output
+        normalized = dict(output)
+        normalized["signals"] = [_normalize_signal_item(item) for item in signals]
+        return normalized
+    if agent_name == "market":
+        return _normalize_market_output(output)
+    if agent_name == "product":
+        return _normalize_product_output(output)
+    if agent_name == "judge":
+        return _normalize_judge_output(output)
+    return output
+
+
+def _validate_agent_output(agent_name: str, output: Any, allowed_evidence_ids: set[int]) -> dict[str, Any]:
+    schema = _AGENT_SCHEMAS[agent_name]
+    output = _normalize_agent_output(agent_name, output)
+    try:
+        value = schema.model_validate(output).model_dump()
+    except ValidationError as exc:
+        raise ValueError(
+            f"{agent_name} agent output schema invalid: {exc.errors(include_url=False)}"
+        ) from exc
+
+    def check_refs(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key == "evidence_refs":
+                    invalid = sorted({int(ref) for ref in child} - allowed_evidence_ids)
+                    if invalid:
+                        raise ValueError(
+                            f"{agent_name} agent evidence_refs outside input evidence: {invalid}"
+                        )
+                else:
+                    check_refs(child)
+        elif isinstance(node, list):
+            for child in node:
+                check_refs(child)
+
+    check_refs(value)
+    price = value.get("price_range")
+    if isinstance(price, dict) and float(price.get("max") or 0) < float(price.get("min") or 0):
+        raise ValueError(f"{agent_name} agent price_range max must be >= min")
+    return value
+
+
+def _score(value: Any) -> float:
+    """Return a validated Agent score; never manufacture a neutral/default value."""
+    if value is None or isinstance(value, bool):
+        raise ValueError("agent score is missing")
+    try:
+        number = float(value)
+    except Exception as exc:
+        raise ValueError(f"agent score is not numeric: {value!r}") from exc
+    if not 0.0 <= number <= 100.0:
+        raise ValueError(f"agent score out of range: {number}")
+    return round(number, 2)
+
+
+def _ensure_schema() -> None:
+    with conn() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS opportunity_cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opportunity_id INTEGER NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                category TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                decision TEXT NOT NULL,
+                final_score REAL NOT NULL DEFAULT 0,
+                market_score REAL NOT NULL DEFAULT 0,
+                risk_score REAL NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0,
+                purchase_intent REAL NOT NULL DEFAULT 0,
+                source_platforms_json TEXT NOT NULL,
+                evidence_ids_json TEXT NOT NULL,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                signals_json TEXT,
+                target_users_json TEXT,
+                pain_points_json TEXT,
+                competition_json TEXT,
+                market_gaps_json TEXT,
+                recommended_products_json TEXT,
+                price_range_json TEXT,
+                warnings_json TEXT,
+                reasoning TEXT,
+                provider TEXT,
+                model TEXT,
+                snapshot_hash TEXT NOT NULL,
+                card_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_cards_decision_score
+                ON opportunity_cards(decision, final_score DESC);
+
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opportunity_id INTEGER NOT NULL,
+                card_id INTEGER,
+                agent_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                input_json TEXT NOT NULL,
+                output_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE CASCADE,
+                FOREIGN KEY(card_id) REFERENCES opportunity_cards(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_runs_opp_agent
+                ON agent_runs(opportunity_id, agent_name, id DESC);
+            """
+        )
+
+
+def _task_progress(opportunity_id: int, progress: int, stage: str, message: str) -> None:
+    try:
+        with conn() as c:
+            row = c.execute(
+                """SELECT id FROM analysis_tasks
+                   WHERE opportunity_id=? AND status IN ('PENDING','RUNNING')
+                   ORDER BY id DESC LIMIT 1""",
+                (opportunity_id,),
+            ).fetchone()
+            if row:
+                c.execute(
+                    "UPDATE analysis_tasks SET status='RUNNING',progress=?,stage=?,message=?,updated_at=? WHERE id=?",
+                    (progress, stage, message, now_iso(), int(row["id"])),
+                )
+    except Exception:
+        pass
+
+
+def _compact_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _engagement_number(value: Any) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        text = value.strip().lower().replace(",", "")
+        multiplier = 1.0
+        if text.endswith("万"):
+            multiplier, text = 10_000.0, text[:-1]
+        elif text.endswith("k"):
+            multiplier, text = 1_000.0, text[:-1]
+        elif text.endswith("m"):
+            multiplier, text = 1_000_000.0, text[:-1]
+        try:
+            return max(0.0, float(text) * multiplier)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _real_engagement_metrics(evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    totals: Counter[str] = Counter()
+    xhs_rows: list[dict[str, Any]] = []
+    for item in evidence:
+        engagement = item.get("engagement") or {}
+        if not isinstance(engagement, dict):
+            continue
+        for key in ("likes", "comments", "favorites", "shares", "views", "score"):
+            value = _engagement_number(engagement.get(key))
+            if value > 0:
+                totals[key] += value
+        if str(item.get("platform") or "").lower() == "xiaohongshu":
+            likes = _engagement_number(engagement.get("likes"))
+            if likes > 0:
+                xhs_rows.append({
+                    "evidence_id": item.get("id"),
+                    "likes": round(likes, 2),
+                    "title": _compact_text(item.get("title"), 160),
+                    "relation_type": item.get("relation_type"),
+                })
+    xhs_rows.sort(key=lambda row: float(row["likes"]), reverse=True)
+    return {
+        "metric_totals": {key: round(float(value), 2) for key, value in sorted(totals.items())},
+        "xiaohongshu": {
+            "evidence_with_likes": len(xhs_rows),
+            "likes_total": round(sum(float(row["likes"]) for row in xhs_rows), 2),
+            "max_likes": round(max((float(row["likes"]) for row in xhs_rows), default=0.0), 2),
+            "top_liked_evidence": xhs_rows[:5],
+        },
+        "semantics": "real platform interaction only; never sales, buyer count, GMV, or independent-demand count",
+    }
+
+
+def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
+    opportunity = get_opportunity(opportunity_id)
+    if not opportunity:
+        raise KeyError("opportunity not found")
+    assert_real_opportunity_provenance(opportunity_id)
+    evidence = get_evidence_for_opportunity(opportunity_id, settings.agent_evidence_limit)
+    if len(evidence) < settings.min_evidence_for_analysis:
+        raise ValueError(
+            f"At least {settings.min_evidence_for_analysis} real evidence item(s) required; found {len(evidence)}"
+        )
+
+    platforms = Counter(str(item.get("platform") or "unknown") for item in evidence)
+    intents = Counter(str(item.get("intent_class") or "unclassified") for item in evidence)
+    authors = {
+        f"{item.get('platform')}:{str(item.get('author')).strip().lower()}"
+        for item in evidence
+        if item.get("author") and str(item.get("author")).strip()
+    }
+    evidence_ids = [int(item["id"]) for item in evidence if item.get("id") is not None]
+    snippets = []
+    for item in evidence[: settings.agent_digest_snippets]:
+        snippets.append(
+            {
+                "evidence_id": item.get("id"),
+                "platform": item.get("platform"),
+                "content_kind": item.get("content_kind"),
+                "intent_class": item.get("intent_class"),
+                "intent_confidence": item.get("intent_confidence"),
+                "quality": item.get("evidence_quality_score"),
+                "relation_type": item.get("relation_type"),
+                "engagement": item.get("engagement") or {},
+                "author": item.get("author"),
+                "published_at": item.get("published_at"),
+                "title": _compact_text(item.get("title"), 220),
+                "content": _compact_text(item.get("content"), settings.agent_snippet_chars),
+                "source_url": item.get("source_url"),
+            }
+        )
+
+    social_engagement = _real_engagement_metrics(evidence)
+    market_intel = market_intel_for_opportunity(opportunity_id)
+
+    snapshot_hash = stable_hash(
+        "opportunity-agent-v2-market-intel",
+        opportunity.get("cluster_signature"),
+        dumps([(item.get("id"), item.get("raw_hash"), item.get("intent_class")) for item in evidence]),
+        dumps([
+            (
+                item.get("id"),
+                item.get("heat_score"),
+                item.get("sales_count"),
+                item.get("sales_scope"),
+                item.get("sales_verified"),
+                item.get("rating"),
+                item.get("metrics", {}).get("rating_scope"),
+                item.get("review_count"),
+                item.get("metrics", {}).get("review_scope"),
+                item.get("market_score"),
+                item.get("last_seen_at"),
+            )
+            for item in market_intel.get("items", [])
+        ]),
+    )
+    return {
+        "opportunity": {
+            "id": opportunity_id,
+            "title": opportunity.get("title"),
+            "normalized_need": opportunity.get("normalized_need"),
+            "cluster_signature": opportunity.get("cluster_signature"),
+            "trend_score": opportunity.get("trend_score"),
+            "trusted_trend_score": opportunity.get("trusted_trend_score"),
+            "data_quality_score": opportunity.get("data_quality_score"),
+            "current_7d": opportunity.get("current_7d"),
+            "previous_7d": opportunity.get("previous_7d"),
+            "growth_7d_pct": opportunity.get("growth_7d_pct"),
+        },
+        "real_metrics": {
+            "evidence_count": len(evidence),
+            "evidence_ids": evidence_ids,
+            "platform_counts": dict(platforms),
+            "unique_authors": len(authors),
+            "intent_counts": dict(intents),
+            "social_engagement": social_engagement,
+        },
+        "evidence": snippets,
+        "market_intel": market_intel,
+        "snapshot_hash": snapshot_hash,
+    }
+
+
+def _record_agent_run(
+    *,
+    opportunity_id: int,
+    agent_name: str,
+    status: str,
+    input_payload: dict[str, Any],
+    output: dict[str, Any] | None,
+    meta: dict[str, Any] | None,
+    duration_ms: int,
+    error: str | None = None,
+) -> int:
+    meta = meta or {}
+    usage = meta.get("usage") or {}
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO agent_runs(
+                   opportunity_id,agent_name,status,provider,model,prompt_tokens,completion_tokens,total_tokens,
+                   duration_ms,input_json,output_json,error,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                opportunity_id,
+                agent_name,
+                status,
+                meta.get("provider"),
+                meta.get("model"),
+                int(usage.get("prompt_tokens") or 0),
+                int(usage.get("completion_tokens") or 0),
+                int(usage.get("total_tokens") or 0),
+                duration_ms,
+                dumps(input_payload),
+                dumps(output) if output is not None else None,
+                error,
+                now_iso(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def _run_agent(
+    opportunity_id: int,
+    agent_name: str,
+    payload: dict[str, Any],
+    allowed_evidence_ids: set[int],
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    started = time.monotonic()
+    try:
+        output, meta = chat_json_with_meta(
+            operation=f"opportunity_agent_{agent_name}",
+            entity_type="opportunity",
+            entity_id=opportunity_id,
+            system=_AGENT_SYSTEM[agent_name],
+            payload=payload,
+            max_new_tokens=settings.agent_max_new_tokens,
+        )
+        output = _validate_agent_output(agent_name, output, allowed_evidence_ids)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        run_id = _record_agent_run(
+            opportunity_id=opportunity_id,
+            agent_name=agent_name,
+            status="SUCCESS",
+            input_payload=payload,
+            output=output,
+            meta=meta,
+            duration_ms=duration_ms,
+        )
+        return output, meta, run_id
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - started) * 1000)
+        _record_agent_run(
+            opportunity_id=opportunity_id,
+            agent_name=agent_name,
+            status="FAILED",
+            input_payload=payload,
+            output=None,
+            meta=None,
+            duration_ms=duration_ms,
+            error=str(exc),
+        )
+        raise
+
+
+def _decision(final_score: float, market_score: float, risk_score: float) -> str:
+    if risk_score >= settings.high_risk_threshold:
+        return "DROP"
+    if final_score >= settings.agent_build_score and market_score >= settings.agent_build_market_score:
+        return "BUILD"
+    if final_score >= settings.agent_watch_score:
+        return "WATCH"
+    return "DROP"
+
+
+def _decision_consistency(
+    proposed: str,
+    final_score: float,
+    market_score: float,
+    risk_score: float,
+) -> dict[str, Any]:
+    deterministic = _decision(final_score, market_score, risk_score)
+    normalized = str(proposed or "").upper()
+    return {
+        "proposed": normalized,
+        "deterministic": deterministic,
+        "matches_policy": normalized == deterministic,
+    }
+
+
+def _build_readiness(
+    final_score: float,
+    market_score: float,
+    risk_score: float,
+    validation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    validation_status = str((validation or {}).get("status") or "NOT_VALIDATED").upper()
+    thresholds = {
+        "final_score_min": float(settings.agent_build_score),
+        "market_score_min": float(settings.agent_build_market_score),
+        "risk_score_max_exclusive": float(settings.high_risk_threshold),
+        "commercial_validation_required": "PASSED",
+    }
+    gaps: list[dict[str, Any]] = []
+    if validation_status != "PASSED":
+        gaps.append({
+            "code": "commercial_validation_not_passed",
+            "actual": validation_status,
+            "required": "PASSED",
+        })
+    if final_score < settings.agent_build_score:
+        gaps.append({
+            "code": "final_score_below_build_threshold",
+            "actual": round(final_score, 2),
+            "required": float(settings.agent_build_score),
+            "shortfall": round(float(settings.agent_build_score) - final_score, 2),
+        })
+    if market_score < settings.agent_build_market_score:
+        gaps.append({
+            "code": "market_score_below_build_threshold",
+            "actual": round(market_score, 2),
+            "required": float(settings.agent_build_market_score),
+            "shortfall": round(float(settings.agent_build_market_score) - market_score, 2),
+        })
+    if risk_score >= settings.high_risk_threshold:
+        gaps.append({
+            "code": "risk_score_too_high",
+            "actual": round(risk_score, 2),
+            "required": f"< {float(settings.high_risk_threshold):g}",
+        })
+    return {
+        "eligible": not gaps,
+        "thresholds": thresholds,
+        "gaps": gaps,
+    }
+
+
+def _primary_product_view(product_output: dict[str, Any]) -> dict[str, Any]:
+    name = str(product_output.get("primary_product") or "").strip()
+    products = product_output.get("recommended_products") or []
+    selected = next(
+        (
+            item for item in products
+            if isinstance(item, dict) and str(item.get("name") or "").strip() == name
+        ),
+        None,
+    )
+    if not selected:
+        raise ValueError("primary_product must resolve to a recommended product")
+    return {
+        "product": selected,
+        "price_range": product_output.get("price_range") or {},
+        "production_complexity": product_output.get("production_complexity"),
+        "automation_fit": product_output.get("automation_fit"),
+        "confidence": product_output.get("confidence"),
+        "reasoning": product_output.get("reasoning"),
+    }
+
+
+def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
+    _ensure_schema()
+    opportunity = get_opportunity(opportunity_id)
+    if not opportunity:
+        raise KeyError("opportunity not found")
+    if not int(opportunity.get("cluster_active") or 0):
+        raise ValueError("inactive opportunity cannot be analyzed")
+
+    _task_progress(opportunity_id, 8, "证据摘要", "正在整理真实证据，避免六个 Agent 重复读取全部原文")
+    digest = build_evidence_digest(opportunity_id)
+
+    try:
+        validation = get_validation(opportunity_id)
+        if validation.get("status") in {"NOT_VALIDATED", "STALE"}:
+            validation = validate_opportunity(opportunity_id)
+    except Exception as exc:
+        validation = {"status": "ERROR", "score": 0, "reason_codes": [str(exc)]}
+
+    allowed_evidence_ids = {int(value) for value in digest["real_metrics"]["evidence_ids"]}
+    outputs: dict[str, dict[str, Any]] = {}
+    run_ids: list[int] = []
+    last_meta: dict[str, Any] = {}
+    stages = {
+        "signal": (20, "Signal Agent", "识别真实需求信号"),
+        "pain": (34, "Pain Agent", "提取目标用户与痛点"),
+        "market": (49, "Market Agent", "判断市场可做性与竞争缺口"),
+        "product": (64, "Product Agent", "生成可原创数字商品方向"),
+        "risk": (79, "Risk Agent", "审查版权、平台、饱和和支付风险"),
+        "judge": (92, "Judge Agent", "综合评分并形成 BUILD / WATCH / DROP 决策"),
+    }
+
+    base_context = {
+        "digest": digest,
+        "commercial_validation": validation,
+        "truth_policy": "Only reason from supplied real evidence and metrics. Never invent market-size facts.",
+    }
+
+    for agent_name in AGENT_ORDER:
+        progress, stage, message = stages[agent_name]
+        _task_progress(opportunity_id, progress, stage, message)
+        if agent_name == "signal":
+            payload = base_context
+        elif agent_name == "pain":
+            payload = {"digest": digest, "signal": outputs["signal"]}
+        elif agent_name == "market":
+            payload = {
+                "digest_metrics": digest["real_metrics"],
+                "commercial_validation": validation,
+                "signal": outputs["signal"],
+                "pain": outputs["pain"],
+                "market_intel": digest["market_intel"],
+            }
+        elif agent_name == "product":
+            payload = {
+                "signal": outputs["signal"],
+                "pain": outputs["pain"],
+                "market": outputs["market"],
+                "evidence_examples": digest["evidence"][:6],
+            }
+        elif agent_name == "risk":
+            payload = {
+                "digest_metrics": digest["real_metrics"],
+                "market": outputs["market"],
+                "primary_product": _primary_product_view(outputs["product"]),
+                "evidence_examples": digest["evidence"][:6],
+            }
+        else:
+            payload = {
+                "digest_metrics": digest["real_metrics"],
+                "commercial_validation": validation,
+                "signal": outputs["signal"],
+                "pain": outputs["pain"],
+                "market": outputs["market"],
+                "primary_product": _primary_product_view(outputs["product"]),
+                "risk": outputs["risk"],
+                "market_intel": digest["market_intel"],
+                "decision_policy": {
+                    "drop_if_risk_gte": float(settings.high_risk_threshold),
+                    "build_if_final_gte": float(settings.agent_build_score),
+                    "build_if_market_gte": float(settings.agent_build_market_score),
+                    "watch_if_final_gte": float(settings.agent_watch_score),
+                    "rule_order": [
+                        "risk >= drop_if_risk_gte => DROP",
+                        "final >= build_if_final_gte AND market >= build_if_market_gte => BUILD",
+                        "final >= watch_if_final_gte => WATCH",
+                        "otherwise => DROP",
+                    ],
+                },
+            }
+        output, last_meta, run_id = _run_agent(opportunity_id, agent_name, payload, allowed_evidence_ids)
+        outputs[agent_name] = output
+        run_ids.append(run_id)
+
+    market_score = _score(outputs["market"].get("market_score"))
+    purchase_intent = _score(outputs["market"].get("purchase_intent"))
+    risk_score = _score(outputs["risk"].get("risk_score"))
+    final_score = _score(outputs["judge"].get("final_score"))
+    confidence = _score(outputs["judge"].get("confidence"))
+    deterministic_decision = _decision(final_score, market_score, risk_score)
+    proposed = str(outputs["judge"].get("decision") or "").upper()
+    decision_consistency = _decision_consistency(
+        proposed,
+        final_score,
+        market_score,
+        risk_score,
+    )
+    decision = deterministic_decision
+
+    source_platforms = sorted(digest["real_metrics"]["platform_counts"].keys())
+    recommended_products = outputs["product"].get("recommended_products") or []
+    primary_product = outputs["product"].get("primary_product") or (
+        recommended_products[0].get("name") if recommended_products and isinstance(recommended_products[0], dict) else None
+    )
+    category = outputs["judge"].get("category") or outputs["market"].get("category") or opportunity.get("category")
+    title = outputs["judge"].get("title") or opportunity.get("title") or "Untitled opportunity"
+    reasoning = outputs["judge"].get("reasoning") or outputs["judge"].get("summary") or ""
+    card = {
+        "opportunity_id": opportunity_id,
+        "title": title,
+        "category": category,
+        "status": "ACTIVE",
+        "decision": decision,
+        "judge_proposed_decision": proposed or None,
+        "decision_consistency": decision_consistency,
+        "final_score": final_score,
+        "market_score": market_score,
+        "risk_score": risk_score,
+        "purchase_intent": purchase_intent,
+        "confidence": confidence,
+        "source_platforms": source_platforms,
+        "evidence_ids": digest["real_metrics"]["evidence_ids"],
+        "evidence_count": digest["real_metrics"]["evidence_count"],
+        "signals": outputs["signal"].get("signals") or [],
+        "target_users": outputs["pain"].get("target_users") or [],
+        "pain_points": outputs["pain"].get("pain_points") or [],
+        "competition": {
+            "level": _score(outputs["market"].get("competition_level")),
+            "reasoning": outputs["market"].get("reasoning"),
+        },
+        "market_gaps": outputs["market"].get("competition_gaps") or [],
+        "recommended_products": recommended_products,
+        "primary_product": primary_product,
+        "price_range": outputs["product"].get("price_range") or {},
+        "warnings": outputs["risk"].get("warnings") or [],
+        "blockers": outputs["risk"].get("blockers") or [],
+        "commercial_validation": validation,
+        "build_readiness": _build_readiness(final_score, market_score, risk_score, validation),
+        "snapshot_hash": digest["snapshot_hash"],
+        "provider": last_meta.get("provider"),
+        "model": last_meta.get("model"),
+        "reasoning": reasoning,
+        "agent_outputs": outputs,
+        "generated_at": now_iso(),
+    }
+
+    now = now_iso()
+    with conn() as c:
+        existing = c.execute("SELECT id,created_at FROM opportunity_cards WHERE opportunity_id=?", (opportunity_id,)).fetchone()
+        created_at = existing["created_at"] if existing else now
+        c.execute(
+            """INSERT INTO opportunity_cards(
+                   opportunity_id,title,category,status,decision,final_score,market_score,risk_score,confidence,
+                   purchase_intent,source_platforms_json,evidence_ids_json,evidence_count,signals_json,target_users_json,
+                   pain_points_json,competition_json,market_gaps_json,recommended_products_json,price_range_json,warnings_json,
+                   reasoning,provider,model,snapshot_hash,card_json,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(opportunity_id) DO UPDATE SET
+                   title=excluded.title,category=excluded.category,status=excluded.status,decision=excluded.decision,
+                   final_score=excluded.final_score,market_score=excluded.market_score,risk_score=excluded.risk_score,
+                   confidence=excluded.confidence,purchase_intent=excluded.purchase_intent,
+                   source_platforms_json=excluded.source_platforms_json,evidence_ids_json=excluded.evidence_ids_json,
+                   evidence_count=excluded.evidence_count,signals_json=excluded.signals_json,target_users_json=excluded.target_users_json,
+                   pain_points_json=excluded.pain_points_json,competition_json=excluded.competition_json,
+                   market_gaps_json=excluded.market_gaps_json,recommended_products_json=excluded.recommended_products_json,
+                   price_range_json=excluded.price_range_json,warnings_json=excluded.warnings_json,reasoning=excluded.reasoning,
+                   provider=excluded.provider,model=excluded.model,snapshot_hash=excluded.snapshot_hash,card_json=excluded.card_json,
+                   updated_at=excluded.updated_at""",
+            (
+                opportunity_id,
+                title,
+                category,
+                "ACTIVE",
+                decision,
+                final_score,
+                market_score,
+                risk_score,
+                confidence,
+                purchase_intent,
+                dumps(source_platforms),
+                dumps(digest["real_metrics"]["evidence_ids"]),
+                digest["real_metrics"]["evidence_count"],
+                dumps(card["signals"]),
+                dumps(card["target_users"]),
+                dumps(card["pain_points"]),
+                dumps(card["competition"]),
+                dumps(card["market_gaps"]),
+                dumps(recommended_products),
+                dumps(card["price_range"]),
+                dumps(card["warnings"]),
+                reasoning,
+                last_meta.get("provider"),
+                last_meta.get("model"),
+                digest["snapshot_hash"],
+                dumps(card),
+                created_at,
+                now,
+            ),
+        )
+        card_row = c.execute("SELECT id FROM opportunity_cards WHERE opportunity_id=?", (opportunity_id,)).fetchone()
+        card_id = int(card_row["id"])
+        if run_ids:
+            placeholders = ",".join("?" for _ in run_ids)
+            c.execute(f"UPDATE agent_runs SET card_id=? WHERE id IN ({placeholders})", (card_id, *run_ids))
+        c.execute(
+            """UPDATE opportunities SET category=?,status=?,purchase_intent=?,competition=?,copyright_risk=?,
+                      automation_fit=?,overall_score=?,suggested_product=?,ai_reason=?,analysis_json=?,analysis_stale=0,updated_at=?
+               WHERE id=?""",
+            (
+                category,
+                "REJECTED_RISK" if risk_score >= settings.high_risk_threshold else "ANALYZED",
+                round(purchase_intent),
+                round(_score(outputs["market"].get("competition_level"))),
+                round(_score(outputs["risk"].get("copyright_risk"))),
+                round(_score(outputs["product"].get("automation_fit"))),
+                round(final_score),
+                primary_product,
+                reasoning,
+                dumps(card),
+                now,
+                opportunity_id,
+            ),
+        )
+
+    _task_progress(opportunity_id, 98, "保存商机卡", f"商机卡已生成：{decision}")
+    return {"card_id": card_id, "card": card}
+
+
+def _decode_card_row(row: Any) -> dict[str, Any]:
+    data = row_to_dict(row) or {}
+    for key in (
+        "source_platforms_json",
+        "evidence_ids_json",
+        "signals_json",
+        "target_users_json",
+        "pain_points_json",
+        "competition_json",
+        "market_gaps_json",
+        "recommended_products_json",
+        "price_range_json",
+        "warnings_json",
+        "card_json",
+    ):
+        if key in data:
+            data[key[:-5] if key.endswith("_json") else key] = loads(data.pop(key), {} if key in {"competition_json", "price_range_json", "card_json"} else [])
+    return data
+
+
+def get_opportunity_card(card_id: int) -> dict[str, Any] | None:
+    _ensure_schema()
+    with conn() as c:
+        row = c.execute("SELECT * FROM opportunity_cards WHERE id=?", (card_id,)).fetchone()
+    return _decode_card_row(row) if row else None
+
+
+def get_card_for_opportunity(opportunity_id: int) -> dict[str, Any] | None:
+    _ensure_schema()
+    with conn() as c:
+        row = c.execute("SELECT * FROM opportunity_cards WHERE opportunity_id=?", (opportunity_id,)).fetchone()
+    return _decode_card_row(row) if row else None
+
+
+def list_opportunity_cards(
+    limit: int = 100,
+    decision: str | None = None,
+    *,
+    current_only: bool = True,
+) -> list[dict[str, Any]]:
+    _ensure_schema()
+    sql = """SELECT c.* FROM opportunity_cards c
+             JOIN opportunities o ON o.id=c.opportunity_id"""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if current_only:
+        clauses.append("coalesce(o.cluster_active,0)=1")
+        clauses.append("coalesce(o.analysis_stale,0)=0")
+    if decision:
+        clauses.append("c.decision=?")
+        params.append(str(decision).upper())
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY c.final_score DESC,c.id DESC LIMIT ?"
+    params.append(max(1, min(limit, 500)))
+    with conn() as c:
+        rows = c.execute(sql, tuple(params)).fetchall()
+    decoded = [_decode_card_row(row) for row in rows]
+    cards: list[dict[str, Any]] = []
+    for card in decoded:
+        payload = card.get("card") if isinstance(card.get("card"), dict) else {}
+        validation = payload.get("commercial_validation") if isinstance(payload, dict) else {}
+        card["build_readiness"] = _build_readiness(
+            float(card.get("final_score") or 0),
+            float(card.get("market_score") or 0),
+            float(card.get("risk_score") or 0),
+            validation if isinstance(validation, dict) else {},
+        )
+
+        snapshot_current = False
+        current_snapshot_hash = None
+        try:
+            digest = build_evidence_digest(int(card["opportunity_id"]))
+            current_snapshot_hash = digest.get("snapshot_hash")
+            snapshot_current = bool(
+                current_snapshot_hash
+                and str(card.get("snapshot_hash") or "") == str(current_snapshot_hash)
+            )
+        except Exception:
+            snapshot_current = False
+
+        card["snapshot_current"] = snapshot_current
+        card["current_snapshot_hash"] = current_snapshot_hash
+        if current_only and not snapshot_current:
+            continue
+        cards.append(card)
+    return cards
+
+
+def list_agent_runs(opportunity_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    _ensure_schema()
+    with conn() as c:
+        rows = c.execute(
+            "SELECT * FROM agent_runs WHERE opportunity_id=? ORDER BY id DESC LIMIT ?",
+            (opportunity_id, max(1, min(limit, 200))),
+        ).fetchall()
+    result = []
+    for row in rows:
+        data = row_to_dict(row) or {}
+        data["input"] = loads(data.pop("input_json", None), {})
+        data["output"] = loads(data.pop("output_json", None), None)
+        result.append(data)
+    return result

@@ -4,12 +4,15 @@ from typing import Any
 
 from ..db import conn, loads, row_to_dict
 from .clustering import rebuild_clusters
+from .market_intel import rematch_market_intel
 
 
 def build_from_unlinked_evidence(limit: int = 500) -> dict[str, Any]:
     # `limit` is retained for API compatibility. Clustering uses the configured rolling window
     # and evidence cap so old + new real evidence are regrouped consistently.
-    return rebuild_clusters()
+    result = rebuild_clusters()
+    result["market_intel_links"] = rematch_market_intel()
+    return result
 
 
 def get_opportunity(opportunity_id: int) -> dict[str, Any] | None:

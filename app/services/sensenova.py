@@ -10,6 +10,7 @@ import httpx
 
 from ..config import settings
 from ..db import conn, dumps, now_iso
+from .llm.budget import BudgetExceededError, release_ai_budget, reserve_ai_budget
 
 
 class SenseNovaError(RuntimeError):
@@ -57,9 +58,6 @@ def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
 def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system: str, payload: dict[str, Any], max_new_tokens: int = 1800) -> dict[str, Any]:
     if not settings.is_sensenova_configured:
         raise SenseNovaError("SenseNova is not configured. Set SENSENOVA_API_TOKEN and SENSENOVA_MODEL. No mock fallback is allowed.")
-    if _daily_spend() >= settings.daily_ai_budget_cny:
-        raise SenseNovaError(f"Daily AI budget reached: ¥{_daily_spend():.4f} / ¥{settings.daily_ai_budget_cny:.2f}")
-
     request_body = {
         "model": settings.sensenova_model,
         "messages": [
@@ -74,7 +72,15 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
     }
     headers = {"Authorization": f"Bearer {settings.sensenova_api_token}", "Content-Type": "application/json"}
     created_at = now_iso()
+    reservation_id: int | None = None
     try:
+        prompt_text = system + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        prompt_upper = max(256, int(len(prompt_text) * 1.25) + 256)
+        reserve_cost = _estimate_cost(prompt_upper, int(max_new_tokens))
+        try:
+            reservation_id = reserve_ai_budget("SenseNova", reserve_cost)
+        except BudgetExceededError as exc:
+            raise SenseNovaError(str(exc)) from exc
         with httpx.Client(timeout=90.0, headers=headers) as client:
             resp = client.post(settings.sensenova_base_url, json=request_body)
             resp.raise_for_status()
@@ -102,6 +108,7 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model, "SUCCESS", prompt_tokens, completion_tokens, total_tokens, cost, created_at),
             )
+            release_ai_budget(reservation_id, c)
         result["_usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens, "estimated_cost_cny": cost}
         return result
     except Exception as exc:
@@ -111,6 +118,7 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model or "UNCONFIGURED", "FAILED", str(exc), created_at),
             )
+            release_ai_budget(reservation_id, c)
         if isinstance(exc, SenseNovaError):
             raise
         raise SenseNovaError(str(exc)) from exc
@@ -153,7 +161,7 @@ ANALYZE_SYSTEM = """你是数字商品商机分析师。你只能依据输入中
 所有评分都是“基于当前证据的 AI 判断”，不是事实数据。只输出一个 JSON 对象，不要 Markdown。"""
 
 
-def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, Any]], *, chat=chat_json) -> dict[str, Any]:
     snippets = []
     for e in evidence[:40]:
         snippets.append({
@@ -178,7 +186,7 @@ def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, An
             "category": "string",
             "demand_score": "integer 0-100; AI judgement grounded only in evidence",
             "purchase_intent": "integer 0-100; AI judgement grounded only in explicit intent language",
-            "competition": "integer 0-100; use 50 when competition evidence is unavailable and explain uncertainty",
+            "competition": "integer 0-100 when supported by evidence; otherwise null and explain uncertainty; never invent a neutral score",
             "production_cost": "integer 0-100",
             "after_sales_cost": "integer 0-100",
             "copyright_risk": "integer 0-100",
@@ -190,20 +198,29 @@ def analyze_opportunity(opportunity: dict[str, Any], evidence: list[dict[str, An
             "compliance": "string",
         },
     }
-    result = chat_json(operation="opportunity_analysis", entity_type="opportunity", entity_id=int(opportunity["id"]), system=ANALYZE_SYSTEM, payload=payload, max_new_tokens=1900)
+    result = chat(operation="opportunity_analysis", entity_type="opportunity", entity_id=int(opportunity["id"]), system=ANALYZE_SYSTEM, payload=payload, max_new_tokens=1900)
     return result
 
 
-PRODUCT_SYSTEM = """你是数字商品产品经理。只根据输入的真实需求证据和已完成的商机分析设计原创数字商品草稿。
+PRODUCT_SYSTEM = """你是数字商品产品经理。只根据输入的真实需求证据和已完成的 BUILD 商机分析完善最终商品草稿。
+最终商品必须严格对应 analysis.primary_product 以及 analysis.primary_recommendation，不得重新换成另一个商品方向或另一个文件格式。
 不得声称不存在的销量、效果、认证、用户数量或市场数据。价格只作为 AI 建议价格，不得称为市场均价。
-不得复制或打包转售他人受版权保护内容。优先原创模板、表格、工作流、脚本、指南、检查表、知识索引和辅助工具。
+不得复制或打包转售他人受版权保护内容。当前系统只允许能真实构建为 xlsx、csv、markdown、txt、json、python、javascript、html、css、yaml 的商品。
 只输出一个 JSON 对象，不要 Markdown。"""
 
 
-def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]], analysis: dict[str, Any]) -> dict[str, Any]:
+def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]], analysis: dict[str, Any], *, chat=chat_json) -> dict[str, Any]:
     payload = {
         "opportunity": {k: opportunity.get(k) for k in ("id", "title", "normalized_need", "category", "overall_score", "suggested_product")},
-        "analysis": {k: analysis.get(k) for k in ("normalized_need", "category", "reason", "uncertainty", "compliance", "evidence_ids_used")},
+        "analysis": {
+            k: analysis.get(k)
+            for k in (
+                "decision", "primary_product", "primary_recommendation", "recommended_products",
+                "price_range", "pain_points", "target_users", "market_score", "purchase_intent",
+                "reasoning", "commercial_validation", "normalized_need", "category", "reason",
+                "uncertainty", "compliance", "evidence_ids_used"
+            )
+        },
         "evidence": [
             {"id": e.get("id"), "platform": e.get("platform"), "source_url": e.get("source_url"), "title": e.get("title"), "content": (e.get("content") or "")[:700]}
             for e in evidence[:20]
@@ -221,4 +238,4 @@ def generate_product(opportunity: dict[str, Any], evidence: list[dict[str, Any]]
             "compliance_notes": "string",
         },
     }
-    return chat_json(operation="product_draft", entity_type="opportunity", entity_id=int(opportunity["id"]), system=PRODUCT_SYSTEM, payload=payload, max_new_tokens=1800)
+    return chat(operation="product_draft", entity_type="opportunity", entity_id=int(opportunity["id"]), system=PRODUCT_SYSTEM, payload=payload, max_new_tokens=1800)

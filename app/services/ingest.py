@@ -182,6 +182,14 @@ def insert_evidence(source: dict[str, Any], item: CollectedItem) -> tuple[int, b
                 (observed_at, dumps(item.engagement), dumps(item.raw), raw_hash, fingerprint, quality, time_quality, demand_signal,
                  item.content_kind, item.parent_source_item_id, item.thread_url, intent.label, intent.confidence, intent.demand_weight, dumps(intent.reason_codes), eid),
             )
+            c.execute(
+                """UPDATE opportunities SET validation_status='STALE'
+                   WHERE validation_status='PASSED' AND id IN (
+                       SELECT opportunity_id FROM opportunity_evidence
+                       WHERE evidence_id=? AND relation_type='demand'
+                   )""",
+                (eid,),
+            )
             return eid, False
 
         cur = c.execute(

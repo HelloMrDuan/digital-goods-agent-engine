@@ -14,11 +14,16 @@ from ..collectors import (
     collect_rsshub,
     collect_v2ex,
     collect_youtube,
+    collect_creative_market,
+    collect_etsy_market,
+    collect_xianyu_market,
 )
 from ..collectors.base import CollectorError
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .ingest import ingest_items
+from .asset_registry import sync_github_source_asset_candidates
+from .market_intel import sync_market_items
 
 _source_locks: dict[int, threading.Lock] = {}
 _source_locks_guard = threading.Lock()
@@ -51,7 +56,7 @@ def source_role(source: dict[str, Any]) -> str:
     cfg = loads(source.get("config_json"), {}) if "config_json" in source else source.get("config", {})
     cfg = cfg or {}
     role = str(cfg.get("role") or "demand").lower()
-    return role if role in {"demand", "trend", "supply"} else "demand"
+    return role if role in {"demand", "trend", "supply", "market"} else "demand"
 
 
 def source_priority(source: dict[str, Any]) -> str:
@@ -65,7 +70,7 @@ def source_priority(source: dict[str, Any]) -> str:
     platform = str(source.get("platform") or "").lower()
     if platform == "v2ex":
         return "P3"
-    return {"demand": "P0", "trend": "P1", "supply": "P2"}.get(role, "P3")
+    return {"demand": "P0", "trend": "P1", "market": "P1", "supply": "P2"}.get(role, "P3")
 
 
 def source_business_group(source: dict[str, Any]) -> str:
@@ -74,20 +79,20 @@ def source_business_group(source: dict[str, Any]) -> str:
     explicit = cfg.get("business_group")
     if explicit:
         group = str(explicit)
-        return group if group in {"core_demand", "trend_support", "supply_intel", "auxiliary"} else "auxiliary"
+        return group if group in {"core_demand", "trend_support", "market_intel", "supply_intel", "auxiliary"} else "auxiliary"
     role = str(cfg.get("role") or "demand").lower()
     platform = str(source.get("platform") or "").lower()
     if platform == "v2ex":
         return "auxiliary"
-    return {"demand": "core_demand", "trend": "trend_support", "supply": "supply_intel"}.get(role, "auxiliary")
+    return {"demand": "core_demand", "trend": "trend_support", "market": "market_intel", "supply": "supply_intel"}.get(role, "auxiliary")
 
 
 def create_source(data: dict[str, Any]) -> int:
     now = now_iso()
     config = data.get("config") or {}
     role = str(config.get("role") or "demand").lower()
-    if role not in {"demand", "trend", "supply"}:
-        raise ValueError("source config.role must be demand, trend or supply")
+    if role not in {"demand", "trend", "supply", "market"}:
+        raise ValueError("source config.role must be demand, trend, market or supply")
     with conn() as c:
         cur = c.execute(
             """INSERT INTO sources(name,source_type,platform,query,url,config_json,enabled,status,created_at,updated_at)
@@ -170,7 +175,15 @@ def _dispatch(source: dict[str, Any], config: dict[str, Any], limit: int):
     if t == "agent_reach":
         if not source.get("query"):
             raise CollectorError("Agent-Reach source missing query")
-        return collect_agent_reach(source["platform"], source["query"], limit=limit, enrich=bool(config.get("enrich", False)), detail_limit=int(config.get("detail_limit", 8)), comments_limit=int(config.get("comments_limit", 15)))
+        return collect_agent_reach(
+            source["platform"],
+            source["query"],
+            limit=limit,
+            enrich=bool(config.get("enrich", False)),
+            detail_limit=int(config.get("detail_limit", 8)),
+            comments_limit=int(config.get("comments_limit", 15)),
+            sort=str(config.get("sort") or "").strip() or None,
+        )
     if t == "bilibili":
         if not source.get("query"):
             raise CollectorError("Bilibili source missing query")
@@ -179,6 +192,20 @@ def _dispatch(source: dict[str, Any], config: dict[str, Any], limit: int):
         if not source.get("query"):
             raise CollectorError("YouTube source missing query")
         return collect_youtube(source["query"], limit=limit)
+    if t == "creative_market":
+        return collect_creative_market(
+            str(source.get("url") or ""),
+            limit=limit,
+            ranking=str(config.get("ranking") or "bestseller"),
+        )
+    if t == "etsy_market":
+        if not source.get("query"):
+            raise CollectorError("Etsy market source missing query")
+        return collect_etsy_market(str(source["query"]), limit=limit)
+    if t == "xianyu_market":
+        if not source.get("query"):
+            raise CollectorError("Xianyu market source missing query")
+        return collect_xianyu_market(str(source["query"]), limit=limit)
     raise CollectorError(f"unsupported source_type: {t}")
 
 
@@ -243,7 +270,21 @@ def collect_source(source_id: int, limit: int | None = None, force: bool = False
             assert last_exc is not None
             raise last_exc
 
-        stats = ingest_items(source, items)
+        source_asset_sync = None
+        if (
+            source.get("source_type") == "github"
+            and source_role(source) == "supply"
+            and source_priority(source) == "P2"
+            and str(config.get("mode") or "repositories") == "repositories"
+        ):
+            source_asset_sync = sync_github_source_asset_candidates(source, items)
+
+        market_intel_sync = None
+        if source_role(source) == "market":
+            market_intel_sync = sync_market_items(source, items)
+            stats = market_intel_sync
+        else:
+            stats = ingest_items(source, items)
         finished = now_iso()
         duration_ms = max(0, int((time.monotonic() - t0) * 1000))
         empty = stats["fetched"] == 0
@@ -262,7 +303,17 @@ def collect_source(source_id: int, limit: int | None = None, force: bool = False
                    failure_streak=0,empty_streak=?,next_retry_at=NULL,avg_duration_ms=?,updated_at=? WHERE id=?""",
                 (source_status, finished, finished, stats["fetched"], int(source.get("empty_streak") or 0) + 1 if empty else 0, avg_ms, finished, source_id),
             )
-        return {"run_id": run_id, "source_id": source_id, "status": status, "role": source_role(source), "duration_ms": duration_ms, "retry_count": retry_count, **stats}
+        return {
+            "run_id": run_id,
+            "source_id": source_id,
+            "status": status,
+            "role": source_role(source),
+            "duration_ms": duration_ms,
+            "retry_count": retry_count,
+            "source_asset_sync": source_asset_sync,
+            "market_intel_sync": market_intel_sync,
+            **stats,
+        }
     except Exception as exc:
         finished = now_iso()
         duration_ms = max(0, int((time.monotonic() - t0) * 1000)) if 't0' in locals() else 0
@@ -385,6 +436,12 @@ def bootstrap_sources() -> dict[str, int]:
         {"name":"Reddit - creator workflow demand","source_type":"agent_reach","platform":"reddit","query":"looking for content creator workflow template","config":cfg("demand","P0","core_demand",180,limit=30,enrich=True,detail_limit=8,comments_limit=15),"enabled":False},
 
         # P1: real trend/support sources. Search/video/news results are NOT counted as direct demand.
+        # Xiaohongshu high-like searches are real social attention evidence only:
+        # likes are preserved as engagement and never treated as sales or independent-demand count.
+        {"name":"小红书 - Excel模板高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"Excel模板","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
+        {"name":"小红书 - 简历模板高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"简历模板","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
+        {"name":"小红书 - 自动化工具高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"自动化工具","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
+        {"name":"小红书 - 短视频运营工具高赞趋势","source_type":"agent_reach","platform":"xiaohongshu","query":"短视频运营工具","config":cfg("trend","P1","trend_support",240,limit=30,enrich=False,sort="most-liked"),"enabled":True},
         {"name":"Google News - Excel模板与自动化","source_type":"google_news","platform":"google_news","query":"Excel 模板 自动化 工具","config":cfg("trend","P1","trend_support",180,limit=50),"enabled":True},
         {"name":"Google News - 简历求职工具","source_type":"google_news","platform":"google_news","query":"简历 模板 求职 工具","config":cfg("trend","P1","trend_support",180,limit=50),"enabled":True},
         {"name":"Google News - 短视频运营工具","source_type":"google_news","platform":"google_news","query":"短视频 运营 工具 模板","config":cfg("trend","P1","trend_support",180,limit=50),"enabled":True},
@@ -393,6 +450,15 @@ def bootstrap_sources() -> dict[str, int]:
         {"name":"YouTube - digital product workflow","source_type":"youtube","platform":"youtube","query":"digital product workflow automation","config":cfg("trend","P1","trend_support",360,limit=25),"enabled":False},
         {"name":"RSSHub - B站综合热门","source_type":"rsshub","platform":"bilibili_hot","url":"/bilibili/popular/all","config":cfg("trend","P1","trend_support",120,limit=50),"enabled":False},
         {"name":"RSSHub - B站热搜","source_type":"rsshub","platform":"bilibili_hot_search","url":"/bilibili/hot-search","config":cfg("trend","P1","trend_support",60,limit=50),"enabled":False},
+
+        # P1 Market Intelligence: real marketplace ranking/sales observations.
+        # These do not count as direct user demand and never bypass Gate A.
+        {"name":"Creative Market - Bestselling Templates","source_type":"creative_market","platform":"creative_market","url":"https://creativemarket.com/templates-themes/popular","config":cfg("market","P1","market_intel",180,ranking="bestseller",limit=40),"enabled":True},
+        {"name":"Creative Market - Trending Templates","source_type":"creative_market","platform":"creative_market","url":"https://creativemarket.com/templates-themes/trending","config":cfg("market","P1","market_intel",180,ranking="trending",limit=40),"enabled":True},
+        {"name":"Etsy - Digital Template Market","source_type":"etsy_market","platform":"etsy","query":"digital download template","config":cfg("market","P1","market_intel",240,limit=30,digital_only=True),"enabled":True},
+        {"name":"闲鱼 - Excel数字模板","source_type":"xianyu_market","platform":"xianyu","query":"Excel模板","config":cfg("market","P1","market_intel",180,limit=30,digital_only=True,requires_login=True),"enabled":True},
+        {"name":"闲鱼 - 简历数字模板","source_type":"xianyu_market","platform":"xianyu","query":"简历模板","config":cfg("market","P1","market_intel",180,limit=30,digital_only=True,requires_login=True),"enabled":True},
+        {"name":"闲鱼 - 自动化数字工具","source_type":"xianyu_market","platform":"xianyu","query":"自动化脚本","config":cfg("market","P1","market_intel",180,limit=30,digital_only=True,requires_login=True),"enabled":True},
 
         # P2: supply intelligence; useful for finding reusable/open-source building blocks, never demand.
         {"name":"GitHub - automation templates","source_type":"github","platform":"github","query":"automation template in:name,description","config":cfg("supply","P2","supply_intel",360,mode="repositories",limit=50),"enabled":True},

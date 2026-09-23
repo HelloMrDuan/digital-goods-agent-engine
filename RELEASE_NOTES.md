@@ -1,3 +1,35 @@
+# V1.2.3 — SourceAsset License Registry
+
+- 新增 SourceAsset Registry：素材来源、URL/本地引用、checksum、所有权类型、许可证名称/URL、商用许可、再分发许可和证据独立入库。
+- 授权判断坚持显式事实：不会因为来源是 GitHub、网页或“开源”字样自动推断可商用/可再分发；未知信息进入 `REVIEW_REQUIRED`。
+- 明确 `commercial_use_allowed=false` 或 `redistribution_allowed=false` 的素材直接让商品 Gate B `BLOCKED`。
+- 商品必须绑定至少一个 SourceAsset 才能通过 Gate B；自有素材通过 `self_owned` 显式声明，外部许可素材要求补许可证/证据。
+- 新增素材登记、修改、商品绑定/解绑、授权 readiness API；商品详情页展示实际素材及商用/再分发状态。
+- Gate B 快照新增素材授权快照；素材或许可证信息变化会让旧 Gate B 自动失效。
+- 商品批准时记录批准对应的 Gate B snapshot；批准后若素材变化，即便重新跑 Gate B 通过，也必须再次人工批准才能交付。
+
+# V1.2.2 — Gate A / Gate B Product Lifecycle
+
+- 将既有真实需求商业验证显式标准化为 Gate A：`PASS / REJECT / REVIEW_REQUIRED`，继续坚持 evidence-first，不用 AI 补造需求指标。
+- 新增确定性 Gate B：检查当前 Gate A、商机分析快照、版权/合规风险、SKU、标题、描述、价格、交付物、FAQ 与合规备注。
+- Gate B 结果绑定商品内容 + 商机分析 + Gate A 快照；真实证据或商品内容变化后，旧 Gate B 会自动失效，不能继续批准或交付。
+- 商品人工批准收口到 Gate B：只有 `PASS` 才能进入 `APPROVED`，并把对应商机推进到 `READY_TO_PUBLISH`。
+- 交付记录扩展 `delivery_type/resource/retry/error/delivered_at`，并要求商品已批准且 Gate B 当前有效，禁止用假资源模拟已交付。
+- 新增商品详情、Gate A、Gate B、交付查询 API；前端商机页和商品页直接展示 Gate 状态、阻塞原因和检查项。
+- 旧 SQLite 数据库原地迁移，不删除既有真实 evidence、商机、商品或历史交付记录。
+
+# V1.2.0 — Real-Demand Commercial Validation Gate
+
+- 新增零 AI 的商业验证 Gate：基于独立需求信号、明确需求、作者/平台多样性、证据质量、时间覆盖和近 30 天需求判断商机是否可继续投入。
+- 验证结果绑定当前真实证据快照；证据新增、聚类变化或已关联证据再次观测后，旧 `PASSED` 自动变为 `STALE`。
+- 付费 AI 分析、同步分析任务、商品草稿生成和商品批准统一要求当前验证通过，低质量单点需求不会消耗模型费用。
+- 新增单条验证、查询验证、批量验证 API，并在商机详情和工作台展示验证状态与评分。
+- 商机分析 API 从重复注册收口为唯一实现，统一复用完整评分、版权风险和商品门槛逻辑。
+- Qiniu 主模型与 SenseNova 备用模型通过统一 provider 路由进入相同的证据约束提示和评分流程。
+- 补齐此前被页面引用但未入库的 `web/app.js`，恢复工作台、采集、证据、商机、趋势、质量、商品、成本和系统状态页面。
+- 旧数据库原地增加验证表和字段，不删除 `.env`、真实 evidence、商机、商品或交付记录。
+- 验收：pytest 47/47、Python compileall、前端 `node --check` 全部通过。
+
 # V1.1.3.3 — Windows OpenCLI Command Resolution Hotfix
 
 - 修复 P0 已启用、Doctor 已连接，但真实采集阶段仍报 `opencli: [WinError 2] 系统找不到指定的文件`。

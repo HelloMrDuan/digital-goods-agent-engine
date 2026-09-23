@@ -9,6 +9,7 @@ from ..config import settings
 from ..db import now_iso
 from .clustering import rebuild_clusters
 from .sources import collect_source, list_sources
+from .market_intel import rematch_market_intel
 
 _lock = threading.Lock()
 _thread: threading.Thread | None = None
@@ -36,7 +37,8 @@ def run_cycle() -> dict[str, Any]:
             except Exception as exc:
                 results.append({"source_id": source["id"], "status": "FAILED", "error": str(exc)})
         cluster = rebuild_clusters() if any(x.get("status") in {"SUCCESS", "EMPTY"} for x in results) else None
-        result = {"status": "SUCCESS", "processed_sources": len(results), "success_count": sum(1 for x in results if x.get("status") in {"SUCCESS","EMPTY"}), "skipped_count": sum(1 for x in results if x.get("status")=="SKIPPED"), "failed_count": sum(1 for x in results if x.get("status")=="FAILED"), "results": results, "cluster_run": cluster}
+        market_intel_links = rematch_market_intel() if cluster is not None else 0
+        result = {"status": "SUCCESS", "processed_sources": len(results), "success_count": sum(1 for x in results if x.get("status") in {"SUCCESS","EMPTY"}), "skipped_count": sum(1 for x in results if x.get("status")=="SKIPPED"), "failed_count": sum(1 for x in results if x.get("status")=="FAILED"), "results": results, "cluster_run": cluster, "market_intel_links": market_intel_links}
         _status["last_result"] = result
         return result
     except Exception as exc:

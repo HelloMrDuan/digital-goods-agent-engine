@@ -209,6 +209,21 @@ def init_db() -> None:
                 FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS commercial_validation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opportunity_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                score REAL NOT NULL,
+                policy_version TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                reasons_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_commercial_validation_opp
+                ON commercial_validation_runs(opportunity_id, id DESC);
+
             CREATE TABLE IF NOT EXISTS ai_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 operation TEXT NOT NULL,
@@ -225,6 +240,89 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS ai_budget_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                reserved_cost_cny REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_budget_reservations_created
+                ON ai_budget_reservations(created_at);
+
+            CREATE TABLE IF NOT EXISTS market_intel_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                marketplace TEXT NOT NULL,
+                source_item_id TEXT,
+                source_url TEXT,
+                title TEXT NOT NULL,
+                seller TEXT,
+                category TEXT,
+                price REAL,
+                currency TEXT,
+                sales_count REAL,
+                sales_scope TEXT,
+                sales_verified INTEGER NOT NULL DEFAULT 0,
+                digital_verified INTEGER NOT NULL DEFAULT 0,
+                digital_verification TEXT,
+                review_count REAL,
+                rating REAL,
+                favorites_count REAL,
+                views_count REAL,
+                rank_position INTEGER,
+                bestseller INTEGER NOT NULL DEFAULT 0,
+                trending INTEGER NOT NULL DEFAULT 0,
+                heat_score REAL NOT NULL DEFAULT 0,
+                sales_score REAL,
+                market_score REAL NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL,
+                raw_json TEXT,
+                canonical_key TEXT NOT NULL UNIQUE,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_intel_score
+                ON market_intel_items(market_score DESC, heat_score DESC, sales_score DESC);
+
+            CREATE TABLE IF NOT EXISTS market_intel_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_item_id INTEGER NOT NULL,
+                observed_at TEXT NOT NULL,
+                price REAL,
+                sales_count REAL,
+                sales_scope TEXT,
+                sales_verified INTEGER NOT NULL DEFAULT 0,
+                review_count REAL,
+                rating REAL,
+                favorites_count REAL,
+                views_count REAL,
+                rank_position INTEGER,
+                bestseller INTEGER NOT NULL DEFAULT 0,
+                trending INTEGER NOT NULL DEFAULT 0,
+                heat_score REAL NOT NULL DEFAULT 0,
+                sales_score REAL,
+                market_score REAL NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL,
+                FOREIGN KEY(market_item_id) REFERENCES market_intel_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_intel_snapshots_item
+                ON market_intel_snapshots(market_item_id, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS opportunity_market_intel (
+                opportunity_id INTEGER NOT NULL,
+                market_item_id INTEGER NOT NULL,
+                similarity REAL NOT NULL,
+                matched_at TEXT NOT NULL,
+                PRIMARY KEY(opportunity_id, market_item_id),
+                FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE CASCADE,
+                FOREIGN KEY(market_item_id) REFERENCES market_intel_items(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_opportunity_market_intel_opp
+                ON opportunity_market_intel(opportunity_id, similarity DESC);
+
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 opportunity_id INTEGER NOT NULL,
@@ -233,6 +331,7 @@ def init_db() -> None:
                 category TEXT,
                 audience TEXT,
                 price_suggestion REAL,
+                artifact_format TEXT,
                 title TEXT,
                 description TEXT,
                 keywords_json TEXT,
@@ -245,6 +344,86 @@ def init_db() -> None:
                 FOREIGN KEY(opportunity_id) REFERENCES opportunities(id) ON DELETE RESTRICT
             );
 
+            CREATE TABLE IF NOT EXISTS source_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_url TEXT,
+                local_ref TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                checksum TEXT,
+                ownership_type TEXT NOT NULL DEFAULT 'unknown',
+                license_name TEXT,
+                license_url TEXT,
+                commercial_use_allowed INTEGER,
+                redistribution_allowed INTEGER,
+                license_evidence_json TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS product_assets (
+                product_id INTEGER NOT NULL,
+                source_asset_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'deliverable',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(product_id, source_asset_id, role),
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES source_assets(id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_assets_product ON product_assets(product_id);
+
+            CREATE TABLE IF NOT EXISTS product_gate_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                decision TEXT NOT NULL,
+                score REAL NOT NULL,
+                policy_version TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                checks_json TEXT NOT NULL,
+                blockers_json TEXT NOT NULL,
+                review_flags_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_gate_product
+                ON product_gate_runs(product_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS product_builds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                bundle_path TEXT,
+                checksum TEXT,
+                manifest_json TEXT,
+                source_asset_id INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES source_assets(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_builds_product
+                ON product_builds(product_id, id DESC);
+
+            CREATE TABLE IF NOT EXISTS publish_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT,
+                external_id TEXT,
+                external_url TEXT,
+                response_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_publish_runs_product
+                ON publish_runs(product_id, platform, id DESC);
+
             CREATE TABLE IF NOT EXISTS deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 product_id INTEGER NOT NULL,
@@ -252,6 +431,11 @@ def init_db() -> None:
                 order_ref TEXT NOT NULL,
                 buyer_ref TEXT,
                 delivery_uri TEXT,
+                delivery_type TEXT NOT NULL DEFAULT 'manual',
+                resource_json TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                delivered_at TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -380,9 +564,96 @@ def init_db() -> None:
             "explicit_demand_count": "INTEGER NOT NULL DEFAULT 0",
             "probable_demand_count": "INTEGER NOT NULL DEFAULT 0",
             "comment_demand_count": "INTEGER NOT NULL DEFAULT 0",
+            "validation_status": "TEXT NOT NULL DEFAULT 'NOT_VALIDATED'",
+            "validation_score": "REAL",
+            "validation_snapshot_hash": "TEXT",
+            "validated_at": "TEXT",
+            "validation_json": "TEXT",
         }.items():
             _ensure_column(c, "opportunities", name, ddl)
 
+
+        for name, ddl in {
+            "digital_verified": "INTEGER NOT NULL DEFAULT 0",
+            "digital_verification": "TEXT",
+        }.items():
+            _ensure_column(c, "market_intel_items", name, ddl)
+
+        for name, ddl in {
+            "gate_status": "TEXT NOT NULL DEFAULT 'NOT_RUN'",
+            "gate_score": "REAL",
+            "gate_snapshot_hash": "TEXT",
+            "gate_checked_at": "TEXT",
+            "gate_json": "TEXT",
+            "approved_at": "TEXT",
+            "approved_gate_snapshot_hash": "TEXT",
+            "artifact_format": "TEXT",
+            "price_currency": "TEXT NOT NULL DEFAULT 'CNY'",
+            "published_at": "TEXT",
+            "published_platform": "TEXT",
+            "external_listing_id": "TEXT",
+            "external_listing_url": "TEXT",
+        }.items():
+            _ensure_column(c, "products", name, ddl)
+
+        for name, ddl in {
+            "delivery_type": "TEXT NOT NULL DEFAULT 'manual'",
+            "resource_json": "TEXT",
+            "retry_count": "INTEGER NOT NULL DEFAULT 0",
+            "error_message": "TEXT",
+            "delivered_at": "TEXT",
+        }.items():
+            _ensure_column(c, "deliveries", name, ddl)
+
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS source_assets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL,
+                source_url TEXT,
+                local_ref TEXT,
+                title TEXT NOT NULL,
+                author TEXT,
+                checksum TEXT,
+                ownership_type TEXT NOT NULL DEFAULT 'unknown',
+                license_name TEXT,
+                license_url TEXT,
+                commercial_use_allowed INTEGER,
+                redistribution_allowed INTEGER,
+                license_evidence_json TEXT,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS product_assets (
+                product_id INTEGER NOT NULL,
+                source_asset_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'deliverable',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(product_id, source_asset_id, role),
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_asset_id) REFERENCES source_assets(id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_product_assets_product ON product_assets(product_id);
+            """
+        )
+
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS product_gate_runs (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   product_id INTEGER NOT NULL,
+                   decision TEXT NOT NULL,
+                   score REAL NOT NULL,
+                   policy_version TEXT NOT NULL,
+                   snapshot_hash TEXT NOT NULL,
+                   checks_json TEXT NOT NULL,
+                   blockers_json TEXT NOT NULL,
+                   review_flags_json TEXT NOT NULL,
+                   created_at TEXT NOT NULL,
+                   FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+               )"""
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_product_gate_product ON product_gate_runs(product_id, id DESC)")
 
         for name, ddl in {
             "trend_confidence": "REAL NOT NULL DEFAULT 0",

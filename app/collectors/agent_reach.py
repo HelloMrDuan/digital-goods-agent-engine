@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import quote
 
@@ -131,19 +132,26 @@ def doctor() -> dict[str, Any]:
         opencli = _opencli_doctor()
 
         if opencli.get("installed"):
+            connected = bool(opencli.get("connected"))
+            channel_status = "ok" if connected else "not_connected"
             return {
                 "installed": True,
-                "status": "OK",
+                "status": "OK" if connected else "NOT_CONNECTED",
                 "channels": {
                     "xiaohongshu": {
-                        "effective_status": "ok",
+                        "effective_status": channel_status,
                         "effective_backend": "OpenCLI Browser Bridge",
-                        "opencli_connected": opencli.get("connected", False),
+                        "opencli_connected": connected,
                     },
                     "reddit": {
-                        "effective_status": "ok",
+                        "effective_status": channel_status,
                         "effective_backend": "OpenCLI Browser Bridge",
-                        "opencli_connected": opencli.get("connected", False),
+                        "opencli_connected": connected,
+                    },
+                    "xianyu": {
+                        "effective_status": channel_status,
+                        "effective_backend": "OpenCLI Browser Bridge",
+                        "opencli_connected": connected,
                     },
                 },
                 "opencli": opencli,
@@ -179,7 +187,7 @@ def doctor() -> dict[str, Any]:
         }
 
         if opencli.get("connected"):
-            for platform in ("xiaohongshu", "reddit"):
+            for platform in ("xiaohongshu", "reddit", "xianyu"):
                 info = dict(effective.get(platform) or {})
                 info["effective_status"] = "ok"
                 info["effective_backend"] = "OpenCLI Browser Bridge"
@@ -227,6 +235,31 @@ def _parse_output(text: str) -> Any:
         return yaml.safe_load(text)
     except Exception:
         return {"text": text}
+
+
+def _payload_shape(value: Any) -> str:
+    if isinstance(value, list):
+        if not value:
+            return "list[0]"
+        first = value[0]
+        if isinstance(first, dict):
+            return "list[dict] keys=" + ",".join(sorted(str(k) for k in first.keys())[:12])
+        return f"list[{type(first).__name__}]"
+    if isinstance(value, dict):
+        return "dict keys=" + ",".join(sorted(str(k) for k in value.keys())[:16])
+    return type(value).__name__
+
+
+def _is_empty_result_payload(value: Any) -> bool:
+    if value in (None, "", [], {}):
+        return True
+    if isinstance(value, dict):
+        for key in ("items", "results", "posts", "notes", "videos", "feeds", "list"):
+            if key in value and isinstance(value.get(key), list):
+                return len(value.get(key) or []) == 0
+        if "data" in value:
+            return _is_empty_result_payload(value.get("data"))
+    return False
 
 
 def _flatten_candidate_items(value: Any) -> list[dict[str, Any]]:
@@ -293,7 +326,7 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
     if not title:
         return None
 
-    item_id = _first(raw, "id", "note_id", "noteId", "post_id", "postId", "video_id", "videoId", "aweme_id", "mid", "bvid", "aid")
+    item_id = _first(raw, "id", "item_id", "itemId", "note_id", "noteId", "post_id", "postId", "video_id", "videoId", "aweme_id", "mid", "bvid", "aid")
     url = _first(raw, "url", "link", "web_url", "share_url", "note_url", "permalink", "webpage_url")
     if platform == "xiaohongshu" and not url and item_id:
         token = _first(raw, "xsec_token", "xsecToken")
@@ -304,6 +337,8 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
         url = "https://www.reddit.com" + str(url)
     elif platform == "reddit" and not url and item_id:
         url = f"https://www.reddit.com/comments/{item_id}/"
+    elif platform == "xianyu" and not url and item_id:
+        url = f"https://www.goofish.com/item?categoryId=0&id={item_id}"
     elif platform == "bilibili" and not url and item_id:
         sid = str(item_id)
         url = f"https://www.bilibili.com/video/{sid}" if sid.upper().startswith("BV") else f"https://www.bilibili.com/video/av{sid}"
@@ -313,7 +348,7 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
     if not url and item_id is None:
         return None
 
-    author_raw = _first(raw, "author", "user", "owner", "nickname", "username", "user_name", "channel", "uploader")
+    author_raw = _first(raw, "author", "seller", "seller_name", "sellerName", "user", "owner", "nickname", "username", "user_name", "channel", "uploader")
     if isinstance(author_raw, dict):
         author_raw = _first(author_raw, "name", "nickname", "username", "login", "user_name")
 
@@ -362,6 +397,7 @@ def _channel_info(status: dict[str, Any], platform: str) -> dict[str, Any]:
         aliases = {
             "xiaohongshu": ("xiaohongshu", "xhs", "小红书"),
             "reddit": ("reddit",),
+            "xianyu": ("xianyu", "闲鱼", "goofish"),
             "bilibili": ("bilibili", "bili", "b站"),
             "youtube": ("youtube",),
             "github": ("github",),
@@ -382,12 +418,25 @@ def _run(cmd: list[str], timeout: int = 150) -> Any:
     return _parse_output(stdout)
 
 
-def _commands(platform: str, query: str, limit: int, active_backend: str) -> list[list[str]]:
+def _commands(platform: str, query: str, limit: int, active_backend: str, sort: str | None = None) -> list[list[str]]:
     b = active_backend.lower()
     cmds: list[list[str]] = []
     if platform == "xiaohongshu":
+        xhs_sort = str(sort or "comprehensive").strip().lower()
+        allowed_sorts = {"comprehensive", "latest", "most-liked", "most-commented", "most-collected"}
+        if xhs_sort not in allowed_sorts:
+            raise CollectorError(
+                "unsupported Xiaohongshu sort: "
+                + xhs_sort
+                + "; expected one of "
+                + ", ".join(sorted(allowed_sorts))
+            )
         if "opencli" in b or (not b and shutil.which("opencli")):
-            cmds.append(["opencli", "xiaohongshu", "search", query, "-f", "yaml"])
+            cmd = ["opencli", "xiaohongshu", "search", query, "--limit", str(limit)]
+            if xhs_sort != "comprehensive":
+                cmd.extend(["--sort", xhs_sort])
+            cmd.extend(["-f", "json"])
+            cmds.append(cmd)
         if "mcp" in b or "xiaohongshu" in b or (not b and shutil.which("mcporter")):
             call = f'xiaohongshu.search_feeds(keyword: {json.dumps(query, ensure_ascii=False)})'
             cmds.append(["mcporter", "call", call, "--timeout", "120000"])
@@ -398,6 +447,9 @@ def _commands(platform: str, query: str, limit: int, active_backend: str) -> lis
             cmds.append(["opencli", "reddit", "search", query, "-f", "yaml"])
         if "rdt" in b or (not b and shutil.which("rdt")):
             cmds.append(["rdt", "search", query, "--limit", str(limit), "--yaml"])
+    elif platform == "xianyu":
+        if "opencli" in b or (not b and shutil.which("opencli")):
+            cmds.append(["opencli", "xianyu", "search", query, "--limit", str(limit), "-f", "json"])
     elif platform == "bilibili":
         if "bili" in b or (not b and shutil.which("bili")):
             cmds.append(["bili", "search", query, "--type", "video", "--max", str(limit), "--yaml"])
@@ -414,7 +466,9 @@ def _commands(platform: str, query: str, limit: int, active_backend: str) -> lis
 
 
 
-def _synthetic_comment_id(platform: str, parent_id: str | None, author: str | None, text: str) -> str:
+def _derived_comment_id(platform: str, parent_id: str | None, author: str | None, text: str) -> str:
+    # This is only a deterministic local identity for a real comment when the upstream omits an ID.
+    # It never fabricates comment content, author, engagement, or timestamp.
     payload = "\x1f".join([platform, parent_id or "", author or "", re.sub(r"\s+", " ", text).strip()])
     return "comment-hash:" + hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()[:32]
 
@@ -433,7 +487,7 @@ def _comment_item(platform: str, parent: CollectedItem, raw: dict[str, Any]) -> 
     if isinstance(author, dict):
         author = _first(author, "name", "nickname", "username", "user_name")
     raw_id = _first(raw, "id", "comment_id", "commentId", "cid", "rpid")
-    sid = str(raw_id) if raw_id not in (None, "") else _synthetic_comment_id(platform, parent.source_item_id, str(author) if author else None, text)
+    sid = str(raw_id) if raw_id not in (None, "") else _derived_comment_id(platform, parent.source_item_id, str(author) if author else None, text)
     published = _first(raw, "published_at", "created_at", "createdAt", "created_utc", "time", "timestamp")
     time_quality = "source" if published not in (None, "") else "inherited_thread"
     if published in (None, ""):
@@ -463,6 +517,72 @@ def _comment_item(platform: str, parent: CollectedItem, raw: dict[str, Any]) -> 
         thread_url=parent.source_url,
         published_time_quality=time_quality,
     )
+
+
+def _xianyu_detail_item(parent: CollectedItem) -> CollectedItem:
+    if not parent.source_item_id:
+        return parent
+    try:
+        body = _run(
+            ["opencli", "xianyu", "item", str(parent.source_item_id), "-f", "json"],
+            timeout=max(10, int(settings.xianyu_market_detail_timeout_seconds)),
+        )
+        raws = _flatten_candidate_items(body)
+        detail = raws[0] if raws else (body if isinstance(body, dict) else {})
+        if not isinstance(detail, dict) or not detail:
+            return parent
+        merged = dict(parent.raw or {})
+        merged["_xianyu_detail_verified"] = True
+        merged["_xianyu_detail"] = detail
+        detail_title = _first(detail, "title", "name")
+        detail_text = _first(detail, "content", "description", "desc", "text")
+        detail_author = _first(detail, "seller", "seller_name", "sellerName", "nick", "nickname")
+        if isinstance(detail_author, dict):
+            detail_author = _first(detail_author, "name", "nick", "nickname", "user_name")
+        return CollectedItem(
+            platform=parent.platform,
+            source_type=parent.source_type,
+            source_item_id=parent.source_item_id,
+            source_url=parent.source_url,
+            title=str(detail_title or parent.title),
+            content=str(detail_text or parent.content or "") or None,
+            author=str(detail_author or parent.author) if (detail_author or parent.author) else None,
+            published_at=parent.published_at,
+            engagement=parent.engagement,
+            raw=merged,
+            content_kind=parent.content_kind,
+            parent_source_item_id=parent.parent_source_item_id,
+            thread_url=parent.thread_url,
+            published_time_quality=parent.published_time_quality,
+        )
+    except Exception:
+        return parent
+
+
+def _enrich_xianyu_details(parents: list[CollectedItem], detail_limit: int) -> list[CollectedItem]:
+    if not shutil.which("opencli") or detail_limit <= 0:
+        return parents
+
+    capped = min(
+        len(parents),
+        max(0, int(detail_limit)),
+        max(1, int(settings.xianyu_market_detail_limit)),
+    )
+    indexes = [index for index, parent in enumerate(parents[:capped]) if parent.source_item_id]
+    if not indexes:
+        return parents
+
+    out = list(parents)
+    workers = min(max(1, int(settings.xianyu_market_detail_workers)), len(indexes))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xianyu-detail") as pool:
+        future_map = {pool.submit(_xianyu_detail_item, parents[index]): index for index in indexes}
+        for future in as_completed(future_map):
+            index = future_map[future]
+            try:
+                out[index] = future.result()
+            except Exception:
+                out[index] = parents[index]
+    return out
 
 
 def _enrich_opencli(platform: str, parents: list[CollectedItem], detail_limit: int, comments_limit: int) -> list[CollectedItem]:
@@ -510,7 +630,16 @@ def _enrich_opencli(platform: str, parents: list[CollectedItem], detail_limit: i
     return out
 
 
-def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False, detail_limit: int = 8, comments_limit: int = 15) -> list[CollectedItem]:
+def collect(
+    platform: str,
+    query: str,
+    limit: int = 20,
+    *,
+    enrich: bool = False,
+    detail_limit: int = 8,
+    comments_limit: int = 15,
+    sort: str | None = None,
+) -> list[CollectedItem]:
     """Collect real platform results through Agent-Reach-selected upstream tools.
 
     Agent-Reach is a router/installer rather than a data proxy. We run its doctor first,
@@ -521,7 +650,10 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
         base = settings.agent_reach_bridge_url.strip().rstrip("/")
         try:
             with httpx.Client(timeout=190, headers=_bridge_headers()) as client:
-                resp = client.post(base + "/collect", json={"platform": platform, "query": query, "limit": limit, "enrich": enrich, "detail_limit": detail_limit, "comments_limit": comments_limit})
+                payload = {"platform": platform, "query": query, "limit": limit, "enrich": enrich, "detail_limit": detail_limit, "comments_limit": comments_limit}
+                if sort:
+                    payload["sort"] = sort
+                resp = client.post(base + "/collect", json=payload)
                 resp.raise_for_status()
                 body = resp.json()
         except Exception as exc:
@@ -542,7 +674,7 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
         raise CollectorError("Agent-Reach is not installed")
     info = _channel_info(status, platform)
     active_backend = str(info.get("active_backend") or info.get("effective_backend") or info.get("backend") or "")
-    commands = _commands(platform, query, limit, active_backend)
+    commands = _commands(platform, query, limit, active_backend, sort=sort)
     if not commands:
         detail = info.get("message") or info.get("status") or "no documented backend command is available"
         raise CollectorError(f"Agent-Reach {platform} is not ready: {detail}")
@@ -552,6 +684,10 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
         try:
             body = _run(cmd)
             raw_items = _flatten_candidate_items(body)
+            if not raw_items and _is_empty_result_payload(body):
+                # A successful OpenCLI command returning [] (or an empty normalized
+                # envelope) is a legitimate empty search result, not a parser failure.
+                return []
             out: list[CollectedItem] = []
             for raw in raw_items:
                 item = _normalize(platform, raw)
@@ -560,10 +696,46 @@ def collect(platform: str, query: str, limit: int = 20, *, enrich: bool = False,
                     out.append(item)
             if out:
                 search_items = out[:limit]
-                if enrich and cmd[0] == "opencli" and platform in {"xiaohongshu", "reddit"}:
-                    search_items.extend(_enrich_opencli(platform, search_items, max(0, int(detail_limit)), max(0, int(comments_limit))))
+                if enrich and cmd[0] == "opencli":
+                    if platform in {"xiaohongshu", "reddit"}:
+                        search_items.extend(_enrich_opencli(platform, search_items, max(0, int(detail_limit)), max(0, int(comments_limit))))
+                    elif platform == "xianyu":
+                        search_items = _enrich_xianyu_details(search_items, max(0, int(detail_limit)))
                 return search_items
-            errors.append(f"{cmd[0]} returned no parseable real items")
+            errors.append(
+                f"{cmd[0]} returned no parseable real items "
+                f"(raw_items={len(raw_items)}, payload={_payload_shape(body)})"
+            )
         except Exception as exc:
             errors.append(f"{cmd[0]}: {exc}")
     raise CollectorError("Agent-Reach real collection failed: " + " | ".join(errors))
+
+
+
+def publish_xianyu_listing(
+    title: str,
+    description: str,
+    price: float,
+    condition: str,
+    category: str,
+    image_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish a real Xianyu listing through the authenticated OpenCLI browser adapter."""
+    if not shutil.which("opencli"):
+        raise CollectorError("OpenCLI is not installed")
+    if not title.strip() or not description.strip() or float(price) <= 0 or not category.strip():
+        raise CollectorError("Xianyu publish fields are incomplete")
+    if condition not in {"全新", "几乎全新", "轻微使用", "明显使用", "老旧"}:
+        raise CollectorError("unsupported Xianyu condition")
+    cmd = [
+        "opencli", "xianyu", "publish",
+        title.strip(), description.strip(), f"{float(price):.2f}", condition, category.strip(),
+    ]
+    paths = [str(x).strip() for x in (image_paths or []) if str(x).strip()]
+    if paths:
+        cmd.extend(["--images", ",".join(paths)])
+    cmd.extend(["-f", "json"])
+    body = _run(cmd, timeout=180)
+    if isinstance(body, dict):
+        return body
+    return {"data": body}

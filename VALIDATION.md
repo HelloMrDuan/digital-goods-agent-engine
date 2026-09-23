@@ -1,3 +1,19 @@
+# V1.2.0 Commercial Validation Validation
+
+- 单一真实需求信号无法通过商业验证：PASS
+- 两名独立真实需求作者、证据质量与时间覆盖达标时通过：PASS
+- 聚类关联证据变化后旧验证自动 `STALE`：PASS
+- 验证未通过时，付费 AI provider 不会被调用：PASS
+- 验证未通过或已过期时，商品草稿生成被拦截：PASS
+- 商品草稿生成后证据变化，人工批准被拦截：PASS
+- 商机分析 POST 路由仅注册一次：PASS
+- V1.2 单条/查询/批量验证 API 均存在：PASS
+- `web/app.js` 已入库并通过 Node 语法检查：PASS
+- V1.1.3.3 旧库原地迁移到 V1.2 验证表/字段：PASS
+- pytest：47/47 PASS
+- Python compileall：PASS
+- 发布库不插入任何测试业务数据：PASS
+
 # V1.1.3.3 Windows OpenCLI Command Resolution Validation
 
 - 裸 `opencli` → `shutil.which()` 解析到 `opencli.cmd`：PASS

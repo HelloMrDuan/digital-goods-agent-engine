@@ -23,7 +23,47 @@ class SourceUpdate(BaseModel):
 
 class DeliveryIn(BaseModel):
     product_id: int
-    platform: str = "manual"
+    platform: str = Field(default="manual", min_length=1, max_length=80)
     order_ref: str = Field(min_length=1, max_length=200)
     buyer_ref: str | None = Field(default=None, max_length=300)
     delivery_uri: str | None = Field(default=None, max_length=2000)
+    delivery_type: str = Field(
+        default="manual",
+        pattern="^(manual|file_download|cloud_drive_link|extraction_code|license_key|api_delivery|manual_review)$",
+    )
+    resource: dict[str, Any] | None = None
+
+
+class SourceAssetCreate(BaseModel):
+    source_type: str = Field(pattern="^(owned|user_upload|github|web|open_source|licensed|public_domain)$")
+    title: str = Field(min_length=1, max_length=300)
+    source_url: str | None = Field(default=None, max_length=2000)
+    local_ref: str | None = Field(default=None, max_length=2000)
+    author: str | None = Field(default=None, max_length=300)
+    checksum: str | None = Field(default=None, max_length=256)
+    ownership_type: str = Field(
+        default="unknown",
+        pattern="^(self_owned|licensed|open_source|public_domain|unknown)$",
+    )
+    license_name: str | None = Field(default=None, max_length=300)
+    license_url: str | None = Field(default=None, max_length=2000)
+    commercial_use_allowed: bool | None = None
+    redistribution_allowed: bool | None = None
+    license_evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class SourceAssetUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    source_url: str | None = Field(default=None, max_length=2000)
+    local_ref: str | None = Field(default=None, max_length=2000)
+    author: str | None = Field(default=None, max_length=300)
+    checksum: str | None = Field(default=None, max_length=256)
+    ownership_type: str | None = Field(
+        default=None,
+        pattern="^(self_owned|licensed|open_source|public_domain|unknown)$",
+    )
+    license_name: str | None = Field(default=None, max_length=300)
+    license_url: str | None = Field(default=None, max_length=2000)
+    commercial_use_allowed: bool | None = None
+    redistribution_allowed: bool | None = None
+    license_evidence: dict[str, Any] | None = None

@@ -3,9 +3,130 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from ..config import settings
 from ..db import conn, loads, now_iso, row_to_dict
+
+
+
+_SUSPICIOUS_SOURCE_TYPES = {"mock", "fake", "demo", "sample", "synthetic", "dummy", "test", "fixture"}
+_RESERVED_HOSTS = {"example.com", "example.org", "example.net"}
+
+
+def _suspicious_provenance(source_type: Any, source_url: Any) -> str | None:
+    source_value = str(source_type or "").strip().lower()
+    tokens = {token for token in source_value.replace("-", "_").split("_") if token}
+    bad_tokens = tokens & _SUSPICIOUS_SOURCE_TYPES
+    if bad_tokens:
+        return "suspicious_source_type:" + ",".join(sorted(bad_tokens))
+    raw_url = str(source_url or "").strip()
+    if raw_url:
+        try:
+            host = (urlparse(raw_url).hostname or "").lower()
+        except Exception:
+            host = ""
+        if host in _RESERVED_HOSTS or host.endswith(".example") or host.endswith(".test") or host.endswith(".invalid"):
+            return f"reserved_nonproduction_host:{host}"
+    return None
+
+
+def runtime_integrity_report() -> dict[str, Any]:
+    """Find business rows that look like fixtures/demo data instead of real provenance."""
+    with conn() as c:
+        evidence_rows = c.execute(
+            "SELECT id,source_type,source_url,title FROM evidence ORDER BY id"
+        ).fetchall()
+        market_rows = c.execute(
+            """SELECT mi.id,mi.source_url,mi.title,s.source_type
+               FROM market_intel_items mi JOIN sources s ON s.id=mi.source_id ORDER BY mi.id"""
+        ).fetchall()
+        opportunity_rows = c.execute(
+            """SELECT DISTINCT o.id,o.title
+               FROM opportunities o
+               JOIN opportunity_evidence oe ON oe.opportunity_id=o.id
+               JOIN evidence e ON e.id=oe.evidence_id"""
+        ).fetchall()
+        product_rows = c.execute(
+            """SELECT p.id,p.name,p.opportunity_id
+               FROM products p"""
+        ).fetchall()
+
+        suspicious_evidence: list[dict[str, Any]] = []
+        suspicious_evidence_ids: set[int] = set()
+        for row in evidence_rows:
+            reason = _suspicious_provenance(row["source_type"], row["source_url"])
+            if reason:
+                eid = int(row["id"])
+                suspicious_evidence_ids.add(eid)
+                suspicious_evidence.append({"id": eid, "title": row["title"], "reason": reason})
+
+        suspicious_market: list[dict[str, Any]] = []
+        for row in market_rows:
+            reason = _suspicious_provenance(row["source_type"], row["source_url"])
+            if reason:
+                suspicious_market.append({"id": int(row["id"]), "title": row["title"], "reason": reason})
+
+        impacted_opportunity_ids: set[int] = set()
+        if suspicious_evidence_ids:
+            placeholders = ",".join("?" for _ in suspicious_evidence_ids)
+            linked = c.execute(
+                f"SELECT DISTINCT opportunity_id FROM opportunity_evidence WHERE evidence_id IN ({placeholders})",
+                tuple(sorted(suspicious_evidence_ids)),
+            ).fetchall()
+            impacted_opportunity_ids = {int(row["opportunity_id"]) for row in linked}
+
+        impacted_products = [
+            {"id": int(row["id"]), "name": row["name"], "opportunity_id": int(row["opportunity_id"])}
+            for row in product_rows
+            if int(row["opportunity_id"]) in impacted_opportunity_ids
+        ]
+
+    clean = not suspicious_evidence and not suspicious_market and not impacted_products
+    return {
+        "status": "PASS" if clean else "FAILED",
+        "real_data_only": clean,
+        "suspicious_evidence_count": len(suspicious_evidence),
+        "suspicious_market_intel_count": len(suspicious_market),
+        "impacted_opportunity_count": len(impacted_opportunity_ids),
+        "impacted_product_count": len(impacted_products),
+        "suspicious_evidence": suspicious_evidence[:50],
+        "suspicious_market_intel": suspicious_market[:50],
+        "impacted_products": impacted_products[:50],
+        "policy": "mock/fake/demo/sample/synthetic/dummy/test/fixture provenance and reserved example/test hosts are not valid production business data",
+    }
+
+
+def assert_real_opportunity_provenance(opportunity_id: int) -> None:
+    with conn() as c:
+        rows = c.execute(
+            """SELECT e.id,e.source_type,e.source_url
+               FROM opportunity_evidence oe
+               JOIN evidence e ON e.id=oe.evidence_id
+               WHERE oe.opportunity_id=?""",
+            (opportunity_id,),
+        ).fetchall()
+        market_rows = c.execute(
+            """SELECT mi.id,mi.source_url,s.source_type
+               FROM opportunity_market_intel omi
+               JOIN market_intel_items mi ON mi.id=omi.market_item_id
+               JOIN sources s ON s.id=mi.source_id
+               WHERE omi.opportunity_id=?""",
+            (opportunity_id,),
+        ).fetchall()
+    failures = []
+    for row in rows:
+        reason = _suspicious_provenance(row["source_type"], row["source_url"])
+        if reason:
+            failures.append(f"evidence:{row['id']}:{reason}")
+    for row in market_rows:
+        reason = _suspicious_provenance(row["source_type"], row["source_url"])
+        if reason:
+            failures.append(f"market_intel:{row['id']}:{reason}")
+    if failures:
+        raise ValueError(
+            "opportunity contains non-production provenance and cannot be analyzed: " + "; ".join(failures[:10])
+        )
 
 
 def data_quality_report() -> dict[str, Any]:
@@ -96,9 +217,11 @@ def data_quality_report() -> dict[str, Any]:
     stale_cut = (now - timedelta(hours=max(1, settings.source_stale_after_hours))).isoformat(timespec="seconds")
     stale_sources = sum(1 for s in source_rows if s["enabled"] and (not s["last_success_at"] or str(s["last_success_at"]) < stale_cut))
     duplicated_rows = sum(max(0, int(r["c"]) - 1) for r in duplicate_rows)
+    integrity = runtime_integrity_report()
     return {
         "generated_at": now_iso(),
-        "real_data_only": True,
+        "real_data_only": integrity["status"] == "PASS",
+        "runtime_integrity": integrity,
         "evidence_total": total,
         "independent_content_fingerprints": len(fingerprints),
         "mirrored_or_exact_copy_extra_rows": duplicated_rows,
@@ -120,5 +243,6 @@ def data_quality_report() -> dict[str, Any]:
             "evidence quality is a transparent completeness score, not an AI judgment",
             "only explicit_demand/probable_demand from core_demand sources can enter business demand clustering",
             "source reliability uses the latest 20 completed collection runs per source",
+            "runtime_integrity fails when fixture/demo provenance is present in production business rows",
         ],
     }

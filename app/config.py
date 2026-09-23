@@ -14,11 +14,31 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
     db_path: str = str(BASE_DIR / "data" / "digital_goods.db")
+    artifact_dir: str = str(BASE_DIR / "data" / "generated")
+    default_product_currency: str = "CNY"
 
     # Production never falls back to fake AI or fake data.
     qiniu_api_token: str = ""
-    qiniu_model: str = "qwen3.5-plus"
-    qiniu_base_url: str = ""
+    qiniu_model: str = "qwen/qwen3.5-plus"
+    qiniu_base_url: str = "https://api.qnaigc.com/v1"
+    # Explicit prices override built-in public list-price estimates. Zero means auto-resolve
+    # for known models; unknown models remain unpriced rather than inventing a cost.
+    qiniu_input_price_per_million: float = 0.0
+    qiniu_output_price_per_million: float = 0.0
+    qiniu_enable_thinking: bool = False
+    qiniu_json_mode: bool = True
+    # Qiniu accounts can have a low requests-per-minute quota. Opportunity rebuilds may
+    # run several opportunities concurrently, so all Qiniu calls share one process-level
+    # pacer. 8s keeps request starts at <=7.5 RPM and leaves headroom for rolling windows.
+    qiniu_min_request_interval_seconds: float = 8.0
+    qiniu_rate_limit_retries: int = 4
+    qiniu_rate_limit_backoff_seconds: float = 15.0
+    # Any RPM 429 opens a process-wide cooldown. This is intentionally a full minute so
+    # concurrent Agent workers cannot keep the provider's rolling RPM window permanently hot.
+    qiniu_rate_limit_global_cooldown_seconds: float = 60.0
+    # Structured responses normally use AGENT_MAX_NEW_TOKENS. If a response clearly starts
+    # as JSON but is cut off by the output limit, retry once with this larger cap.
+    qiniu_json_retry_max_tokens: int = 1600
 
     sensenova_api_token: str = ""
     sensenova_model: str = ""
@@ -31,6 +51,34 @@ class Settings(BaseSettings):
     min_score_for_product: int = 70
     high_risk_threshold: int = 80
     daily_ai_budget_cny: float = 5.0
+    # Unknown/unpriced models still reserve budget conservatively instead of bypassing the cap.
+    ai_unknown_call_reserve_cny: float = 0.10
+
+    # Mutating /api routes require this token for non-loopback clients. When empty,
+    # remote writes are disabled; local loopback development remains usable.
+    api_auth_token: str = ""
+
+    # V1.2 deterministic commercial validation. This gate protects product generation,
+    # but the opportunity Agent workflow may still evaluate failed candidates as WATCH/DROP
+    # so deterministic keyword rules do not silently erase potentially useful real evidence.
+    commercial_validation_min_signals: int = 2
+    commercial_validation_min_authors: int = 2
+    commercial_validation_min_quality: float = 55.0
+    commercial_validation_min_timestamp_coverage: float = 50.0
+    commercial_validation_min_score: float = 65.0
+
+    # V1.2 Opportunity Agent Engine. Evidence is compacted once, then structured results
+    # flow through Signal -> Pain -> Market -> Product -> Risk -> Judge to limit token cost.
+    agent_evidence_limit: int = 80
+    agent_digest_snippets: int = 14
+    agent_snippet_chars: int = 420
+    agent_max_new_tokens: int = 800
+    # Different opportunities are independent. Provider-side pacing below prevents these
+    # workers from turning into an RPM burst against Qiniu.
+    agent_rebuild_concurrency: int = 3
+    agent_build_score: float = 75.0
+    agent_build_market_score: float = 65.0
+    agent_watch_score: float = 50.0
 
     github_token: str = ""
     rsshub_base_url: str = ""
@@ -43,6 +91,9 @@ class Settings(BaseSettings):
     user_agent: str = "DigitalGoodsRealCollector/1.0 (+local-self-hosted)"
 
     request_timeout_seconds: float = 25.0
+    # Marketplace HTTP collectors may need the host's HTTP(S)_PROXY settings.
+    # Keep this configurable instead of hard-disabling proxies inside httpx.
+    marketplace_trust_env: bool = True
     collector_limit_default: int = 30
     collector_retries: int = 2
     collector_backoff_base_seconds: float = 2.0
@@ -52,12 +103,58 @@ class Settings(BaseSettings):
     source_stale_after_hours: int = 24
     trend_support_similarity_threshold: float = 0.42
     trend_min_confidence_for_trusted_rank: float = 35.0
-    auto_collect_enabled: bool = False
-    auto_collect_interval_minutes: int = 360
+
+    # Market Intelligence: real marketplace rank/engagement/sales observations.
+    market_intel_match_threshold: float = 0.12
+    market_intel_high_heat_score: float = 65.0
+    market_intel_high_sales_score: float = 60.0
+    etsy_enrich_shop_sales: bool = True
+    etsy_shop_enrich_limit: int = 8
+    etsy_digital_verify_limit: int = 30
+    # Interactive rebuilds only need top market signals; cap refresh breadth so a
+    # marketplace cannot monopolize the whole opportunity rebuild.
+    market_refresh_source_limit: int = 12
+    rebuild_task_stale_minutes: int = 10
+    xianyu_market_detail_limit: int = 9
+    xianyu_market_detail_workers: int = 3
+    xianyu_market_detail_timeout_seconds: int = 40
+
+    # Real Etsy Open API v3 publishing. No fake success when credentials are absent.
+    etsy_api_key: str = ""
+    etsy_access_token: str = ""
+    etsy_shop_id: str = ""
+    etsy_taxonomy_id: int = 0
+    etsy_shop_currency: str = ""
+    etsy_listing_quantity: int = 999
+    etsy_who_made: str = "i_did"
+    etsy_when_made: str = "made_to_order"
+
+    # Real Xianyu publishing through the authenticated OpenCLI browser bridge.
+    xianyu_publish_category: str = ""
+    xianyu_publish_condition: str = "全新"
+    xianyu_shop_currency: str = "CNY"
+
+    # Official Xianyu partner order APIs are invitation-only and require JuShiTa deployment.
+    xianyu_top_app_key: str = ""
+    xianyu_top_app_secret: str = ""
+    xianyu_top_access_token: str = ""
+    xianyu_top_biz_code: str = ""
+    xianyu_top_gateway: str = "https://gw.api.taobao.com/router/rest"
+
+    auto_collect_enabled: bool = True
+    auto_collect_interval_minutes: int = 180
 
     @property
     def is_sensenova_configured(self) -> bool:
         return bool(self.sensenova_api_token and self.sensenova_model)
+
+    @property
+    def is_qiniu_configured(self) -> bool:
+        return bool(self.qiniu_api_token and self.qiniu_base_url and self.qiniu_model)
+
+    @property
+    def is_llm_configured(self) -> bool:
+        return self.is_qiniu_configured or self.is_sensenova_configured
 
 
 settings = Settings()

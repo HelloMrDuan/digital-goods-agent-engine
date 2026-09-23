@@ -529,7 +529,13 @@ def _market_signal_signature(intel: dict[str, Any]) -> tuple[Any, ...]:
 
 def _targeted_market_exception_status(exc: Exception) -> str:
     text = str(exc).lower()
-    if "empty_result" in text or "returned no data" in text or "no matching" in text:
+    if (
+        "empty_result" in text
+        or "returned no data" in text
+        or "no matching" in text
+        or "no verified digital" in text
+        or "returned no verified" in text
+    ):
         return "EMPTY"
     return "FAILED"
 

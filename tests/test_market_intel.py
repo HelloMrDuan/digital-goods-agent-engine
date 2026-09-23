@@ -390,6 +390,11 @@ def test_targeted_market_empty_result_is_not_collector_failure():
     assert market_intel._targeted_market_exception_status(exc) == "EMPTY"
 
 
+def test_targeted_market_empty_etsy_digital_result_is_not_collector_failure():
+    exc = RuntimeError("Etsy Open API returned no verified digital downloads for this query")
+    assert market_intel._targeted_market_exception_status(exc) == "EMPTY"
+
+
 def test_targeted_market_validation_status_distinguishes_partial_and_inconclusive():
     partial = market_intel._targeted_market_validation_status([
         {"platform": "etsy", "status": "FAILED"},

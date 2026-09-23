@@ -45,11 +45,15 @@ def _scores(metrics: dict[str, Any]) -> tuple[float, float | None, float]:
     if wants is not None:
         components.append((wants, 0.15))
     if reviews is not None:
-        # Review count is a real observed metric and can stand on its own.
-        components.append((reviews, 0.15))
+        # Review count is real, but a shop-level count is weaker evidence for one listing.
+        review_scope = str(metrics.get("review_scope") or "").lower()
+        review_factor = {"listing": 1.0, "product": 1.0, "listing_search_card": 1.0, "shop": 0.65, "seller": 0.65}.get(review_scope, 1.0)
+        components.append((round(reviews * review_factor, 2), 0.15))
     if rating is not None and 0.0 <= rating <= 5.0:
-        # Rating contributes only when the marketplace explicitly exposes it.
-        components.append((round(rating / 5.0 * 100.0, 2), 0.05))
+        # Rating contributes only when explicitly observed; shop ratings are down-weighted.
+        rating_scope = str(metrics.get("rating_scope") or "").lower()
+        rating_factor = {"listing": 1.0, "product": 1.0, "listing_search_card": 1.0, "shop": 0.65, "seller": 0.65}.get(rating_scope, 1.0)
+        components.append((round(rating / 5.0 * 100.0 * rating_factor, 2), 0.05))
     if components:
         weight = sum(item[1] for item in components)
         heat = sum(value * w for value, w in components) / max(weight, 0.0001)
@@ -137,6 +141,7 @@ def _similarity(left: Any, right: Any) -> float:
 
 def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any]:
     inserted = updated = rejected = 0
+    verified_sales_count = verified_rating_count = verified_review_count = 0
     item_ids: list[int] = []
     observed_at = now_iso()
     with conn() as c:
@@ -155,6 +160,12 @@ def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any
             canonical = stable_hash(getattr(item, "platform", "market"), source_item_id or source_url)
             heat_score, sales_score, market_score = _scores(metrics)
             sales_count = _num(metrics.get("sales_count"))
+            if bool(metrics.get("sales_verified")) and sales_count is not None:
+                verified_sales_count += 1
+            if _num(metrics.get("rating")) is not None:
+                verified_rating_count += 1
+            if _num(metrics.get("review_count")) is not None:
+                verified_review_count += 1
             rank_position = _num(metrics.get("rank_position"))
             values = {
                 "source_id": int(source["id"]),
@@ -240,6 +251,9 @@ def sync_market_items(source: dict[str, Any], items: list[Any]) -> dict[str, Any
         "rejected_invalid": rejected,
         "market_item_ids": item_ids,
         "matched_links": matched,
+        "verified_sales": verified_sales_count,
+        "verified_ratings": verified_rating_count,
+        "verified_review_counts": verified_review_count,
     }
 
 
@@ -296,7 +310,9 @@ def _decode(row: Any) -> dict[str, Any]:
     data["hot_and_selling"] = data["high_heat"] and data["high_sales"]
     data["metric_availability"] = {
         "rating": data.get("rating") is not None,
+        "rating_scope": data.get("metrics", {}).get("rating_scope"),
         "review_count": data.get("review_count") is not None,
+        "review_scope": data.get("metrics", {}).get("review_scope"),
         "favorites_count": data.get("favorites_count") is not None,
         "want_count": data.get("metrics", {}).get("want_count") is not None,
         "views_count": data.get("views_count") is not None,
@@ -345,15 +361,26 @@ def market_intel_for_opportunity(opportunity_id: int, limit: int = 12) -> dict[s
         ).fetchall()
     items = [_decode(row) for row in rows]
     verified_sales = [item for item in items if item.get("sales_verified") and item.get("sales_count") is not None]
+    verified_ratings = [item for item in items if item.get("rating") is not None]
+    verified_reviews = [item for item in items if item.get("review_count") is not None]
     return {
         "matched_count": len(items),
         "high_heat_count": sum(1 for item in items if item["high_heat"]),
         "high_sales_count": sum(1 for item in items if item["high_sales"]),
         "hot_and_selling_count": sum(1 for item in items if item["hot_and_selling"]),
+        "verified_sales_count": len(verified_sales),
+        "verified_rating_count": len(verified_ratings),
+        "verified_review_count": len(verified_reviews),
+        "sales_scopes": sorted({str(item.get("sales_scope")) for item in verified_sales if item.get("sales_scope")}),
+        "rating_scopes": sorted({str(item.get("metrics", {}).get("rating_scope")) for item in verified_ratings if item.get("metrics", {}).get("rating_scope")}),
+        "review_scopes": sorted({str(item.get("metrics", {}).get("review_scope")) for item in verified_reviews if item.get("metrics", {}).get("review_scope")}),
         "max_heat_score": max((float(item.get("heat_score") or 0) for item in items), default=0.0),
         "max_sales_score": max((float(item.get("sales_score") or 0) for item in verified_sales), default=0.0),
         "items": items,
-        "truth_policy": "sales_count is stored only when the source explicitly exposes a sales metric; sales_scope identifies listing/shop/account scope and is never silently promoted to product sales.",
+        "truth_policy": (
+            "sales/rating/review metrics are stored only when observed from the source; "
+            "their scope is preserved (listing/product/shop/seller/account) and shop metrics are never promoted to listing metrics."
+        ),
     }
 
 
@@ -476,6 +503,10 @@ def _market_signal_signature(intel: dict[str, Any]) -> tuple[Any, ...]:
             bool(item.get("sales_verified")),
             item.get("sales_count"),
             item.get("sales_scope"),
+            item.get("rating"),
+            item.get("metrics", {}).get("rating_scope"),
+            item.get("review_count"),
+            item.get("metrics", {}).get("review_scope"),
         ))
     return tuple(sorted(rows))
 
@@ -556,6 +587,9 @@ def collect_targeted_market_intel(
                     "updated": int(stats.get("updated") or 0),
                     "rejected_invalid": int(stats.get("rejected_invalid") or 0),
                     "matched_links": int(stats.get("matched_links") or 0),
+                    "verified_sales": int(stats.get("verified_sales") or 0),
+                    "verified_ratings": int(stats.get("verified_ratings") or 0),
+                    "verified_review_counts": int(stats.get("verified_review_counts") or 0),
                 })
             except Exception as exc:
                 status = _targeted_market_exception_status(exc)
@@ -585,7 +619,7 @@ def collect_targeted_market_intel(
         ),
         "policy": (
             "real verified digital-market supply only; market intel never counts as demand; "
-            "missing results remain unknown rather than low competition"
+            "sales/rating/review scopes are preserved and missing results remain unknown rather than low competition"
         ),
     }
 

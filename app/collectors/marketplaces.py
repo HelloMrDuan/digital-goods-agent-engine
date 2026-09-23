@@ -234,7 +234,9 @@ def _etsy_search_rows(page_html: str, limit: int) -> list[dict[str, Any]]:
                 "views": _first_number(obj, "views", "view_count"),
                 "favorites": _first_number(obj, "num_favorers", "favorites", "favorite_count"),
                 "review_count": _first_number(obj, "review_count", "reviews_count", "num_reviews"),
+                "review_scope": "listing_search_card" if _first_number(obj, "review_count", "reviews_count", "num_reviews") is not None else None,
                 "rating": _first_number(obj, "rating", "average_rating"),
+                "rating_scope": "listing_search_card" if _first_number(obj, "rating", "average_rating") is not None else None,
                 "digital": digital,
                 "digital_verification": verification,
                 "search_rank": len(rows) + 1,
@@ -293,23 +295,12 @@ def _etsy_money(value: Any) -> tuple[float | None, str | None]:
     return price, str(currency) if currency else None
 
 
-def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]], str]:
+def _etsy_api_get_json(path: str, params: dict[str, Any] | None = None) -> tuple[Any, str]:
     api_key = str(settings.etsy_api_key or "").strip()
     if not api_key:
-        raise CollectorError("Etsy Open API market search requires ETSY_API_KEY")
-
-    url = "https://openapi.etsy.com/v3/application/listings/active"
-    params = {
-        "keywords": query,
-        "limit": max(1, min(int(limit), 100)),
-        "sort_on": "score",
-        "sort_order": "desc",
-        "is_safe": "true",
-    }
+        raise CollectorError("Etsy Open API request requires ETSY_API_KEY")
+    url = "https://openapi.etsy.com/v3/application/" + str(path or "").lstrip("/")
     try:
-        # Public marketplace search is api_key-only per Etsy's current
-        # findAllListingsActive reference. Do not attach a shop OAuth token here:
-        # an invalid/stale private token must never break public market validation.
         headers = {
             "x-api-key": api_key,
             "Accept": "application/json",
@@ -325,17 +316,77 @@ def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]],
             try:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
-                if response.status_code in {401, 403}:
+                if getattr(response, "status_code", None) in {401, 403}:
                     raise CollectorError(
-                        "Etsy Open API authorization failed; verify the app key is approved "
-                        "and configure ETSY_ACCESS_TOKEN if this endpoint/access level requires OAuth"
+                        "Etsy Open API authorization failed; verify ETSY_API_KEY/app access"
                     ) from exc
                 raise
-            payload = response.json()
+            return response.json(), str(response.url)
     except CollectorError:
         raise
     except Exception as exc:
         raise CollectorError(f"Etsy Open API request failed: {exc}") from exc
+
+
+def _etsy_api_shop_metrics(shop_id: str) -> dict[str, Any]:
+    payload, source_url = _etsy_api_get_json(f"shops/{shop_id}")
+    if not isinstance(payload, dict):
+        raise CollectorError("Etsy getShop response is not an object")
+    return {
+        "shop_id": str(payload.get("shop_id") or shop_id),
+        "shop_name": str(payload.get("shop_name") or "").strip() or None,
+        "sales_count": _first_number(payload, "transaction_sold_count"),
+        "review_count": _first_number(payload, "review_count"),
+        "rating": _first_number(payload, "review_average"),
+        "favorites_count": _first_number(payload, "num_favorers"),
+        "source_url": source_url,
+    }
+
+
+def _etsy_api_listing_review_metrics(listing_id: str) -> dict[str, Any]:
+    payload, source_url = _etsy_api_get_json(
+        f"listings/{listing_id}/reviews",
+        {"limit": 100, "offset": 0},
+    )
+    if not isinstance(payload, dict):
+        raise CollectorError("Etsy listing reviews response is not an object")
+    results = payload.get("results")
+    if not isinstance(results, list):
+        results = []
+    count = _first_number(payload, "count")
+    review_count = int(count) if count is not None and count >= 0 else len(results)
+
+    ratings: list[float] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        rating = _first_number(item, "rating")
+        if rating is not None and 0 <= rating <= 5:
+            ratings.append(float(rating))
+
+    # Only publish a listing-level average when the response contains every review.
+    # For listings with >100 reviews, keep rating unknown rather than inventing an
+    # aggregate from a partial page.
+    rating = None
+    if review_count > 0 and review_count == len(results) == len(ratings):
+        rating = round(sum(ratings) / review_count, 4)
+
+    return {
+        "review_count": review_count,
+        "rating": rating,
+        "source_url": source_url,
+    }
+
+
+def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]], str]:
+    params = {
+        "keywords": query,
+        "limit": max(1, min(int(limit), 100)),
+        "sort_on": "score",
+        "sort_order": "desc",
+        "is_safe": "true",
+    }
+    payload, metric_source_url = _etsy_api_get_json("listings/active", params)
 
     results = payload.get("results") if isinstance(payload, dict) else None
     if not isinstance(results, list):
@@ -353,17 +404,26 @@ def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]],
         if not listing_id or not title:
             continue
         price, currency = _etsy_money(obj.get("price"))
+        shop_id = obj.get("shop_id") or obj.get("shopId")
         rows.append({
             "listing_id": str(listing_id),
+            "shop_id": str(shop_id) if shop_id not in (None, "") else None,
             "title": title,
             "url": str(obj.get("url") or f"https://www.etsy.com/listing/{listing_id}"),
             "shop_name": None,
             "price": price,
             "currency": currency,
             "views": None,
-            "favorites": None,
+            "favorites": _first_number(obj, "num_favorers", "favorites", "favorite_count"),
             "review_count": None,
+            "review_scope": None,
             "rating": None,
+            "rating_scope": None,
+            "sales_count": None,
+            "sales_scope": None,
+            "sales_metric_source_url": None,
+            "review_metric_source_url": None,
+            "rating_metric_source_url": None,
             "digital": True,
             "digital_verification": f"etsy_open_api:{verification or 'type=download'}",
             "search_rank": len(rows) + 1,
@@ -372,7 +432,64 @@ def _etsy_api_active_rows(query: str, limit: int) -> tuple[list[dict[str, Any]],
         if len(rows) >= limit:
             break
 
-    return rows, str(response.url)
+    return rows, metric_source_url
+
+
+def _etsy_enrich_api_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    budget = max(0, int(settings.etsy_shop_enrich_limit))
+    if budget <= 0:
+        return rows
+
+    shop_cache: dict[str, dict[str, Any] | None] = {}
+    for row in rows[:budget]:
+        listing_id = str(row.get("listing_id") or "").strip()
+        shop_id = str(row.get("shop_id") or "").strip()
+
+        shop_metrics: dict[str, Any] | None = None
+        if shop_id:
+            if shop_id not in shop_cache:
+                try:
+                    shop_cache[shop_id] = _etsy_api_shop_metrics(shop_id)
+                except Exception:
+                    shop_cache[shop_id] = None
+            shop_metrics = shop_cache.get(shop_id)
+
+        listing_reviews: dict[str, Any] | None = None
+        if listing_id:
+            try:
+                listing_reviews = _etsy_api_listing_review_metrics(listing_id)
+            except Exception:
+                listing_reviews = None
+
+        if shop_metrics:
+            row["shop_name"] = shop_metrics.get("shop_name") or row.get("shop_name")
+            sales = shop_metrics.get("sales_count")
+            if sales is not None:
+                row["sales_count"] = sales
+                row["sales_scope"] = "shop"
+                row["sales_metric_source_url"] = shop_metrics.get("source_url")
+            if row.get("favorites") is None and shop_metrics.get("favorites_count") is not None:
+                row["favorites"] = shop_metrics.get("favorites_count")
+
+        if listing_reviews and listing_reviews.get("review_count") is not None:
+            row["review_count"] = listing_reviews.get("review_count")
+            row["review_scope"] = "listing"
+            row["review_metric_source_url"] = listing_reviews.get("source_url")
+        elif shop_metrics and shop_metrics.get("review_count") is not None:
+            row["review_count"] = shop_metrics.get("review_count")
+            row["review_scope"] = "shop"
+            row["review_metric_source_url"] = shop_metrics.get("source_url")
+
+        if listing_reviews and listing_reviews.get("rating") is not None:
+            row["rating"] = listing_reviews.get("rating")
+            row["rating_scope"] = "listing"
+            row["rating_metric_source_url"] = listing_reviews.get("source_url")
+        elif shop_metrics and shop_metrics.get("rating") is not None:
+            row["rating"] = shop_metrics.get("rating")
+            row["rating_scope"] = "shop"
+            row["rating_metric_source_url"] = shop_metrics.get("source_url")
+
+    return rows
 
 
 def _etsy_rows_to_items(
@@ -396,10 +513,13 @@ def _etsy_rows_to_items(
 
     result: list[CollectedItem] = []
     for row in rows:
-        sales_count = None
-        sales_url = None
-        if row.get("shop_name") in shop_sales:
+        sales_count = row.get("sales_count")
+        sales_scope = row.get("sales_scope")
+        sales_url = row.get("sales_metric_source_url")
+        if row.get("shop_name") in shop_sales and sales_count is None:
             sales_count, sales_url = shop_sales[str(row["shop_name"])]
+            sales_scope = "shop" if sales_count is not None else None
+
         rank = int(row.get("search_rank") or 0) or None
         result.append(
             CollectedItem(
@@ -426,15 +546,20 @@ def _etsy_rows_to_items(
                         "views_count": row.get("views"),
                         "favorites_count": row.get("favorites"),
                         "review_count": row.get("review_count"),
+                        "review_scope": row.get("review_scope"),
                         "rating": row.get("rating"),
+                        "rating_scope": row.get("rating_scope"),
                         "price": row.get("price"),
                         "currency": row.get("currency"),
                         "sales_count": sales_count,
-                        "sales_scope": "shop" if sales_count is not None else None,
-                        "sales_verified": sales_count is not None,
+                        "sales_scope": sales_scope,
+                        "sales_verified": sales_count is not None and sales_scope in {"listing", "product", "shop", "seller", "account"},
                         "sales_metric_source_url": sales_url,
+                        "review_metric_source_url": row.get("review_metric_source_url"),
+                        "rating_metric_source_url": row.get("rating_metric_source_url"),
                         "metric_source_url": metric_source_url,
                     },
+                    "shop_id": row.get("shop_id"),
                     "shop_name": row.get("shop_name"),
                     "query": query,
                     "listing": row.get("raw"),
@@ -453,6 +578,7 @@ def collect_etsy_market(query: str, limit: int = 30) -> list[CollectedItem]:
         rows, metric_source_url = _etsy_api_active_rows(query, requested)
         if not rows:
             raise CollectorError("Etsy Open API returned no verified digital downloads for this query")
+        rows = _etsy_enrich_api_rows(rows)
         return _etsy_rows_to_items(
             rows,
             query,

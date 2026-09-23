@@ -455,7 +455,7 @@ def _etsy_enrich_api_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             shop_metrics = shop_cache.get(shop_id)
 
         listing_reviews: dict[str, Any] | None = None
-        if listing_id:
+        if listing_id and shop_id:
             try:
                 listing_reviews = _etsy_api_listing_review_metrics(listing_id)
             except Exception:

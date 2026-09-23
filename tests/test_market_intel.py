@@ -310,9 +310,19 @@ def test_targeted_market_queries_remove_generic_packaging_words():
         "WhatsApp Automation Agency GTM Checklist & Stack Validator",
         "xianyu",
     )
-    assert etsy_queries[0] == "WhatsApp Automation Agency GTM Checklist & Stack Validator"
-    assert etsy_queries[1] == "WhatsApp Automation"
+    assert etsy_queries == ["WhatsApp automation", "WhatsApp workflow template"]
     assert xianyu_queries == ["WhatsApp 自动化", "WhatsApp 工作流"]
+
+
+def test_targeted_etsy_queries_use_buyer_search_terms_for_common_product_types():
+    assert market_intel.targeted_market_queries(
+        "Payroll Excel Automation Workbook Builder",
+        "etsy",
+    ) == ["Excel spreadsheet template", "Excel automation template"]
+    assert market_intel.targeted_market_queries(
+        "Resume CV Rewrite Toolkit",
+        "etsy",
+    ) == ["resume template", "CV template"]
 
 
 def test_targeted_market_validation_writes_market_intel_not_demand(monkeypatch):

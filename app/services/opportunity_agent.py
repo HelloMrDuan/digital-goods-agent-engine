@@ -513,6 +513,10 @@ def build_evidence_digest(opportunity_id: int) -> dict[str, Any]:
                 item.get("sales_count"),
                 item.get("sales_scope"),
                 item.get("sales_verified"),
+                item.get("rating"),
+                item.get("metrics", {}).get("rating_scope"),
+                item.get("review_count"),
+                item.get("metrics", {}).get("review_scope"),
                 item.get("market_score"),
                 item.get("last_seen_at"),
             )

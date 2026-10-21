@@ -71,7 +71,7 @@ Etsy and Xianyu TOP credentials/permissions are absent. No platform writes, real
 
 The broader native script ran task 22 against a read-only-backup-derived isolated database, using actual OpenCLI collection and live marketplace responses. It exited **2**, correctly refusing full acceptance:
 
-- Demand: all 4 probes returned successfully across 8 queries; 18 retained recent records; 2 direct signals.
+- Demand: all 4 probes returned successfully across 8 queries; 18 retained occurrences / 17 unique recent records; 2 direct signals under the earlier classifier.
 - Clustering over existing plus newly collected real evidence: 28 demand records and 21 context records considered; 38 candidate groups; 0 cross-platform groups.
 - Recent Gate A: 2 candidates evaluated; both REVIEW_REQUIRED (one independent signal each); 0 PASS. The automatic paid BUILD path ran no Agents and created no product.
 - Market: 6 sources attempted. Etsy returned 12 verified digital items and inserted 12. Two Creative Market requests returned HTTP 403. All 3 Xianyu queries returned AUTH_REQUIRED (logged-in browser session required). The task remains PARTIAL.
@@ -99,5 +99,37 @@ Sanitized summaries are in this document. Full local reports and the business-da
 - Validated code commit: a6f90bbf03947bf6eb2ccfd4df070a30f9110920.
 - PR run https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39584598333 — SUCCESS; job 119170268169 logs: 261 passed, compile/frontend/source archive/upload successful.
 - Push run https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39584591237 — SUCCESS; job 119170242840 independently confirms the same 261 tests and checks.
+
+## Collection trust follow-up — 2026-10-21
+
+The user authorized the follow-up after reviewing the collection's credibility. This remains part of DGA-001; it does not close the positive BUILD/platform acceptance or start DGA-004.
+
+### Implemented behavior
+
+- Demand discovery enables bounded thread enrichment (default 2 threads / 10 comments per query, configurable). Reddit POST body and Xiaohongshu note fields can update existing evidence. Later search-only observations preserve the cached body and detail provenance.
+- Windows npm shims launch their Node entry point directly. Signed URLs containing `&`, percent escapes and query text remain literal arguments; regression executes a real Node process to verify the round trip.
+- Posts/comments have separate identities. Comments sharing a thread URL cannot overwrite the post or each other. SQLite reserves the write transaction before identity lookup, so concurrent probes retain one row and all observations.
+- Classifier v2 checks buyer direction: `[For Hire]` and self-described product builders are supply; descriptive `terms that need a field` is not a buyer request. Chinese `求多人表格模板` and `帮忙做excel表格有偿` become demand leads. Title-only explicit leads are capped at 0.75 confidence and carry a body-verification reason. This confidence is a rule score, not measured classifier accuracy.
+- Versioned deterministic backfill reclassifies previously labeled evidence once and invalidates linked analyses/validation. No AI request is needed.
+- Gate A v2 requires body text and stable source account identifiers for eligible signals, counts each source account once, and excludes inherited thread dates from recent-comment proof. Profile IDs/usernames identify source accounts, not verified distinct people or willingness to pay. Cross-platform presence cannot bypass the minimum account count.
+- API evidence details and the quality report expose body coverage, identity basis and enrichment outcomes. Discovery totals deduplicate evidence IDs across probes/corroboration. Failed enrichment remains PARTIAL, including when search hits are all stale.
+
+### Real read-only evidence
+
+All mutations below occurred in `data/dga001-acceptance/quality-verification.db`, a fresh SQLite backup of the earlier acceptance copy. No production configuration was loaded and no paid model was invoked.
+
+- Reclassification of the 685 existing rows corrected four inspected cases: 674/679 noise -> explicit title-only leads; 683 discussion -> supply; 684 explicit demand -> supply. The legitimate DVD-template request 685 remains explicit demand. These are case regressions, not a population accuracy estimate.
+- Two bounded searches (`求 多人 表格 模板`, `DVD spreadsheet template`) retained no current evidence after the 30-day filter. A separate source revisit successfully read real Reddit evidence 685 and five comments; all five comments classify as discussion, not additional buyer demand. Repeating the revisit reused the same five comment IDs without extra evidence rows. Their missing source timestamps remain inherited_thread.
+- Xiaohongshu evidence 679 detail/comments both returned `Navigation rejected`. The corrected Windows argv handling removed the shell's `xsec_source` command error but does not resolve this separate browser navigation failure. No restriction bypass or synthetic body was used.
+- Final code's bounded `求 Excel 模板` probe: raw_fetched=3, retained_recent=1 (existing evidence), inserted=0, duplicates=1, enrichment_failures=2, status=PARTIAL. This confirms the actual failure is visible; it does not prove additional independent demand.
+- Isolated final totals: evidence=690, body_present=339 (49.13% of this mixed historical corpus), stable source accounts=370. Coverage measures completeness only. No broad claim of high truthfulness or reliable paid demand follows from these figures.
+- AI runs remain 243; products/publish_runs/deliveries remain 0. SQLite integrity_check=ok; no foreign-key violations. The original effective database is unchanged at sources=40, evidence=668, opportunities=97, products=0, deliveries=0, ai_runs=237.
+- Local reports remain ignored: `quality-verification-report.json`, `quality-source-revisit.json`, `final-quality-probe.json`. They include business provenance and are not part of the source archive.
+
+### Verification
+
+- Final Windows full suite: **281 passed**, no skips, one existing upstream deprecation warning. This adds 20 tests to the preceding 261-test release.
+- Python compileall (`app scripts`), Node syntax (`web/app.js`), native PowerShell acceptance-script parser and `git diff --check`: PASS.
+- Remote CI evidence for this follow-up is recorded on PR #3 after the push. DGA-001 remains BLOCKED on the previously documented real BUILD/package/platform/buyer-transfer requirements and unresolved source availability.
 - All check runs for that code SHA are completed/success. PR #3 has no inline review threads. A final documentation-only commit records this evidence; its fresh CI is also verified before handoff.
 - Owned temporary acceptance servers were stopped. Original business DB counts remain 40/668/97/0 products/0 deliveries/237 ai_runs. No credentials or runtime data are tracked.

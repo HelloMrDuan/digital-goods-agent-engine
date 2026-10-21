@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     # Keep this configurable instead of hard-disabling proxies inside httpx.
     marketplace_trust_env: bool = True
     collector_limit_default: int = 30
+    demand_detail_limit: int = 2
+    demand_comments_limit: int = 10
+    demand_detail_timeout_seconds: int = 60
     collector_retries: int = 2
     collector_backoff_base_seconds: float = 2.0
     collector_failure_backoff_minutes: int = 15

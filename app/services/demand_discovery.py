@@ -8,7 +8,10 @@ from typing import Any, Callable
 
 from ..collectors import agent_reach_doctor, collect_agent_reach
 from ..collectors.base import CollectedItem
+from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict
+from ..evidence_identity import account_identity
+from ..security import redact_error
 from .ingest import ingest_items
 from .demand_topics import DEMAND_TOPICS, detect_topic, topic_matches_text
 from .opportunities import get_evidence_for_opportunity, get_opportunity
@@ -132,7 +135,7 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _item_key(item: CollectedItem) -> tuple[str, str]:
     if item.source_item_id not in (None, ""):
-        return item.platform, f"id:{item.source_item_id}"
+        return item.platform, f"{item.content_kind}:id:{item.source_item_id}"
     if item.source_url:
         return item.platform, f"url:{item.source_url}"
     return item.platform, f"fallback:{item.author or ''}:{item.title}"
@@ -160,7 +163,7 @@ def _prepare_items(items: list[CollectedItem], limit: int) -> list[CollectedItem
     deferred: list[CollectedItem] = []
     authors: set[str] = set()
     for item in ranked:
-        author = str(item.author or "").strip().lower()
+        author, _ = account_identity(item.platform, item.author, item.raw)
         if author and author not in authors:
             authors.add(author)
             chosen.append(item)
@@ -184,6 +187,9 @@ def _probe_config(probe: dict[str, Any]) -> dict[str, Any]:
         "managed_refresh": True,
         "strategy_version": STRATEGY_VERSION,
         "max_age_days": MAX_AGE_DAYS,
+        "enrich": True,
+        "detail_limit": max(0, min(5, settings.demand_detail_limit)),
+        "comments_limit": max(0, min(50, settings.demand_comments_limit)),
         "query_variants": list(probe["queries"]),
     }
 
@@ -298,6 +304,23 @@ def _intent_counts(evidence_ids: list[int]) -> dict[str, int]:
     return result
 
 
+def _collect_with_details(platform: str, query: str, limit: int) -> list[CollectedItem]:
+    return collect_agent_reach(platform, query, limit=limit, enrich=True,
+                               detail_limit=max(0, min(5, settings.demand_detail_limit)),
+                               comments_limit=max(0, min(50, settings.demand_comments_limit)))
+
+
+def _enrichment_failures(items: list[CollectedItem]) -> list[str]:
+    failures = []
+    for item in items:
+        state = item.raw.get("_enrichment") or {}
+        for stage in ("detail", "comments"):
+            if state.get(stage + "_status") in {"FAILED", "NOT_AVAILABLE"}:
+                failures.append(f"{item.platform}:{item.source_item_id}:{stage}: " + redact_error(
+                    state.get(stage + "_error") or state.get("error") or state[stage + "_status"]))
+    return failures
+
+
 _PLATFORM_PARSE_FAILURE_THRESHOLD = 2
 
 
@@ -374,16 +397,15 @@ def _collect_probe(
         fetched = 0
         error: str | None = None
         try:
-            items = collect_agent_reach(
+            items = _collect_with_details(
                 platform,
                 str(query),
                 limit=int(probe["per_query_limit"]),
-                enrich=False,
             )
             fetched = len(items)
             raw_items.extend(items)
         except Exception as exc:
-            error = str(exc)
+            error = redact_error(exc)
             query_errors.append(f"{query}: {error}")
         finally:
             _record_platform_query_result(platform_circuit, platform, error)
@@ -410,13 +432,16 @@ def _collect_probe(
     unique_authors = len({str(item.author).strip().lower() for item in retained if item.author and str(item.author).strip()})
     duration_ms = int((time.monotonic() - t0) * 1000)
     all_queries_failed = bool(attempted_queries) and len(query_errors) == attempted_queries
+    enrichment_errors = _enrichment_failures(raw_items)
     if retained:
-        status = "SUCCESS"
+        status = "PARTIAL" if query_errors or enrichment_errors or circuit_reason else "SUCCESS"
     elif all_queries_failed:
         status = "FAILED"
+    elif query_errors or enrichment_errors or circuit_reason:
+        status = "PARTIAL"
     else:
         status = "EMPTY"
-    error = " | ".join(query_errors[:4]) if query_errors else None
+    error = " | ".join((query_errors + enrichment_errors)[:4]) or None
     source_status = "READY" if retained else ("ERROR" if status == "FAILED" else "EMPTY")
     now = now_iso()
     with conn() as c:
@@ -455,6 +480,9 @@ def _collect_probe(
         "inserted": int(stats.get("inserted") or 0),
         "duplicates": int(stats.get("duplicates") or 0),
         "intent_counts": intents,
+        "observed_evidence_ids": sorted(set(observed_ids)),
+        "enrichment_failures": len(enrichment_errors),
+        "enrichment_errors": enrichment_errors[:4],
         "duration_ms": duration_ms,
         "errors": query_errors[:4],
     }
@@ -492,7 +520,7 @@ def _recent_direct_topics(limit: int = 120) -> list[dict[str, Any]]:
         placeholders = ",".join("?" for _ in eligible_source_ids)
         rows = c.execute(
             f"""SELECT DISTINCT e.id,e.platform,e.title,e.content,e.author,e.intent_class,
-                       e.evidence_quality_score,e.demand_signal_score,e.collected_at
+                       e.evidence_quality_score,e.demand_signal_score,e.collected_at,e.published_at,e.raw_json
                 FROM evidence e
                 JOIN evidence_sources es ON es.evidence_id=e.id
                 WHERE es.source_id IN ({placeholders})
@@ -506,6 +534,9 @@ def _recent_direct_topics(limit: int = 120) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for row in rows:
         data = row_to_dict(row) or {}
+        published = _parse_dt(data.get("published_at"))
+        if not published or not datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS) <= published <= datetime.now(timezone.utc):
+            continue
         topic = _topic_for_text(data.get("title"), data.get("content"))
         if not topic:
             continue
@@ -522,7 +553,7 @@ def _recent_direct_topics(limit: int = 120) -> list[dict[str, Any]]:
             },
         )
         bucket["evidence_ids"].add(int(data["id"]))
-        author = str(data.get("author") or "").strip().lower()
+        author, _ = account_identity(str(data.get("platform") or ""), data.get("author"), loads(data.get("raw_json"), {}) or {})
         if author:
             bucket["authors"].add(author)
         platform = str(data.get("platform") or "").strip().lower()
@@ -581,7 +612,8 @@ def _run_dynamic_corroboration(
         error: str | None = None
         intent_counts = _intent_counts([])
         try:
-            items = collect_agent_reach(platform, query, limit=10, enrich=False)
+            items = _collect_with_details(platform, query, limit=10)
+            error = " | ".join(_enrichment_failures(items)[:4]) or None
             fetched = len(items)
             matching = [item for item in items if _item_matches_topic(item, topic_info["topic"])]
             retained = _prepare_items(matching, 8)
@@ -661,10 +693,10 @@ def _opportunity_corroboration_topic(opportunity_id: int) -> dict[str, Any]:
             },
         )
         bucket["evidence_ids"].append(int(item["id"]))
-        author = str(item.get("author") or "").strip().lower()
+        author, _ = account_identity(str(item.get("platform") or ""), item.get("author"), item.get("raw") or {})
         platform = str(item.get("platform") or "").strip().lower()
         if author:
-            bucket["authors"].add(f"{platform}:{author}")
+            bucket["authors"].add(author)
         if platform:
             bucket["platforms"].add(platform)
 
@@ -680,7 +712,7 @@ def _opportunity_corroboration_topic(opportunity_id: int) -> dict[str, Any]:
             "topic": fallback,
             "evidence_ids": [int(item["id"]) for item in demand_rows if item.get("id") is not None],
             "authors": {
-                f"{str(item.get('platform') or '').strip().lower()}:{str(item.get('author') or '').strip().lower()}"
+                account_identity(str(item.get("platform") or ""), item.get("author"), item.get("raw") or {})[0]
                 for item in demand_rows
                 if str(item.get("author") or "").strip()
             },
@@ -700,7 +732,7 @@ def _opportunity_corroboration_topic(opportunity_id: int) -> dict[str, Any]:
 
     result = next(iter(topics.values()))
     result["evidence_ids"] = sorted(set(result["evidence_ids"]))
-    result["authors"] = sorted(result["authors"])
+    result["authors"] = sorted(author for author in result["authors"] if author)
     result["platforms"] = sorted(result["platforms"])
     return result
 
@@ -741,7 +773,8 @@ def refresh_opportunity_corroboration(
             error: str | None = None
             intent_counts = _intent_counts([])
             try:
-                items = collect_agent_reach(platform, str(query), limit=limit, enrich=False)
+                items = _collect_with_details(platform, str(query), limit=limit)
+                error = " | ".join(_enrichment_failures(items)[:4]) or None
                 fetched = len(items)
                 matching = [
                     item for item in items
@@ -775,14 +808,13 @@ def refresh_opportunity_corroboration(
         placeholders = ",".join("?" for _ in observed_ids)
         with conn() as c:
             rows = c.execute(
-                f"SELECT platform,author FROM evidence WHERE id IN ({placeholders})",
+                f"SELECT platform,author,raw_json FROM evidence WHERE id IN ({placeholders})",
                 tuple(sorted(observed_ids)),
             ).fetchall()
         for row in rows:
-            author = str(row["author"] or "").strip().lower()
-            platform = str(row["platform"] or "").strip().lower()
+            author, _ = account_identity(row["platform"], row["author"], loads(row["raw_json"], {}) or {})
             if author:
-                observed_author_slots.add(f"{platform}:{author}")
+                observed_author_slots.add(author)
 
     intents = _intent_counts(sorted(observed_ids))
     return {
@@ -870,14 +902,8 @@ def run_demand_discovery(
                 })
 
     successful = [x for x in results if x.get("status") in {"SUCCESS", "EMPTY"}]
-    direct_signals = sum(
-        int((x.get("intent_counts") or {}).get("explicit_demand") or 0)
-        + int((x.get("intent_counts") or {}).get("probable_demand") or 0)
-        for x in results
-    )
-    retained = sum(int(x.get("retained_recent") or 0) for x in results)
-    authors = sum(int(x.get("unique_authors") or 0) for x in results)
-    if not successful:
+    usable = [x for x in results if x.get("status") in {"SUCCESS", "EMPTY", "PARTIAL"}]
+    if not usable:
         errors = "; ".join(str(x.get("error") or "collection failed") for x in results)
         raise RuntimeError(f"fresh demand discovery failed: {errors}")
 
@@ -888,10 +914,21 @@ def run_demand_discovery(
         corroboration_platforms,
         progress_callback=progress_callback,
     )
-    direct_signals += int(corroboration.get("direct_demand_signals") or 0)
+    observed_ids = {int(eid) for result in results for eid in result.get("observed_evidence_ids", [])}
+    observed_ids.update(int(eid) for eid in corroboration.get("observed_evidence_ids", []))
+    intents = _intent_counts(sorted(observed_ids))
+    accounts = set()
+    if observed_ids:
+        with conn() as c:
+            rows = c.execute("SELECT platform,author,raw_json FROM evidence WHERE id IN (" + ",".join("?" for _ in observed_ids) + ")", tuple(sorted(observed_ids))).fetchall()
+        for row in rows:
+            account, _ = account_identity(row["platform"], row["author"], loads(row["raw_json"], {}) or {})
+            if account:
+                accounts.add(account)
+    corroboration_failed = any(row.get("error") for row in corroboration.get("results", []))
 
     return {
-        "status": "SUCCESS" if len(successful) == len(results) else "PARTIAL",
+        "status": "SUCCESS" if len(successful) == len(results) and not corroboration_failed else "PARTIAL",
         "strategy": STRATEGY_VERSION,
         "max_age_days": MAX_AGE_DAYS,
         "max_queries_per_probe": max_queries_per_probe,
@@ -902,9 +939,11 @@ def run_demand_discovery(
         "probes": results,
         "probe_count": len(results),
         "successful_probes": len(successful),
-        "retained_recent": retained,
-        "independent_author_slots": authors,
-        "direct_demand_signals": direct_signals,
+        "retained_recent": len(observed_ids),
+        "retained_occurrences": sum(int(x.get("retained_recent") or 0) for x in results) + sum(int(x.get("retained_recent") or 0) for x in corroboration.get("results", [])),
+        "observed_evidence_ids": sorted(observed_ids),
+        "independent_author_slots": len(accounts),
+        "direct_demand_signals": int(intents.get("explicit_demand", 0)) + int(intents.get("probable_demand", 0)),
         "corroboration": corroboration,
         "source_install": install,
         "generated_at": now_iso(),

@@ -288,20 +288,23 @@ def collect_source(source_id: int, limit: int | None = None, force: bool = False
         finished = now_iso()
         duration_ms = max(0, int((time.monotonic() - t0) * 1000))
         empty = stats["fetched"] == 0
-        status = "EMPTY" if empty else "SUCCESS"
+        from .demand_discovery import _enrichment_failures
+        enrichment_errors = _enrichment_failures(items) if source_role(source) == "demand" else []
+        partial_error = " | ".join(enrichment_errors[:4]) or None
+        status = "PARTIAL" if enrichment_errors else ("EMPTY" if empty else "SUCCESS")
         source_status = "EMPTY" if empty else "READY"
         old_avg = float(source.get("avg_duration_ms") or 0)
         avg_ms = duration_ms if old_avg <= 0 else round(old_avg * 0.8 + duration_ms * 0.2, 2)
         with conn() as c:
             c.execute(
                 """UPDATE collection_runs SET status=?, finished_at=?, fetched_count=?, inserted_count=?, duplicate_count=?,
-                   rejected_count=?,retry_count=?,duration_ms=? WHERE id=?""",
-                (status, finished, stats["fetched"], stats["inserted"], stats["duplicates"], stats["rejected_invalid"], retry_count, duration_ms, run_id),
+                   rejected_count=?,retry_count=?,duration_ms=?,error=? WHERE id=?""",
+                (status, finished, stats["fetched"], stats["inserted"], stats["duplicates"], stats["rejected_invalid"], retry_count, duration_ms, partial_error, run_id),
             )
             c.execute(
-                """UPDATE sources SET status=?, last_error=NULL, last_checked_at=?, last_success_at=?, last_item_count=?,
+                """UPDATE sources SET status=?, last_error=?, last_checked_at=?, last_success_at=?, last_item_count=?,
                    failure_streak=0,empty_streak=?,next_retry_at=NULL,avg_duration_ms=?,updated_at=? WHERE id=?""",
-                (source_status, finished, finished, stats["fetched"], int(source.get("empty_streak") or 0) + 1 if empty else 0, avg_ms, finished, source_id),
+                (source_status, partial_error, finished, finished, stats["fetched"], int(source.get("empty_streak") or 0) + 1 if empty else 0, avg_ms, finished, source_id),
             )
         return {
             "run_id": run_id,
@@ -312,6 +315,7 @@ def collect_source(source_id: int, limit: int | None = None, force: bool = False
             "retry_count": retry_count,
             "source_asset_sync": source_asset_sync,
             "market_intel_sync": market_intel_sync,
+            "enrichment_errors": enrichment_errors[:4],
             **stats,
         }
     except Exception as exc:

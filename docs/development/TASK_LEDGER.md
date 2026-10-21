@@ -43,7 +43,7 @@ Do not close DGA-001 or start DGA-002 merely because tests pass. Actual buyer fi
 
 ### Live closeout outcome
 
-- Native task 22: PARTIAL / script exit 2; 18 recent records, 2 direct demand signals; 38 candidate groups; recent Gate A 0/2 passes.
+- Native task 22: PARTIAL / script exit 2; 18 retained occurrences / 17 unique recent records, 2 direct demand signals under the earlier classifier; 38 candidate groups; recent Gate A 0/2 passes.
 - Etsy market: 12 real digital items inserted. Creative Market HTTP 403 and Xianyu AUTH_REQUIRED stay visible.
 - Explicit discovery evaluation of real opportunity 69: six Qiniu Agents completed, card 33 = DROP, Gate A FAILED. Usage 50,231 tokens; estimated CNY 0.055668; unsettled reserves 0. Concurrent and sequential duplicate requests incurred no additional workflow executions.
 - No product or listing was approved/published; no order or buyer delivery was fabricated. DGA-001 still needs a supported real BUILD package plus authorized platform/order acceptance. DGA-002 has not started.
@@ -61,3 +61,12 @@ Status: BLOCKED on positive real BUILD/package/platform acceptance. Final local 
 - Code commit a6f90bbf03947bf6eb2ccfd4df070a30f9110920: PR CI 39584598333 and push CI 39584591237 both SUCCESS; each raw job log confirms 261 passed plus compile/frontend/package/upload success. All code-SHA checks successful; PR #3 remains Draft with no inline review threads.
 - Final documentation-only evidence update does not change the validated business code. Temporary owned servers stopped; original runtime data and configuration preserved.
 - DGA-001 remains BLOCKED on actual BUILD/product/platform/buyer-transfer acceptance. Next task DGA-002 stays TODO until DGA-001 is accepted, as required by the task dependency.
+
+### Collection credibility follow-up
+
+- User authorized work on body/comment completeness, false demand classifications and independent account corroboration. Continued on `codex/dga-001-closure` / PR #3.
+- Fixed Windows signed-URL argument splitting, enabled bounded demand enrichment, persisted refreshed bodies, separated comment identities and serialized concurrent identity upserts. Added intent-policy migration and source-account/body guards to Gate A.
+- Four previously inspected classifier errors corrected on an isolated 685-row backup. Real Reddit revisit reads the actual body plus five discussion comments; repeat reads reuse their IDs. XHS note/comments remain Navigation rejected, explicitly recorded.
+- Final live probe: PARTIAL, 3 raw search results, 1 retained existing recent row, 0 inserts, 2 enrichment failures. No new independent buyer evidence is claimed. AI/products/publishing/delivery counts unchanged; original business DB unchanged.
+- Local final verification: 281 passed; compileall/frontend/PowerShell parser/diff checks PASS. Full sanitized outcomes and local report names are in ACCEPTANCE.md. Remote follow-up CI is linked on PR #3 after push.
+- DGA-001 remains BLOCKED on its real positive acceptance; DGA-002 through DGA-005 remain TODO.

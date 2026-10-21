@@ -5,6 +5,13 @@ from dataclasses import dataclass
 
 _WS = re.compile(r"\s+")
 _URL = re.compile(r"https?://\S+", re.I)
+INTENT_POLICY_VERSION = "intent-v2-buyer-direction"
+
+_BUYER_NEED = re.compile(r"\b(?:i|we)\s+(?:(?:really|urgently|currently|still)\s+)?need\s+(?:a|an|some|help|something)\b")
+_TITLE_NEED = re.compile(r"^(?:\[help\]\s*)?(?:need(?:ing)?\s+(?:a|an)|looking for|in search of)\b")
+_CHINESE_REQUEST = re.compile(r"^(?:急求|求助|求|想找|需要|有没有)[^。！？\n]{0,28}(?:模板|表格|脚本|工具|教程|资料|excel)")
+_CHINESE_COMMISSION = re.compile(r"^(?:求|请|麻烦|帮(?:我)?忙?|有没有人)[^。！？\n]{0,15}(?:做|制作|定制|写)[^。！？\n]{0,20}(?:表格|excel|脚本|模板)")
+_SELLER = re.compile(r"\[for hire\]|\b(?:i(?:'m| am)|we(?:'re| are))\s+(?:building|launching|selling|offering|developing)\b|(?:接单|代做|代工|私信领取|承接定制)")
 
 
 @dataclass(frozen=True)
@@ -96,6 +103,18 @@ def classify_intent(title: str | None, content: str | None, content_kind: str = 
     supply, sh = _score(text, _SUPPLY)
     showcase, vh = _score(text, _SHOWCASE)
 
+    # A descriptive "terms that need a field" is not the author's buyer request.
+    if not _BUYER_NEED.search(text) and not _TITLE_NEED.search(title_text):
+        for phrase in ("need a", "need an"):
+            if phrase in eh:
+                explicit -= _EXPLICIT[phrase]
+                eh.remove(phrase)
+    if _SELLER.search(text):
+        return IntentDecision("supply", 0.94, 0.0, ("author_offers_or_builds_product",))
+    if _CHINESE_REQUEST.search(title_text) or _CHINESE_COMMISSION.search(title_text):
+        explicit = max(30, explicit)
+        eh = ["buyer_request_in_title"] + eh
+
     if "?" in (title or "") + (content or "") or "？" in (title or "") + (content or ""):
         problem += 5
     if content_kind == "comment" and explicit >= 24:
@@ -103,7 +122,11 @@ def classify_intent(title: str | None, content: str | None, content_kind: str = 
 
     if explicit >= 24 and explicit >= supply + 6 and explicit >= showcase + 6:
         conf = min(0.99, 0.72 + (explicit - max(supply, showcase, problem)) / 100.0)
-        return IntentDecision("explicit_demand", round(conf, 3), 1.0, tuple(["explicit_request"] + eh[:4]))
+        reasons = ["explicit_request"] + eh[:4]
+        if not str(content or "").strip() and content_kind != "comment":
+            conf = min(conf, 0.75)
+            reasons.append("title_only_requires_body_verification")
+        return IntentDecision("explicit_demand", round(conf, 3), 1.0, tuple(reasons))
 
     if explicit + problem >= 20 and explicit + problem >= supply + 8 and explicit + problem >= showcase + 8:
         conf = min(0.92, 0.58 + (explicit + problem - max(supply, showcase)) / 120.0)

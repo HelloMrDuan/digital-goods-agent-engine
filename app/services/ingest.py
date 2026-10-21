@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ..collectors.base import CollectedItem
-from ..db import conn, dumps, now_iso, stable_hash
-from .intent import classify_intent
+from ..db import conn, dumps, loads, now_iso, stable_hash
+from .intent import INTENT_POLICY_VERSION, classify_intent
 
 _URL_RE = re.compile(r"https?://\S+", re.I)
 _WS_RE = re.compile(r"\s+")
@@ -44,7 +45,11 @@ def canonicalize_url(url: str | None) -> str:
 def canonical_identity(item: CollectedItem) -> str:
     # Platform item IDs are the strongest identity and must not be split by changing share/tracking URLs.
     if item.source_item_id not in (None, ""):
-        return stable_hash("item-v2", item.platform, str(item.source_item_id).strip())
+        namespace = "comment-v2" if item.content_kind == "comment" else "item-v2"
+        return stable_hash(namespace, item.platform, str(item.source_item_id).strip())
+    if item.content_kind == "comment":
+        return stable_hash("comment-content-id-v1", item.platform, item.parent_source_item_id or item.thread_url,
+                           item.author, normalize_content(item.title, item.content))
     return stable_hash("url-v2", item.platform, canonicalize_url(item.source_url))
 
 _NEGATIVE = {
@@ -157,17 +162,32 @@ def insert_evidence(source: dict[str, Any], item: CollectedItem) -> tuple[int, b
     item.validate()
     observed_at = now_iso()
     canonical_key = canonical_identity(item)
-    raw_hash = stable_hash(dumps(item.raw))
-    fingerprint = content_fingerprint(item)
-    quality, time_quality = evidence_quality_score(item)
-    demand_signal = demand_signal_score(item)
-    intent = classify_intent(item.title, item.content, item.content_kind)
     with conn() as c:
-        existing = c.execute("SELECT id FROM evidence WHERE canonical_key=?", (canonical_key,)).fetchone()
+        # Search probes can observe the same post concurrently. Reserve the write
+        # transaction before the lookup so both cannot decide to insert it.
+        c.execute("BEGIN IMMEDIATE")
+        existing = c.execute("SELECT * FROM evidence WHERE canonical_key=?", (canonical_key,)).fetchone()
         if not existing and item.source_item_id not in (None, ""):
-            existing = c.execute("SELECT id FROM evidence WHERE platform=? AND source_item_id=? ORDER BY id LIMIT 1", (item.platform, str(item.source_item_id))).fetchone()
-        if not existing and item.source_url:
-            existing = c.execute("SELECT id FROM evidence WHERE platform=? AND source_url=? ORDER BY id LIMIT 1", (item.platform, item.source_url)).fetchone()
+            existing = c.execute("SELECT * FROM evidence WHERE platform=? AND source_item_id=? AND content_kind=? ORDER BY id LIMIT 1", (item.platform, str(item.source_item_id), item.content_kind)).fetchone()
+        if not existing and item.source_url and item.content_kind != "comment":
+            existing = c.execute("SELECT * FROM evidence WHERE platform=? AND source_url=? AND content_kind='post' ORDER BY id LIMIT 1", (item.platform, item.source_url)).fetchone()
+        if existing:
+            # A later search card must not erase previously retrieved body text.
+            previous_raw = loads(existing["raw_json"], {}) or {}
+            merged_raw = {**previous_raw, **item.raw}
+            if not item.content and existing["content"]:
+                merged_raw["_body_cached_from_previous_observation"] = True
+            # Preserve the most recent attempt separately from cached successful details.
+            if "_enrichment" not in item.raw and "_enrichment" in previous_raw:
+                merged_raw["_enrichment"] = previous_raw["_enrichment"]
+            item = replace(item, content=item.content or existing["content"], author=item.author or existing["author"],
+                           published_at=item.published_at or existing["published_at"], raw=merged_raw,
+                           published_time_quality=item.published_time_quality if item.published_at else existing["published_time_quality"])
+        raw_hash = stable_hash(dumps(item.raw))
+        fingerprint = content_fingerprint(item)
+        quality, time_quality = evidence_quality_score(item)
+        demand_signal = demand_signal_score(item)
+        intent = classify_intent(item.title, item.content, item.content_kind)
         if existing:
             eid = int(existing["id"])
             _record_observation(c, eid, int(source["id"]), observed_at, item, raw_hash)
@@ -178,13 +198,16 @@ def insert_evidence(source: dict[str, Any], item: CollectedItem) -> tuple[int, b
                 """UPDATE evidence SET last_seen_at=?, observation_count=coalesce(observation_count,1)+1,
                    engagement_json=?, raw_json=?, raw_hash=?, content_fingerprint=?, evidence_quality_score=?,
                    published_time_quality=?, demand_signal_score=?,content_kind=?,parent_source_item_id=?,thread_url=?,
-                   intent_class=?,intent_confidence=?,intent_weight=?,intent_reason_json=? WHERE id=?""",
+                   intent_class=?,intent_confidence=?,intent_weight=?,intent_reason_json=?,
+                   title=?,content=?,author=?,published_at=?,source_url=?,source_item_id=?,intent_policy_version=? WHERE id=?""",
                 (observed_at, dumps(item.engagement), dumps(item.raw), raw_hash, fingerprint, quality, time_quality, demand_signal,
-                 item.content_kind, item.parent_source_item_id, item.thread_url, intent.label, intent.confidence, intent.demand_weight, dumps(intent.reason_codes), eid),
+                 item.content_kind, item.parent_source_item_id, item.thread_url, intent.label, intent.confidence, intent.demand_weight, dumps(intent.reason_codes),
+                 item.title.strip(), item.content, item.author, item.published_at, item.source_url or existing["source_url"],
+                 item.source_item_id or existing["source_item_id"], INTENT_POLICY_VERSION, eid),
             )
             c.execute(
-                """UPDATE opportunities SET validation_status='STALE'
-                   WHERE validation_status='PASSED' AND id IN (
+                """UPDATE opportunities SET validation_status='STALE',analysis_stale=1
+                   WHERE id IN (
                        SELECT opportunity_id FROM opportunity_evidence
                        WHERE evidence_id=? AND relation_type='demand'
                    )""",
@@ -211,6 +234,7 @@ def insert_evidence(source: dict[str, Any], item: CollectedItem) -> tuple[int, b
             ),
         )
         eid = int(cur.lastrowid)
+        c.execute("UPDATE evidence SET intent_policy_version=? WHERE id=?", (INTENT_POLICY_VERSION, eid))
         _record_observation(c, eid, int(source["id"]), observed_at, item, raw_hash)
         return eid, True
 
@@ -250,14 +274,16 @@ def backfill_intents() -> dict[str, int]:
     with conn() as c:
         rows = c.execute(
             """SELECT id,title,content,coalesce(content_kind,'post') content_kind
-               FROM evidence WHERE intent_class IS NULL OR intent_class='' OR intent_class='unclassified'"""
+               FROM evidence WHERE coalesce(intent_policy_version,'')<>?""", (INTENT_POLICY_VERSION,)
         ).fetchall()
         updated = 0
         for row in rows:
             decision = classify_intent(row["title"], row["content"], row["content_kind"] or "post")
             c.execute(
-                """UPDATE evidence SET intent_class=?,intent_confidence=?,intent_weight=?,intent_reason_json=? WHERE id=?""",
-                (decision.label, decision.confidence, decision.demand_weight, dumps(decision.reason_codes), int(row["id"])),
+                """UPDATE evidence SET intent_class=?,intent_confidence=?,intent_weight=?,intent_reason_json=?,intent_policy_version=? WHERE id=?""",
+                (decision.label, decision.confidence, decision.demand_weight, dumps(decision.reason_codes), INTENT_POLICY_VERSION, int(row["id"])),
             )
+            c.execute("""UPDATE opportunities SET analysis_stale=1,validation_status='STALE'
+                         WHERE id IN (SELECT opportunity_id FROM opportunity_evidence WHERE evidence_id=?)""", (int(row["id"]),))
             updated += 1
     return {"updated": updated}

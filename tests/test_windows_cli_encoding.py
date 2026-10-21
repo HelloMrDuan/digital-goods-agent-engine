@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import json
+import shutil
+
+import pytest
 
 from app.collectors import agent_reach
 
@@ -67,13 +71,21 @@ def test_agent_reach_doctor_promotes_p0_when_opencli_is_connected(monkeypatch):
     assert result["channels"]["xiaohongshu"]["effective_backend"] == "OpenCLI Browser Bridge"
 
 
-def test_real_collection_resolves_bare_opencli_to_windows_cmd_shim(monkeypatch):
+def _node_shim(tmp_path, monkeypatch):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node required for literal argv regression")
+    shim = tmp_path / "opencli.cmd"
+    entry = tmp_path / "main.js"
+    entry.write_text("console.log(JSON.stringify(process.argv.slice(2)))", encoding="utf-8")
+    shim.write_text('"%dp0%\\main.js" %*', encoding="utf-8")
+    monkeypatch.setattr(agent_reach.shutil, "which", lambda name: str(shim) if name == "opencli" else node if name == "node" else None)
+    return node, entry
+
+
+def test_real_collection_resolves_bare_opencli_to_windows_cmd_shim(monkeypatch, tmp_path):
     """Regression: doctor could find opencli.cmd while search used bare opencli and hit WinError 2."""
-    monkeypatch.setattr(
-        agent_reach.shutil,
-        "which",
-        lambda name: "C:/Users/test/AppData/Roaming/npm/opencli.cmd" if name == "opencli" else None,
-    )
+    node, entry = _node_shim(tmp_path, monkeypatch)
 
     calls = []
 
@@ -95,26 +107,26 @@ def test_real_collection_resolves_bare_opencli_to_windows_cmd_shim(monkeypatch):
     body = agent_reach._run(["opencli", "reddit", "search", "excel template", "-f", "yaml"])
 
     assert calls
-    assert calls[0][0].lower() == "cmd"
-    assert calls[0][1].lower() == "/c"
-    assert calls[0][2].lower().endswith("opencli.cmd")
+    assert calls[0][:2] == [node, str(entry)]
     assert isinstance(body, list)
     assert body[0]["id"] == "abc123"
 
 
-def test_resolve_cli_command_keeps_arguments_unchanged(monkeypatch):
-    monkeypatch.setattr(
-        agent_reach.shutil,
-        "which",
-        lambda name: "C:/Program Files/nodejs/opencli.cmd" if name == "opencli" else None,
-    )
+def test_resolve_cli_command_keeps_arguments_unchanged(monkeypatch, tmp_path):
+    node, entry = _node_shim(tmp_path, monkeypatch)
     original = ["opencli", "xiaohongshu", "search", "求 Excel 模板 & 自动化", "-f", "yaml"]
     resolved = agent_reach._resolve_cli_command(original)
-    assert resolved[0].lower() == "cmd"
-    assert resolved[1].lower() == "/c"
-    assert resolved[2] == "C:/Program Files/nodejs/opencli.cmd"
-    assert resolved[3:] == original[1:]
+    assert resolved[:2] == [node, str(entry)]
+    assert resolved[2:] == original[1:]
     assert original[0] == "opencli"
+
+
+def test_signed_url_and_shell_metacharacters_round_trip_as_literal_argv(monkeypatch, tmp_path):
+    _node_shim(tmp_path, monkeypatch)
+    args = ["https://www.xiaohongshu.com/explore/abc?xsec_token=a%2Fb&xsec_source=pc_search", "求 模板 & 自动化 | %PATH% $(echo bad)"]
+    code, stdout, stderr = agent_reach._run_cli_text(["opencli", *args], 10)
+    assert code == 0, stderr
+    assert json.loads(stdout) == args
 
 
 def test_xiaohongshu_most_liked_search_builds_ranked_opencli_command(monkeypatch):

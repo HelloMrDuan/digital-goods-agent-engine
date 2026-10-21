@@ -12,3 +12,5 @@ A task is DONE only after code, commit, PR/CI and its required real acceptance e
 | DGA-005 | Operator workbench | DGA-001 acceptance | TODO | Expose orders, delivery receipts, UNKNOWN reconciliation and outstanding reservations |
 
 PR #1 and #2 stay open. This work is stacked on PR #2; the existing frontend layout and platform authorizations are preserved.
+
+2026-10-21 collection-trust follow-up stays inside DGA-001: bounded body/comment reads, buyer-direction rules, stable source-account corroboration and honest PARTIAL reporting. Local 281-test verification passes. Actual XHS detail availability and positive BUILD/platform acceptance remain unresolved; DGA-004 has not started.

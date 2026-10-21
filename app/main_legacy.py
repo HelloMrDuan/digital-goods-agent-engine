@@ -556,6 +556,7 @@ def scheduler_run_now():
 
 @app.get("/api/evidence")
 def evidence_list(platform: str | None = None, source_id: int | None = None, intent_class: str | None = None, content_kind: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    from .evidence_identity import evidence_assessment
     sql = "SELECT DISTINCT e.* FROM evidence e"
     where = []
     params: list[Any] = []
@@ -592,6 +593,7 @@ def evidence_list(platform: str | None = None, source_id: int | None = None, int
         d = row_to_dict(r) or {}
         d["engagement"] = loads(d.pop("engagement_json", None), {})
         d["intent_reason"] = loads(d.pop("intent_reason_json", None), [])
+        d["content_quality"] = evidence_assessment(d)
         d.pop("raw_json", None)
         d["source_matches"] = by_e.get(int(d["id"]),[])
         out.append(d)
@@ -600,6 +602,7 @@ def evidence_list(platform: str | None = None, source_id: int | None = None, int
 
 @app.get("/api/evidence/{evidence_id}")
 def evidence_detail(evidence_id: int):
+    from .evidence_identity import evidence_assessment
     with conn() as c:
         row = c.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone()
         links = c.execute("""SELECT s.id source_id,s.name source_name,s.platform source_platform,s.query,s.config_json,es.first_seen_at,es.last_seen_at,es.observation_count
@@ -610,6 +613,7 @@ def evidence_detail(evidence_id: int):
     d = row_to_dict(row) or {}
     d["engagement"] = loads(d.pop("engagement_json", None), {})
     d["raw"] = loads(d.pop("raw_json", None), {})
+    d["content_quality"] = evidence_assessment(d)
     d["intent_reason"] = loads(d.pop("intent_reason_json", None), [])
     d["source_matches"] = []
     for r in links:

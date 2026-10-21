@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from ..config import settings
 from ..db import conn, loads, now_iso, row_to_dict
+from ..evidence_identity import evidence_assessment
 
 
 
@@ -133,7 +134,7 @@ def data_quality_report() -> dict[str, Any]:
     with conn() as c:
         evidence_rows = c.execute(
             """SELECT id,platform,published_at,collected_at,author,content_fingerprint,evidence_quality_score,
-                      published_time_quality,demand_signal_score,intent_class,intent_confidence,content_kind FROM evidence"""
+                      published_time_quality,demand_signal_score,intent_class,intent_confidence,content_kind,title,content,raw_json FROM evidence"""
         ).fetchall()
         link_rows = c.execute(
             """SELECT es.evidence_id,s.id source_id,s.name,s.platform,s.config_json
@@ -167,7 +168,18 @@ def data_quality_report() -> dict[str, Any]:
     intent_counts = Counter()
     content_kind_counts = Counter()
     demand_eligible = 0
+    body_count = 0
+    identity_bases = Counter()
+    enrichment_statuses = Counter()
+    stable_accounts = set()
     for r in evidence_rows:
+        assessment = evidence_assessment(dict(r))
+        body_count += int(assessment["body_present"])
+        identity_bases[assessment["account_identity_basis"]] += 1
+        if assessment["stable_source_account"]:
+            stable_accounts.add(assessment["account_key"])
+        for stage in ("detail", "comments"):
+            enrichment_statuses[stage + ":" + str(assessment["enrichment"].get(stage + "_status") or "NOT_REQUESTED")] += 1
         platform_counts[str(r["platform"])] += 1
         intent_counts[str(r["intent_class"] or "unclassified")] += 1
         content_kind_counts[str(r["content_kind"] or "post")] += 1
@@ -206,6 +218,7 @@ def data_quality_report() -> dict[str, Any]:
             "success_rate_pct": round(len(good) / len(completed) * 100.0, 2) if completed else None,
             "failure_rate_pct": round(len(fail) / len(completed) * 100.0, 2) if completed else None,
             "empty_rate_pct": round(len(empty) / len(completed) * 100.0, 2) if completed else None,
+            "partial_rate_pct": round(sum(r.get("status") == "PARTIAL" for r in completed) / len(completed) * 100.0, 2) if completed else None,
             "avg_duration_ms": round(float(s.get("avg_duration_ms") or 0), 2),
             "failure_streak": int(s.get("failure_streak") or 0),
             "empty_streak": int(s.get("empty_streak") or 0),
@@ -223,6 +236,12 @@ def data_quality_report() -> dict[str, Any]:
         "real_data_only": integrity["status"] == "PASS",
         "runtime_integrity": integrity,
         "evidence_total": total,
+        "body_present_count": body_count,
+        "body_coverage_pct": round(body_count / total * 100.0, 2) if total else 0.0,
+        "title_only_or_missing_body_count": total - body_count,
+        "account_identity_basis_counts": dict(identity_bases),
+        "distinct_stable_source_accounts": len(stable_accounts),
+        "enrichment_status_counts": dict(enrichment_statuses),
         "independent_content_fingerprints": len(fingerprints),
         "mirrored_or_exact_copy_extra_rows": duplicated_rows,
         "published_timestamp_coverage_pct": round(source_time_count / total * 100.0, 2) if total else 0.0,
@@ -241,6 +260,7 @@ def data_quality_report() -> dict[str, Any]:
         "notes": [
             "duplicate_groups are retained as provenance but de-inflated in effective demand signal counts",
             "evidence quality is a transparent completeness score, not an AI judgment",
+            "body coverage and stable source accounts do not prove statements are true, people are distinct, or buyers will pay",
             "only explicit_demand/probable_demand from core_demand sources can enter business demand clustering",
             "source reliability uses the latest 20 completed collection runs per source",
             "runtime_integrity fails when fixture/demo provenance is present in production business rows",

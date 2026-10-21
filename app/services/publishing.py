@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import math
 import textwrap
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from ..security import redact_error
 from PIL import Image, ImageDraw, ImageFont
 
 from ..config import settings
@@ -34,6 +37,7 @@ def etsy_status() -> dict[str, Any]:
             missing.append(name)
     return {
         "configured": not missing,
+        "status": "NOT_CONFIGURED" if missing else "CONFIGURED_NOT_VERIFIED",
         "missing": missing,
         "shop_id": settings.etsy_shop_id or None,
         "taxonomy_id": settings.etsy_taxonomy_id or None,
@@ -69,7 +73,9 @@ def _listing_id(payload: dict[str, Any]) -> int:
     for value in candidates:
         try:
             if value is not None:
-                return int(value)
+                parsed = int(value)
+                if parsed > 0:
+                    return parsed
         except Exception:
             pass
     raise ValueError("Etsy createDraftListing response did not contain listing_id")
@@ -160,21 +166,30 @@ def publish_to_etsy(
             "provide an explicit publish price in the shop currency"
         )
     publish_price = float(price if price is not None else product.get("price_suggestion"))
-    if publish_price <= 0:
+    if not math.isfinite(publish_price) or publish_price <= 0:
         raise ValueError("Etsy publish price must be greater than zero")
     publish_taxonomy = int(taxonomy_id or settings.etsy_taxonomy_id)
     publish_quantity = int(quantity or settings.etsy_listing_quantity)
     if publish_taxonomy <= 0 or publish_quantity <= 0:
         raise ValueError("Etsy taxonomy_id and quantity must be positive")
 
-    previous = _latest_publish_run(product_id)
-    if previous and previous.get("status") == "SUCCESS":
-        return previous
-
     created_at = now_iso()
-    external_id = int(previous["external_id"]) if previous and previous.get("external_id") else None
+    external_id = None
     run_id = None
     with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        previous = c.execute(
+            "SELECT * FROM publish_runs WHERE product_id=? AND platform='etsy' ORDER BY id DESC LIMIT 1", (product_id,)
+        ).fetchone()
+        if previous and previous["status"] in {"RUNNING", "UNKNOWN"}:
+            raise ValueError("Etsy publish is RUNNING or UNKNOWN; reconcile the remote listing before retrying")
+        previous_response = loads(previous["response_json"], {}) if previous else {}
+        previous_bundle = (previous_response or {}).get("bundle_checksum")
+        if previous_bundle and previous_bundle != bundle["checksum"]:
+            raise ValueError("published bundle changed; reconcile the existing listing before publishing a revision")
+        if previous and previous["status"] == "SUCCESS" and (previous["stage"] == "ACTIVE" or not activate):
+            return dict(previous)
+        external_id = int(previous["external_id"]) if previous and previous["external_id"] else None
         cur = c.execute(
             """INSERT INTO publish_runs(
                    product_id,platform,status,stage,external_id,external_url,response_json,error,created_at,updated_at
@@ -185,7 +200,11 @@ def publish_to_etsy(
 
     own_client = client is None
     http = client or httpx.Client(timeout=60.0, follow_redirects=True)
-    responses: dict[str, Any] = {}
+    responses: dict[str, Any] = {
+        "bundle_checksum": bundle["checksum"],
+        "approved_gate_snapshot_hash": product.get("approved_gate_snapshot_hash"),
+        "shop_id": settings.etsy_shop_id,
+    }
     try:
         headers = _headers()
         if external_id is None:
@@ -217,10 +236,13 @@ def publish_to_etsy(
             response = http.post(
                 f"{ETSY_BASE_URL}/shops/{settings.etsy_shop_id}/listings/{external_id}/files",
                 headers=headers,
+                data={"name": bundle_path.name},
                 files={"file": (bundle_path.name, handle, mime)},
             )
         response.raise_for_status()
         responses["upload_file"] = _response_json(response)
+        if not responses["upload_file"].get("listing_file_id"):
+            raise ValueError("Etsy did not confirm a listing_file_id for the uploaded package")
         with conn() as c:
             c.execute("UPDATE publish_runs SET stage='UPLOAD_IMAGE',response_json=?,updated_at=? WHERE id=?", (dumps(responses), now_iso(), run_id))
 
@@ -233,18 +255,23 @@ def publish_to_etsy(
             )
         response.raise_for_status()
         responses["upload_image"] = _response_json(response)
+        if not responses["upload_image"].get("listing_image_id"):
+            raise ValueError("Etsy did not confirm a listing_image_id")
 
         final_state = "draft"
         if activate:
             with conn() as c:
                 c.execute("UPDATE publish_runs SET stage='ACTIVATE',response_json=?,updated_at=? WHERE id=?", (dumps(responses), now_iso(), run_id))
-            response = http.put(
+            response = http.patch(
                 f"{ETSY_BASE_URL}/shops/{settings.etsy_shop_id}/listings/{external_id}",
                 headers=headers,
                 data={"state": "active"},
             )
             response.raise_for_status()
             responses["activate"] = _response_json(response)
+            if (_listing_id(responses["activate"]) != external_id
+                    or responses["activate"].get("state") != "active"):
+                raise ValueError("Etsy did not confirm the requested listing is active")
             final_state = "active"
 
         external_url = f"https://www.etsy.com/listing/{external_id}"
@@ -277,8 +304,8 @@ def publish_to_etsy(
     except Exception as exc:
         with conn() as c:
             c.execute(
-                """UPDATE publish_runs SET status='FAILED',external_id=?,response_json=?,error=?,updated_at=? WHERE id=?""",
-                (str(external_id) if external_id else None, dumps(responses), str(exc), now_iso(), run_id),
+                """UPDATE publish_runs SET status='UNKNOWN',external_id=?,response_json=?,error=?,updated_at=? WHERE id=?""",
+                (str(external_id) if external_id else None, dumps(responses), redact_error(exc), now_iso(), run_id),
             )
         raise
     finally:
@@ -289,9 +316,9 @@ def publish_to_etsy(
 
 def _extract_xianyu_item_id(value: Any) -> str | None:
     if isinstance(value, dict):
-        for key in ("item_id", "itemId", "id"):
+        for key in ("item_id", "itemId"):
             raw = value.get(key)
-            if raw not in (None, "") and str(raw).isdigit():
+            if raw not in (None, "") and str(raw).isdigit() and int(raw) > 0:
                 return str(raw)
         for child in value.values():
             found = _extract_xianyu_item_id(child)
@@ -330,7 +357,7 @@ def xianyu_status(client: httpx.Client | Any | None = None) -> dict[str, Any]:
             response.raise_for_status()
             remote = response.json()
         except Exception as exc:
-            remote = {"configured": False, "error": str(exc)}
+            remote = {"configured": False, "error": redact_error(exc)}
         finally:
             if own:
                 http.close()
@@ -366,13 +393,13 @@ def publish_to_xianyu(
     client: httpx.Client | Any | None = None,
 ) -> dict[str, Any]:
     product = require_approved_current_product(product_id)
-    latest_successful_bundle(product_id)
+    bundle = latest_successful_bundle(product_id)
     product_currency = str(product.get("price_currency") or settings.default_product_currency).upper()
     if product_currency != "CNY":
         raise ValueError("Xianyu publishing currently requires a CNY product price")
 
     publish_price = float(price if price is not None else product.get("price_suggestion"))
-    if publish_price <= 0:
+    if not math.isfinite(publish_price) or publish_price <= 0:
         raise ValueError("Xianyu publish price must be greater than zero")
     publish_category = str(category or settings.xianyu_publish_category).strip()
     publish_condition = str(condition or settings.xianyu_publish_condition).strip()
@@ -381,18 +408,22 @@ def publish_to_xianyu(
     if publish_condition not in {"全新", "几乎全新", "轻微使用", "明显使用", "老旧"}:
         raise ValueError("unsupported Xianyu condition")
 
-    with conn() as c:
-        previous = c.execute(
-            "SELECT * FROM publish_runs WHERE product_id=? AND platform='xianyu' AND status='SUCCESS' ORDER BY id DESC LIMIT 1",
-            (product_id,),
-        ).fetchone()
-    if previous:
-        item = row_to_dict(previous) or {}
-        item["response"] = loads(item.pop("response_json", None), {}) or {}
-        return item
-
+    cover = _cover_image(product)
+    image_b64 = base64.b64encode(cover.read_bytes()).decode("ascii")
     created_at = now_iso()
     with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        previous = c.execute(
+            "SELECT * FROM publish_runs WHERE product_id=? AND platform='xianyu' ORDER BY id DESC LIMIT 1", (product_id,)
+        ).fetchone()
+        if previous and previous["status"] in {"RUNNING", "UNKNOWN"}:
+            raise ValueError("Xianyu publish is RUNNING or UNKNOWN; reconcile the remote listing before retrying")
+        previous_response = loads(previous["response_json"], {}) if previous else {}
+        previous_bundle = (previous_response or {}).get("bundle_checksum")
+        if previous_bundle and previous_bundle != bundle["checksum"]:
+            raise ValueError("published bundle changed; reconcile the existing listing before publishing a revision")
+        if previous and previous["status"] == "SUCCESS":
+            return dict(previous)
         cur = c.execute(
             """INSERT INTO publish_runs(
                    product_id,platform,status,stage,external_id,external_url,response_json,error,created_at,updated_at
@@ -401,8 +432,6 @@ def publish_to_xianyu(
         )
         run_id = int(cur.lastrowid)
 
-    cover = _cover_image(product)
-    image_b64 = base64.b64encode(cover.read_bytes()).decode("ascii")
     title = str(product.get("title") or product.get("name") or "").strip()
     description = str(product.get("description") or "").strip()
     description = (
@@ -446,10 +475,14 @@ def publish_to_xianyu(
                 ),
             }
 
-        item_id = _extract_xianyu_item_id(response_payload)
+        if response_payload.get("status") != "SUCCESS":
+            raise ValueError("Xianyu publish did not report SUCCESS")
+        item_id = _extract_xianyu_item_id(response_payload.get("result"))
         if not item_id:
             raise ValueError("Xianyu publish returned no verifiable item_id; product was not marked published")
         external_url = f"https://www.goofish.com/item?categoryId=0&id={item_id}"
+        response_payload["bundle_checksum"] = bundle["checksum"]
+        response_payload["approved_gate_snapshot_hash"] = product.get("approved_gate_snapshot_hash")
         finished_at = now_iso()
         with conn() as c:
             c.execute(
@@ -479,7 +512,7 @@ def publish_to_xianyu(
     except Exception as exc:
         with conn() as c:
             c.execute(
-                "UPDATE publish_runs SET status='FAILED',response_json=?,error=?,updated_at=? WHERE id=?",
-                (dumps(response_payload), str(exc), now_iso(), run_id),
+                "UPDATE publish_runs SET status='UNKNOWN',response_json=?,error=?,updated_at=? WHERE id=?",
+                (dumps(response_payload), redact_error(exc), now_iso(), run_id),
             )
         raise

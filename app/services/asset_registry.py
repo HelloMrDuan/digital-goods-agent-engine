@@ -426,10 +426,14 @@ def product_asset_readiness(product_id: int) -> dict[str, Any]:
     review_flags: list[str] = []
     for asset in assets:
         decision, reasons = _asset_license_decision(asset)
+        if str(asset.get("status") or "").upper() != "ACTIVE":
+            decision = "BLOCKED"
+            reasons = reasons + ["source_asset_not_active"]
         entry = {
             "asset_id": int(asset["id"]),
             "title": asset.get("title"),
             "role": asset.get("role"),
+            "status": asset.get("status"),
             "ownership_type": asset.get("ownership_type"),
             "decision": decision,
             "reasons": reasons,
@@ -454,6 +458,7 @@ def product_asset_readiness(product_id: int) -> dict[str, Any]:
         {
             "id": asset.get("id"),
             "role": asset.get("role"),
+            "status": asset.get("status"),
             "checksum": asset.get("checksum"),
             "ownership_type": asset.get("ownership_type"),
             "license_name": asset.get("license_name"),

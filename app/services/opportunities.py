@@ -21,6 +21,20 @@ def get_opportunity(opportunity_id: int) -> dict[str, Any] | None:
     return row_to_dict(row)
 
 
+def analysis_is_current(opportunity: dict[str, Any]) -> bool:
+    if (opportunity.get("overall_score") is None or bool(opportunity.get("analysis_stale"))
+            or not bool(opportunity.get("cluster_active"))):
+        return False
+    analysis = loads(opportunity.get("analysis_json"), {}) or {}
+    snapshot = analysis.get("snapshot_hash")
+    if snapshot:
+        # Market observations are part of the Agent snapshot even when demand Gate A
+        # remains unchanged. Check at every consequential boundary, not just in the UI.
+        from .opportunity_agent import build_evidence_digest
+        return snapshot == build_evidence_digest(int(opportunity["id"]))["snapshot_hash"]
+    return True  # Legacy V1.2 analysis uses the persisted analysis_stale flag.
+
+
 def get_evidence_for_opportunity(opportunity_id: int, limit: int = 80) -> list[dict[str, Any]]:
     with conn() as c:
         rows = c.execute(

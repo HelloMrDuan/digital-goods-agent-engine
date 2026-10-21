@@ -595,6 +595,7 @@ def _run_agent(
     allowed_evidence_ids: set[int],
 ) -> tuple[dict[str, Any], dict[str, Any], int]:
     started = time.monotonic()
+    meta = None
     try:
         output, meta = chat_json_with_meta(
             operation=f"opportunity_agent_{agent_name}",
@@ -624,7 +625,7 @@ def _run_agent(
             status="FAILED",
             input_payload=payload,
             output=None,
-            meta=None,
+            meta=meta,
             duration_ms=duration_ms,
             error=str(exc),
         )
@@ -725,7 +726,7 @@ def _primary_product_view(product_output: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
+def _run_opportunity_agent_workflow(opportunity_id: int) -> dict[str, Any]:
     _ensure_schema()
     opportunity = get_opportunity(opportunity_id)
     if not opportunity:
@@ -1065,3 +1066,9 @@ def list_agent_runs(opportunity_id: int, limit: int = 50) -> list[dict[str, Any]
         data["output"] = loads(data.pop("output_json", None), None)
         result.append(data)
     return result
+
+
+def run_opportunity_agent_workflow(opportunity_id: int, *, force: bool = False) -> dict[str, Any]:
+    from .paid_workflows import run_paid_once
+    digest=build_evidence_digest(opportunity_id)
+    return run_paid_once("opportunity_agents",opportunity_id,str(digest["snapshot_hash"]),lambda:_run_opportunity_agent_workflow(opportunity_id),force=force)

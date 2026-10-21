@@ -213,8 +213,8 @@ class _FakeEtsyClient:
             return _FakeResponse({"listing_image_id": 22})
         raise AssertionError(url)
 
-    def put(self, url, **kwargs):
-        self.calls.append(("PUT", url, kwargs))
+    def patch(self, url, **kwargs):
+        self.calls.append(("PATCH", url, kwargs))
         assert url.endswith("/listings/987654321")
         assert kwargs["data"]["state"] == "active"
         return _FakeResponse({"listing_id": 987654321, "state": "active"})
@@ -234,7 +234,7 @@ def test_approved_real_package_routes_to_etsy_digital_listing(monkeypatch):
     assert result["state"] == "active"
     assert result["external_id"] == "987654321"
     methods = [call[0] for call in fake.calls]
-    assert methods == ["POST", "POST", "POST", "PUT"]
+    assert methods == ["POST", "POST", "POST", "PATCH"]
     create_payload = fake.calls[0][2]["data"]
     assert create_payload["type"] == "download"
     assert create_payload["title"] == "Payroll and Overtime Workbook"
@@ -320,3 +320,171 @@ def test_approved_real_package_publishes_to_real_xianyu_bridge(monkeypatch):
     assert product["status"] == "PUBLISHED"
     assert product["published_platform"] == "xianyu"
     assert product["external_listing_id"] == "1234567890123"
+
+
+def test_bundle_tamper_invalidates_gate_and_approval(monkeypatch):
+    from app.services.product_lifecycle import get_gate_b, require_approved_current_product
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    build = product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    Path(build["bundle_path"]).write_bytes(b"tampered")
+    assert get_gate_b(product_id)["is_current"] is False
+    assert evaluate_gate_b(product_id)["decision"] == "BLOCKED"
+    with pytest.raises(ValueError):
+        require_approved_current_product(product_id)
+
+
+def test_rebuild_preserves_previous_package_and_requires_new_approval(monkeypatch):
+    from app.services.product_lifecycle import get_gate_b
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    first = product_builder.build_product_artifact(product_id)
+    old_bytes = Path(first["bundle_path"]).read_bytes()
+    approve_product(product_id)
+    second = product_builder.build_product_artifact(product_id, force=True)
+    assert first["bundle_path"] != second["bundle_path"]
+    assert Path(first["bundle_path"]).read_bytes() == old_bytes
+    assert get_gate_b(product_id)["is_current"] is False
+
+
+def test_artifact_build_refuses_failed_gate_before_paid_call(monkeypatch):
+    product_id = _ready_product()
+    with conn() as c:
+        c.execute("DELETE FROM commercial_validation_runs")
+    def forbidden(**kwargs):
+        raise AssertionError("paid model must not be called")
+    monkeypatch.setattr(product_builder, "chat_json", forbidden)
+    with pytest.raises(ValueError, match="commercial validation"):
+        product_builder.build_product_artifact(product_id)
+
+
+def test_market_snapshot_change_blocks_gate_and_product_generation(monkeypatch):
+    from app.services import opportunity_agent, analyze
+    from app.services.product_lifecycle import get_gate_b
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    with conn() as c:
+        c.execute("UPDATE opportunities SET analysis_json=?", (dumps({"decision":"BUILD","snapshot_hash":"old"}),))
+    monkeypatch.setattr(opportunity_agent, "build_evidence_digest", lambda oid: {"snapshot_hash":"old"})
+    approve_product(product_id)
+    monkeypatch.setattr(opportunity_agent, "build_evidence_digest", lambda oid: {"snapshot_hash":"changed-market"})
+    assert get_gate_b(product_id)["is_current"] is False
+    assert evaluate_gate_b(product_id)["decision"] == "BLOCKED"
+    with pytest.raises(ValueError, match="analyzed first"):
+        analyze.product_from_opportunity(1)
+
+
+@pytest.mark.parametrize("state", ["draft", None])
+def test_etsy_unconfirmed_activation_cannot_publish(monkeypatch, state):
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    class Unconfirmed(_FakeEtsyClient):
+        def patch(self, url, **kwargs):
+            return _FakeResponse({"listing_id":987654321, "state":state})
+    client = Unconfirmed()
+    with pytest.raises(ValueError, match="confirm.*active"):
+        publishing.publish_to_etsy(product_id, client=client)
+    with conn() as c:
+        assert c.execute("SELECT status FROM products WHERE id=?",(product_id,)).fetchone()["status"] == "APPROVED"
+        assert c.execute("SELECT status FROM publish_runs").fetchone()["status"] == "UNKNOWN"
+    with pytest.raises(ValueError, match="UNKNOWN"):
+        publishing.publish_to_etsy(product_id, client=client)
+
+
+def test_etsy_draft_can_later_activate(monkeypatch):
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    client = _FakeEtsyClient()
+    assert publishing.publish_to_etsy(product_id, client=client, activate=False)["state"] == "draft"
+    client.calls.clear()
+    assert publishing.publish_to_etsy(product_id, client=client, activate=True)["state"] == "active"
+    assert all(not call[1].endswith("/listings") for call in client.calls)
+
+
+def test_concurrent_publish_claim_prevents_duplicate_remote_write(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    entered, release = Event(), Event()
+    class Blocking(_FakeEtsyClient):
+        def post(self, url, **kwargs):
+            if url.endswith("/listings"):
+                entered.set()
+                assert release.wait(10)
+            return super().post(url, **kwargs)
+    client = Blocking()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(publishing.publish_to_etsy, product_id, client=client)
+        try:
+            assert entered.wait(10)
+            with pytest.raises(ValueError, match="RUNNING"):
+                publishing.publish_to_etsy(product_id, client=_FakeEtsyClient())
+        finally:
+            release.set()
+        assert first.result()["state"] == "active"
+    assert sum(call[1].endswith("/listings") for call in client.calls) == 1
+
+
+def test_manual_delivery_resource_is_not_proof_of_transfer(monkeypatch):
+    from app.main_legacy import delivery_create
+    from app.models import DeliveryIn
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    result = delivery_create(DeliveryIn(product_id=product_id,order_ref="manual-1",delivery_uri="https://files.example.test/file.zip"))
+    assert result["status"] == "PENDING"
+    assert result["delivered_at"] is None
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as caught:
+        delivery_create(DeliveryIn(product_id=product_id,platform="xianyu",order_ref="123",resource={"ok":True}))
+    assert caught.value.status_code == 400
+
+
+def test_repeated_build_reuses_snapshot_without_another_paid_call(monkeypatch):
+    product_id = _ready_product()
+    calls=[]
+    def generate(**kwargs):
+        calls.append(kwargs)
+        return _artifact_response()
+    monkeypatch.setattr(product_builder,"chat_json",generate)
+    first=product_builder.build_product_artifact(product_id)
+    second=product_builder.build_product_artifact(product_id)
+    assert second["idempotent"] is True
+    assert second["build_id"] == first["build_id"]
+    assert len(calls) == 1
+
+
+def test_gate_a_expires_when_recent_evidence_ages_out(monkeypatch):
+    from app.services import validation
+    product_id = _ready_product()
+    assert validation.get_validation(1)["status"] == "PASSED"
+    original_datetime=validation.datetime
+    class Later(original_datetime):
+        @classmethod
+        def now(cls,tz=None):
+            return original_datetime.now(tz) + timedelta(days=40)
+    monkeypatch.setattr(validation,"datetime",Later)
+    assert validation.get_validation(1)["status"] == "STALE"
+    with pytest.raises(ValueError,match="commercial validation"):
+        product_builder.build_product_artifact(product_id)
+
+
+def test_gate_policy_change_invalidates_prior_approval(monkeypatch):
+    from app.services.product_lifecycle import get_gate_b
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder,"chat_json",lambda **kwargs:_artifact_response())
+    product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    monkeypatch.setattr(settings,"high_risk_threshold",5)
+    assert get_gate_b(product_id)["is_current"] is False
+    assert evaluate_gate_b(product_id)["decision"] == "BLOCKED"

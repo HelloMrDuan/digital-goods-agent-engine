@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from ...security import redact_error
+
 from ...config import settings
 from ...db import conn, now_iso
 from .budget import BudgetExceededError, release_ai_budget, reserve_ai_budget
@@ -72,7 +74,7 @@ def _daily_spend() -> float:
     today = datetime.now(timezone.utc).date().isoformat()
     with conn() as c:
         row = c.execute(
-            "SELECT coalesce(sum(estimated_cost_cny),0) cost FROM ai_runs WHERE status='SUCCESS' AND substr(created_at,1,10)=?",
+            "SELECT coalesce(sum(estimated_cost_cny),0) cost FROM ai_runs WHERE substr(created_at,1,10)=?",
             (today,),
         ).fetchone()
     return float(row["cost"] or 0)
@@ -154,13 +156,15 @@ def _post_with_rate_limit_retry(url: str, headers: dict[str, str], body: dict[st
     return last_response
 
 
-def _decode_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, str]:
+def _decode_completion_response(response: httpx.Response, usage_parts=None) -> tuple[dict[str, Any], str, str]:
     if response.status_code != 200:
-        raise QiniuError(f"Qiniu HTTP {response.status_code}: {response.text}")
+        raise QiniuError(f"Qiniu HTTP {response.status_code}: {redact_error(response.text)}")
     try:
         data = response.json()
     except Exception as exc:
-        raise QiniuError(f"Qiniu invalid json response: {response.text[:800]}") from exc
+        raise QiniuError(f"Qiniu invalid json response: {redact_error(response.text[:800])}") from exc
+    if usage_parts is not None:
+        usage_parts.append(_usage_numbers(data))
     try:
         choice = data["choices"][0]
         content = choice["message"]["content"]
@@ -225,15 +229,16 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
     }
     if settings.qiniu_json_mode:
         body["response_format"] = {"type": "json_object"}
-    max_new_tokens = kwargs.get("max_new_tokens")
-    if max_new_tokens:
-        body["max_tokens"] = int(max_new_tokens)
+    max_new_tokens = int(kwargs.get("max_new_tokens") or settings.agent_max_new_tokens)
+    body["max_tokens"] = max_new_tokens
 
     operation = str(kwargs.get("operation") or "chat_json")
     entity_type = str(kwargs.get("entity_type") or "system")
     entity_id = kwargs.get("entity_id")
     created_at = now_iso()
     reservation_id: int | None = None
+    usage_parts: list[tuple[int, int, int]] = []
+    request_dispatched = False
     try:
         try:
             reservation_id = reserve_ai_budget(
@@ -241,10 +246,10 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                 _request_budget_reserve(messages, int(max_new_tokens) if max_new_tokens else None),
             )
         except BudgetExceededError as exc:
-            raise QiniuError(str(exc)) from exc
+            raise QiniuError(redact_error(exc)) from exc
+        request_dispatched = True
         response = _post_with_rate_limit_retry(url, headers, body)
-        data, content, finish_reason = _decode_completion_response(response)
-        usage_parts = [_usage_numbers(data)]
+        data, content, finish_reason = _decode_completion_response(response, usage_parts)
         json_length_retry = False
         try:
             result = _extract_json(content)
@@ -255,8 +260,7 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
             retry_body = dict(body)
             retry_body["max_tokens"] = _expanded_json_retry_tokens(original_limit)
             retry_response = _post_with_rate_limit_retry(url, headers, retry_body)
-            retry_data, retry_content, retry_finish_reason = _decode_completion_response(retry_response)
-            usage_parts.append(_usage_numbers(retry_data))
+            retry_data, retry_content, retry_finish_reason = _decode_completion_response(retry_response, usage_parts)
             try:
                 result = _extract_json(retry_content)
             except QiniuError as exc:
@@ -291,7 +295,8 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                     created_at,
                 ),
             )
-            release_ai_budget(reservation_id, c)
+            if not request_dispatched or (total_tokens > 0 and _resolved_prices()[2] != "unknown"):
+                release_ai_budget(reservation_id, c)
         meta = {
             "provider": "Qiniu",
             "model": settings.qiniu_model,
@@ -308,10 +313,15 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
         }
         return result, meta
     except Exception as exc:
+        prompt_tokens = sum(part[0] for part in usage_parts)
+        completion_tokens = sum(part[1] for part in usage_parts)
+        total_tokens = sum(part[2] for part in usage_parts)
+        cost = _estimate_cost(prompt_tokens, completion_tokens)
         with conn() as c:
             c.execute(
-                """INSERT INTO ai_runs(operation,entity_type,entity_id,provider,model,status,error,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
+                """INSERT INTO ai_runs(operation,entity_type,entity_id,provider,model,status,error,created_at,
+                                       prompt_tokens,completion_tokens,total_tokens,estimated_cost_cny)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     operation,
                     entity_type,
@@ -319,14 +329,16 @@ def chat_json_with_meta(**kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
                     "Qiniu",
                     settings.qiniu_model or "UNCONFIGURED",
                     "FAILED",
-                    str(exc),
+                    redact_error(exc),
                     created_at,
+                    prompt_tokens, completion_tokens, total_tokens, cost,
                 ),
             )
-            release_ai_budget(reservation_id, c)
+            if not request_dispatched or (total_tokens > 0 and _resolved_prices()[2] != "unknown"):
+                release_ai_budget(reservation_id, c)
         if isinstance(exc, QiniuError):
             raise
-        raise QiniuError(f"Qiniu connection failed: {exc}") from exc
+        raise QiniuError(f"Qiniu connection failed: {redact_error(exc)}") from exc
 
 
 def chat_json(**kwargs) -> dict[str, Any]:

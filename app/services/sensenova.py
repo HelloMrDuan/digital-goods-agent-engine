@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from ..security import redact_error
+
 from ..config import settings
 from ..db import conn, dumps, now_iso
 from .llm.budget import BudgetExceededError, release_ai_budget, reserve_ai_budget
@@ -41,7 +43,7 @@ def _daily_spend() -> float:
     today = datetime.now(timezone.utc).date().isoformat()
     with conn() as c:
         row = c.execute(
-            "SELECT coalesce(sum(estimated_cost_cny),0) cost FROM ai_runs WHERE status='SUCCESS' AND substr(created_at,1,10)=?",
+            "SELECT coalesce(sum(estimated_cost_cny),0) cost FROM ai_runs WHERE substr(created_at,1,10)=?",
             (today,),
         ).fetchone()
     return float(row["cost"] or 0)
@@ -73,6 +75,9 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
     headers = {"Authorization": f"Bearer {settings.sensenova_api_token}", "Content-Type": "application/json"}
     created_at = now_iso()
     reservation_id: int | None = None
+    prompt_tokens = completion_tokens = total_tokens = 0
+    cost = 0.0
+    request_dispatched = False
     try:
         prompt_text = system + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         prompt_upper = max(256, int(len(prompt_text) * 1.25) + 256)
@@ -80,12 +85,18 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
         try:
             reservation_id = reserve_ai_budget("SenseNova", reserve_cost)
         except BudgetExceededError as exc:
-            raise SenseNovaError(str(exc)) from exc
+            raise SenseNovaError(redact_error(exc)) from exc
         with httpx.Client(timeout=90.0, headers=headers) as client:
+            request_dispatched = True
             resp = client.post(settings.sensenova_base_url, json=request_body)
             resp.raise_for_status()
             body = resp.json()
         data = body.get("data") or body
+        usage = data.get("usage") or {}
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        cost = _estimate_cost(prompt_tokens, completion_tokens)
         choices = data.get("choices") or []
         if not choices:
             raise SenseNovaError(f"Unexpected SenseNova response: {str(body)[:500]}")
@@ -108,20 +119,24 @@ def chat_json(*, operation: str, entity_type: str, entity_id: int | None, system
                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model, "SUCCESS", prompt_tokens, completion_tokens, total_tokens, cost, created_at),
             )
-            release_ai_budget(reservation_id, c)
+            if not request_dispatched or (total_tokens > 0 and cost > 0):
+                release_ai_budget(reservation_id, c)
         result["_usage"] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens, "estimated_cost_cny": cost}
         return result
     except Exception as exc:
         with conn() as c:
             c.execute(
-                """INSERT INTO ai_runs(operation,entity_type,entity_id,provider,model,status,error,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model or "UNCONFIGURED", "FAILED", str(exc), created_at),
+                """INSERT INTO ai_runs(operation,entity_type,entity_id,provider,model,status,error,created_at,
+                                       prompt_tokens,completion_tokens,total_tokens,estimated_cost_cny)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (operation, entity_type, entity_id, "SenseNova", settings.sensenova_model or "UNCONFIGURED", "FAILED", redact_error(exc), created_at,
+                 prompt_tokens, completion_tokens, total_tokens, cost),
             )
-            release_ai_budget(reservation_id, c)
+            if not request_dispatched or (total_tokens > 0 and cost > 0):
+                release_ai_budget(reservation_id, c)
         if isinstance(exc, SenseNovaError):
             raise
-        raise SenseNovaError(str(exc)) from exc
+        raise SenseNovaError(redact_error(exc)) from exc
 
 
 def real_metrics(evidence: list[dict[str, Any]], opportunity: dict[str, Any] | None = None) -> dict[str, Any]:

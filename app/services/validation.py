@@ -52,6 +52,8 @@ def current_snapshot(opportunity_id: int) -> tuple[str, list[dict[str, Any]]]:
     if not opportunity:
         raise KeyError("opportunity not found")
     rows = _validation_rows(opportunity_id)
+    current_time = datetime.now(timezone.utc)
+    recent_cutoff = current_time - timedelta(days=30)
     evidence_state = [
         (
             row.get("id"),
@@ -59,12 +61,21 @@ def current_snapshot(opportunity_id: int) -> tuple[str, list[dict[str, Any]]]:
             row.get("intent_class"),
             row.get("intent_confidence"),
             row.get("intent_weight"),
+            row.get("author"), row.get("platform"), row.get("published_at"),
+            row.get("published_time_quality"), row.get("evidence_quality_score"),
+            bool((published := _parse_datetime(row.get("published_at"))) and recent_cutoff <= published <= current_time),
         )
         for row in rows
     ]
     snapshot_hash = stable_hash(
         POLICY_VERSION,
         opportunity.get("cluster_signature"),
+        opportunity.get("cluster_active"),
+        settings.commercial_validation_min_signals,
+        settings.commercial_validation_min_authors,
+        settings.commercial_validation_min_quality,
+        settings.commercial_validation_min_timestamp_coverage,
+        settings.commercial_validation_min_score,
         dumps(evidence_state),
     )
     return snapshot_hash, rows

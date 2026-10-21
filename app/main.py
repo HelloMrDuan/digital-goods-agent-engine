@@ -11,6 +11,7 @@ from . import main_legacy as _legacy
 from .main_legacy import *  # noqa: F401,F403
 from .main_legacy import app
 from .routes_v12 import router as opportunity_v12_router
+from .version import VERSION
 
 
 # Compatibility shims for tests and local scripts that intentionally monkeypatch
@@ -49,7 +50,8 @@ def _write_auth_error(
     authorization: str | None,
     api_key: str | None,
 ) -> tuple[int, str] | None:
-    if method.upper() not in {"POST", "PUT", "PATCH", "DELETE"} or not path.startswith("/api/"):
+    sensitive_read = path.startswith(("/api/xianyu/orders/", "/api/deliveries")) or path.endswith("/artifact/download")
+    if not path.startswith("/api/") or (method.upper() not in {"POST", "PUT", "PATCH", "DELETE"} and not sensitive_read):
         return None
     expected = str(settings.api_auth_token or "").strip()
     if not expected:
@@ -99,4 +101,4 @@ async def _security_guards(request, call_next):
 
 
 app.include_router(opportunity_v12_router)
-app.version = "1.4.0-xianyu-market-publish"
+app.version = VERSION

@@ -1,16 +1,25 @@
 from __future__ import annotations
 
-from pathlib import Path
+import math
 from typing import Any
 
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
 from .asset_registry import product_asset_readiness
-from .opportunities import get_opportunity
+from .opportunities import analysis_is_current, get_opportunity
 from .validation import get_validation
 
 
 POLICY_VERSION = "product-gate-v1"
+
+
+def _package_state(product: dict[str, Any]) -> dict[str, Any]:
+    from .product_builder import latest_successful_bundle
+    try:
+        bundle = latest_successful_bundle(int(product["id"]))
+        return {"id": bundle["id"], "checksum": bundle["checksum"], "valid": True}
+    except (OSError, ValueError) as exc:
+        return {"valid": False, "error": str(exc)}
 
 
 def _decode_product_row(row: Any) -> dict[str, Any] | None:
@@ -52,12 +61,15 @@ def _product_snapshot(
 ) -> str:
     return stable_hash(
         POLICY_VERSION,
+        settings.high_risk_threshold,
+        settings.min_score_for_product,
         product.get("id"),
         product.get("sku"),
         product.get("name"),
         product.get("title"),
         product.get("description"),
         product.get("price_suggestion"),
+        product.get("price_currency"),
         product.get("artifact_format"),
         dumps(product.get("keywords") or []),
         dumps(product.get("deliverables") or []),
@@ -72,6 +84,8 @@ def _product_snapshot(
         validation.get("is_current"),
         asset_readiness.get("snapshot_hash"),
         asset_readiness.get("decision"),
+        dumps(_package_state(product)),
+        analysis_is_current(opportunity),
     )
 
 
@@ -110,15 +124,22 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
     )
     record(
         "opportunity_analysis_current",
-        opportunity.get("overall_score") is not None and not bool(opportunity.get("analysis_stale")),
+        analysis_is_current(opportunity),
         severity="BLOCKER",
         reason="opportunity_analysis_missing_or_stale",
     )
     record(
         "copyright_risk",
-        int(opportunity.get("copyright_risk") or 0) < settings.high_risk_threshold,
+        isinstance(opportunity.get("copyright_risk"), (int, float))
+        and 0 <= float(opportunity["copyright_risk"]) < settings.high_risk_threshold,
         severity="BLOCKER",
         reason="high_copyright_or_compliance_risk",
+    )
+    analysis = loads(opportunity.get("analysis_json"), {}) or {}
+    record(
+        "build_decision",
+        analysis.get("decision") == "BUILD" and float(opportunity.get("overall_score") or 0) >= settings.min_score_for_product,
+        severity="BLOCKER", reason="current_build_decision_required",
     )
     record("sku", _nonempty_text(product.get("sku")), severity="BLOCKER", reason="missing_sku")
     record("name", _nonempty_text(product.get("name")), severity="BLOCKER", reason="missing_product_name")
@@ -133,33 +154,19 @@ def evaluate_gate_b(product_id: int, *, persist: bool = True) -> dict[str, Any]:
         price = float(product.get("price_suggestion") or 0)
     except (TypeError, ValueError):
         price = 0.0
-    record("price", price > 0, severity="BLOCKER", reason="missing_or_invalid_price")
+    record("price", math.isfinite(price) and price > 0, severity="BLOCKER", reason="missing_or_invalid_price")
     record(
         "deliverables",
         bool(product.get("deliverables")),
         severity="BLOCKER",
         reason="missing_deliverables",
     )
-    artifact_format = str(product.get("artifact_format") or "").strip().lower()
-    if artifact_format:
-        with conn() as c:
-            build_row = c.execute(
-                """SELECT bundle_path,checksum FROM product_builds
-                   WHERE product_id=? AND status='SUCCESS' ORDER BY id DESC LIMIT 1""",
-                (product_id,),
-            ).fetchone()
-        package_ready = bool(
-            build_row
-            and build_row["bundle_path"]
-            and build_row["checksum"]
-            and Path(str(build_row["bundle_path"])).is_file()
-        )
-        record(
-            "real_deliverable_package",
-            package_ready,
-            severity="BLOCKER",
-            reason="real_deliverable_package_missing",
-        )
+    record(
+        "real_deliverable_package",
+        bool(_package_state(product).get("valid")),
+        severity="BLOCKER",
+        reason="real_deliverable_package_missing",
+    )
     record(
         "faq",
         bool(product.get("faq")),

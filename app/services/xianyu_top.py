@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from ..security import redact_error
+
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict
 from .product_builder import latest_successful_bundle
@@ -38,6 +40,9 @@ def xianyu_top_status() -> dict[str, Any]:
     missing = [name for name, value in values.items() if not str(value or "").strip()]
     return {
         "configured": not missing,
+        "status": "NOT_CONFIGURED" if missing else "CONFIGURED_NOT_VERIFIED",
+        "virtual_delivery_configured": not missing and bool(settings.xianyu_top_seller_id.strip()),
+        "virtual_delivery_missing": missing + ([] if settings.xianyu_top_seller_id.strip() else ["XIANYU_TOP_SELLER_ID"]),
         "missing": missing,
         "mode": "OFFICIAL_TOP_PARTNER_API",
         "gateway": settings.xianyu_top_gateway,
@@ -119,7 +124,7 @@ def _top_call(
     if isinstance(error, dict):
         code = error.get("code") or error.get("sub_code") or "TOP_ERROR"
         message = error.get("sub_msg") or error.get("msg") or "unknown TOP error"
-        raise ValueError(f"Xianyu TOP error {code}: {message}")
+        raise ValueError(f"Xianyu TOP error {code}: {redact_error(message)}")
 
     roots = [value for key, value in body.items() if key.endswith("_response") and isinstance(value, dict)]
     if roots:
@@ -130,7 +135,7 @@ def _top_call(
 def _find_order(value: Any, requested_id: str) -> dict[str, Any] | None:
     if isinstance(value, dict):
         if "order_status" in value:
-            current = str(value.get("biz_order_id") or requested_id)
+            current = str(value.get("biz_order_id") or "")
             if current == requested_id:
                 return value
         for child in value.values():
@@ -164,6 +169,8 @@ def _safe_order(value: dict[str, Any], requested_id: str) -> dict[str, Any]:
         "ship_time": value.get("ship_time"),
         "end_time": value.get("end_time"),
         "x_global_biz_code": value.get("x_global_biz_code"),
+        "item_id": str((value.get("item") or {}).get("item_id") or ""),
+        "encryption_seller_id": str(value.get("encryption_seller_id") or ""),
     }
 
 
@@ -173,7 +180,9 @@ def xianyu_order_query(
     client: httpx.Client | Any | None = None,
 ) -> dict[str, Any]:
     oid = _order_id(biz_order_id)
-    root = _top_call(ORDER_QUERY_METHOD, {"biz_order_id": oid}, client=client)
+    root = _top_call(ORDER_QUERY_METHOD, {
+        "param_appraise_isv_order_query": json.dumps({"biz_order_id": int(oid)}, separators=(",", ":"))
+    }, client=client)
     raw_order = _find_order(root, oid)
     if not raw_order:
         raise ValueError("Xianyu TOP order query returned no matching order")
@@ -224,6 +233,8 @@ def xianyu_virtual_delivery(
     oid = _order_id(biz_order_id)
 
     existing = _existing_delivery(oid)
+    if existing and int(existing["product_id"]) != product_id:
+        raise ValueError("order is already bound to a different product")
     if existing and existing.get("status") == "VIRTUAL_SHIPPED":
         return {
             **existing,
@@ -239,19 +250,50 @@ def xianyu_virtual_delivery(
             f"{order['order_status']} {order['order_status_name']}"
         )
 
-    root = _top_call(
-        VIRTUAL_DELIVERY_METHOD,
-        {
-            "idle_open_isv_virtual_delivery_param": json.dumps(
-                {"biz_order_id": oid},
-                ensure_ascii=False,
-                separators=(",", ":"),
+    # A paid order is insufficient: verify platform listing and stable seller identity.
+    listing_id = str(product.get("external_listing_id") or "")
+    if product.get("published_platform") != "xianyu" or not listing_id or order.get("item_id") != listing_id:
+        raise ValueError("Xianyu order item does not match the product's published Xianyu listing")
+    seller_id = settings.xianyu_top_seller_id.strip()
+    if not seller_id or order.get("encryption_seller_id") != seller_id:
+        raise ValueError("Xianyu order seller is missing or does not match XIANYU_TOP_SELLER_ID")
+
+    # Claim under a database write lock before crossing the remote write boundary.
+    # RUNNING/UNKNOWN claims survive process restarts and require reconciliation.
+    claimed_at = now_iso()
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        previous = c.execute("SELECT * FROM deliveries WHERE platform='xianyu' AND order_ref=?", (oid,)).fetchone()
+        if previous:
+            if int(previous["product_id"]) != product_id:
+                raise ValueError("order is already bound to a different product")
+            if previous["status"] == "VIRTUAL_SHIPPED":
+                return {**dict(previous), "idempotent": True, "shipment_confirmed": True, "file_transferred": False}
+            if previous["status"] != "FAILED" or previous["delivery_type"] != "xianyu_virtual_top":
+                raise ValueError("order delivery is RUNNING or UNKNOWN; reconcile before retrying")
+            delivery_id = int(previous["id"])
+            c.execute("UPDATE deliveries SET status='RUNNING',updated_at=? WHERE id=?", (claimed_at, delivery_id))
+        else:
+            cur = c.execute(
+                """INSERT INTO deliveries(product_id,platform,order_ref,delivery_type,status,created_at,updated_at)
+                   VALUES(?,'xianyu',?,'xianyu_virtual_top','RUNNING',?,?)""",
+                (product_id, oid, claimed_at, claimed_at),
             )
-        },
-        client=client,
-    )
-    if not _virtual_delivery_success(root):
-        raise ValueError("Xianyu TOP virtual delivery did not confirm result.data=true")
+            delivery_id = int(cur.lastrowid)
+
+    try:
+        root = _top_call(
+            VIRTUAL_DELIVERY_METHOD,
+            {"idle_open_isv_virtual_delivery_param": json.dumps({"biz_order_id": int(oid)}, separators=(",", ":"))},
+            client=client,
+        )
+        if not _virtual_delivery_success(root):
+            raise ValueError("Xianyu TOP virtual delivery did not confirm result.data=true")
+    except Exception as exc:
+        with conn() as c:
+            c.execute("UPDATE deliveries SET status='UNKNOWN',error_message=?,updated_at=? WHERE id=?",
+                      (redact_error(exc), now_iso(), delivery_id))
+        raise
 
     shipped_at = now_iso()
     resource = {
@@ -267,48 +309,11 @@ def xianyu_virtual_delivery(
         "order_status_before_delivery": order["order_status"],
     }
     with conn() as c:
-        row = c.execute(
-            "SELECT id FROM deliveries WHERE platform='xianyu' AND order_ref=?",
-            (oid,),
-        ).fetchone()
-        if row:
-            delivery_id = int(row["id"])
-            c.execute(
-                """UPDATE deliveries SET product_id=?,buyer_ref=?,delivery_uri=NULL,
-                          delivery_type='xianyu_virtual_top',resource_json=?,retry_count=0,error_message=NULL,
-                          delivered_at=?,status='VIRTUAL_SHIPPED',updated_at=? WHERE id=?""",
-                (
-                    product_id,
-                    order.get("buyer_nick"),
-                    dumps(resource),
-                    shipped_at,
-                    shipped_at,
-                    delivery_id,
-                ),
-            )
-        else:
-            cur = c.execute(
-                """INSERT INTO deliveries(
-                       product_id,platform,order_ref,buyer_ref,delivery_uri,delivery_type,resource_json,
-                       retry_count,error_message,delivered_at,status,created_at,updated_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    product_id,
-                    "xianyu",
-                    oid,
-                    order.get("buyer_nick"),
-                    None,
-                    "xianyu_virtual_top",
-                    dumps(resource),
-                    0,
-                    None,
-                    shipped_at,
-                    "VIRTUAL_SHIPPED",
-                    shipped_at,
-                    shipped_at,
-                ),
-            )
-            delivery_id = int(cur.lastrowid)
+        c.execute(
+            """UPDATE deliveries SET buyer_ref=?,resource_json=?,error_message=NULL,
+                      delivered_at=?,status='VIRTUAL_SHIPPED',updated_at=? WHERE id=? AND status='RUNNING'""",
+            (order.get("buyer_nick"), dumps(resource), shipped_at, shipped_at, delivery_id),
+        )
 
     return {
         "id": delivery_id,

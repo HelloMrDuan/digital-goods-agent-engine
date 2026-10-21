@@ -37,11 +37,13 @@ class _TopClient:
             return _Response({
                 "alibaba_idle_isv_order_query_response": {
                     "module": {
-                        "biz_order_id": data["biz_order_id"],
+                        "biz_order_id": json.loads(data["param_appraise_isv_order_query"])["biz_order_id"],
                         "order_status": self.order_status,
                         "buyer_nick": "buyer",
                         "payment": 2900,
                         "x_global_biz_code": "virtual",
+                        "item": {"item_id": "99999"},
+                        "encryption_seller_id": "encrypted-seller",
                     }
                 }
             })
@@ -64,6 +66,7 @@ def isolated(tmp_path: Path):
         "xianyu_top_access_token": settings.xianyu_top_access_token,
         "xianyu_top_biz_code": settings.xianyu_top_biz_code,
         "xianyu_top_gateway": settings.xianyu_top_gateway,
+        "xianyu_top_seller_id": settings.xianyu_top_seller_id,
     }
     settings.db_path = str(tmp_path / "xianyu-top.db")
     settings.artifact_dir = str(tmp_path / "generated")
@@ -71,6 +74,7 @@ def isolated(tmp_path: Path):
     settings.xianyu_top_app_secret = "secret"
     settings.xianyu_top_access_token = "access-token"
     settings.xianyu_top_biz_code = "virtual"
+    settings.xianyu_top_seller_id = "encrypted-seller"
     settings.xianyu_top_gateway = "https://gw.api.taobao.com/router/rest"
     init_db()
     yield
@@ -170,7 +174,7 @@ def test_order_query_uses_real_top_method_and_returns_paid_status():
     assert client.calls[0][0] == "https://gw.api.taobao.com/router/rest"
     sent = client.calls[0][1]
     assert sent["method"] == xianyu_top.ORDER_QUERY_METHOD
-    assert sent["biz_order_id"] == "3318740388015865620"
+    assert json.loads(sent["param_appraise_isv_order_query"])["biz_order_id"] == 3318740388015865620
     assert sent["sign_method"] == "md5"
     assert sent["sign"]
 
@@ -178,7 +182,7 @@ def test_order_query_uses_real_top_method_and_returns_paid_status():
 def test_virtual_delivery_refuses_unpaid_order(monkeypatch, tmp_path):
     product_id = _approved_product(tmp_path)
     monkeypatch.setattr(xianyu_top, "require_approved_current_product", lambda pid: {
-        "id": pid, "opportunity_id": 1, "external_listing_id": "99999"
+        "id": pid, "opportunity_id": 1, "external_listing_id": "99999", "published_platform": "xianyu"
     })
     monkeypatch.setattr(xianyu_top, "latest_successful_bundle", lambda pid: {"checksum":"abc"})
     client = _TopClient(order_status=1)
@@ -194,7 +198,7 @@ def test_virtual_delivery_refuses_unpaid_order(monkeypatch, tmp_path):
 def test_paid_order_calls_official_virtual_delivery_and_records_truthful_status(monkeypatch, tmp_path):
     product_id = _approved_product(tmp_path)
     monkeypatch.setattr(xianyu_top, "require_approved_current_product", lambda pid: {
-        "id": pid, "opportunity_id": 1, "external_listing_id": "99999"
+        "id": pid, "opportunity_id": 1, "external_listing_id": "99999", "published_platform": "xianyu"
     })
     monkeypatch.setattr(xianyu_top, "latest_successful_bundle", lambda pid: {"checksum":"abc"})
     client = _TopClient(order_status=2, virtual_success=True)
@@ -207,7 +211,7 @@ def test_paid_order_calls_official_virtual_delivery_and_records_truthful_status(
     methods = [call[1]["method"] for call in client.calls]
     assert methods == [xianyu_top.ORDER_QUERY_METHOD, xianyu_top.VIRTUAL_DELIVERY_METHOD]
     payload = client.calls[1][1]["idle_open_isv_virtual_delivery_param"]
-    assert json.loads(payload)["biz_order_id"] == "123456789"
+    assert json.loads(payload)["biz_order_id"] == 123456789
 
     with conn() as c:
         row = c.execute("SELECT status,delivery_type,resource_json FROM deliveries WHERE order_ref='123456789'").fetchone()
@@ -222,3 +226,88 @@ def test_top_missing_credentials_is_explicit(monkeypatch):
     monkeypatch.setattr(settings, "xianyu_top_access_token", "")
     with pytest.raises(ValueError, match="not configured"):
         xianyu_top.xianyu_order_query("123456789", client=_TopClient())
+
+
+@pytest.mark.parametrize("missing", ["biz_order_id", "item", "encryption_seller_id"])
+def test_delivery_requires_explicit_order_listing_and_seller(monkeypatch, tmp_path, missing):
+    product_id = _approved_product(tmp_path)
+    monkeypatch.setattr(xianyu_top, "require_approved_current_product", lambda pid: {
+        "id":pid,"opportunity_id":1,"external_listing_id":"99999","published_platform":"xianyu"})
+    monkeypatch.setattr(xianyu_top, "latest_successful_bundle", lambda pid: {"checksum":"abc"})
+    class Missing(_TopClient):
+        def post(self, url, **kwargs):
+            result = super().post(url, **kwargs)
+            if kwargs["data"]["method"] == xianyu_top.ORDER_QUERY_METHOD:
+                result.payload["alibaba_idle_isv_order_query_response"]["module"].pop(missing)
+            return result
+    client = Missing()
+    with pytest.raises(ValueError):
+        xianyu_top.xianyu_virtual_delivery(product_id,"123456789",client=client)
+    assert len(client.calls) == 1
+
+
+def test_unknown_shipment_is_not_retried_and_cannot_bind_other_product(monkeypatch, tmp_path):
+    import httpx
+    product_id = _approved_product(tmp_path)
+    monkeypatch.setattr(xianyu_top, "require_approved_current_product", lambda pid: {
+        "id":pid,"opportunity_id":1,"external_listing_id":"99999","published_platform":"xianyu"})
+    monkeypatch.setattr(xianyu_top, "latest_successful_bundle", lambda pid: {"checksum":"abc"})
+    class Timeout(_TopClient):
+        def post(self, url, **kwargs):
+            if kwargs["data"]["method"] == xianyu_top.VIRTUAL_DELIVERY_METHOD:
+                self.calls.append((url,kwargs["data"]))
+                raise httpx.ReadTimeout("remote outcome unknown")
+            return super().post(url, **kwargs)
+    first = Timeout()
+    with pytest.raises(httpx.ReadTimeout):
+        xianyu_top.xianyu_virtual_delivery(product_id,"123456789",client=first)
+    with conn() as c:
+        assert c.execute("SELECT status FROM deliveries").fetchone()["status"] == "UNKNOWN"
+    second = _TopClient()
+    with pytest.raises(ValueError, match="UNKNOWN"):
+        xianyu_top.xianyu_virtual_delivery(product_id,"123456789",client=second)
+    assert [call[1]["method"] for call in second.calls] == [xianyu_top.ORDER_QUERY_METHOD]
+    with pytest.raises(ValueError, match="different product"):
+        xianyu_top.xianyu_virtual_delivery(product_id+1,"123456789",client=_TopClient())
+
+
+def test_successful_delivery_is_idempotent(monkeypatch,tmp_path):
+    product_id = _approved_product(tmp_path)
+    monkeypatch.setattr(xianyu_top, "require_approved_current_product", lambda pid: {
+        "id":pid,"opportunity_id":1,"external_listing_id":"99999","published_platform":"xianyu"})
+    monkeypatch.setattr(xianyu_top, "latest_successful_bundle", lambda pid: {"checksum":"abc"})
+    client = _TopClient()
+    xianyu_top.xianyu_virtual_delivery(product_id,"123456789",client=client)
+    again = xianyu_top.xianyu_virtual_delivery(product_id,"123456789",client=client)
+    assert again["idempotent"] is True
+    assert again["file_transferred"] is False
+    assert len(client.calls) == 2
+
+
+def test_concurrent_virtual_delivery_only_sends_once(monkeypatch,tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    product_id = _approved_product(tmp_path)
+    monkeypatch.setattr(xianyu_top,"require_approved_current_product",lambda pid:{
+        "id":pid,"opportunity_id":1,"external_listing_id":"99999","published_platform":"xianyu"})
+    monkeypatch.setattr(xianyu_top,"latest_successful_bundle",lambda pid:{"checksum":"abc"})
+    entered,release=Event(),Event()
+    class Blocking(_TopClient):
+        def post(self,url,**kwargs):
+            if kwargs["data"]["method"] == xianyu_top.VIRTUAL_DELIVERY_METHOD:
+                entered.set()
+                assert release.wait(10)
+            return super().post(url,**kwargs)
+    client=Blocking()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first=pool.submit(xianyu_top.xianyu_virtual_delivery,product_id,"123456789",client=client)
+        try:
+            assert entered.wait(10)
+            second=_TopClient()
+            with pytest.raises(ValueError,match="RUNNING"):
+                xianyu_top.xianyu_virtual_delivery(product_id,"123456789",client=second)
+            assert len(second.calls) == 1
+        finally:
+            release.set()
+        assert first.result()["status"] == "VIRTUAL_SHIPPED"
+    assert len(client.calls) == 2

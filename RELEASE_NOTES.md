@@ -1,3 +1,12 @@
+# V1.4.1 — DGA-001 closeout hardening (acceptance pending)
+
+- Fix documented Etsy PATCH activation/file-upload and Xianyu TOP query/item/seller contracts; atomically claim remote writes and retain UNKNOWN outcomes.
+- Verify immutable product packages and invalidate approval on bytes, market, policy, license or evidence changes; validate structured deliverables and Windows paths.
+- Preserve paid failed-output usage, outstanding reservations and persistent snapshot deduplication across Agents, product drafts and packages.
+- Protect buyer/order/download reads, redact credential errors and use tracked-only CI source archives.
+- Update native PowerShell acceptance for version/auth/failure states and read-only preflight. Existing frontend layout is retained.
+- Actual on-site findings and remaining platform/file-transfer gates are in docs/development/ACCEPTANCE.md. This release is not a claim of real listing or buyer delivery acceptance.
+
 # V1.2.3 — SourceAsset License Registry
 
 - 新增 SourceAsset Registry：素材来源、URL/本地引用、checksum、所有权类型、许可证名称/URL、商用许可、再分发许可和证据独立入库。

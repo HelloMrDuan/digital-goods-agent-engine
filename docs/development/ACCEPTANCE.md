@@ -15,9 +15,9 @@ node --check web/app.js
 ```
 
 - Original baseline: 206 passed.
-- Final local full regression: **258 passed**, one upstream Starlette/AnyIO deprecation warning; no skipped tests.
+- Final local full regression: **261 passed**, one upstream Starlette/AnyIO deprecation warning; no skipped tests.
 - Compileall, Node frontend syntax and native PowerShell parse: PASS.
-- Focused integrity/product/publish/order/script regression: 64 passed before the last numeric TOP-contract adjustment; the full 258-test run includes that adjustment.
+- Focused integrity/product/publish/order/script regression: 64 passed before the last numeric TOP-contract adjustment; the full 261-test run includes that adjustment.
 - New checks include positive ZIP/XLSX/CSV open/read, workbook formulas, unsafe/duplicate/empty deliverables, tampered/deleted bytes, market/policy/time snapshot changes, paid failed JSON accounting, concurrency/idempotence, exact TOP parameters, unpaid/mismatched orders, unknown remote outcomes, protected reads and a populated V1.1.3.3 schema migrated twice.
 - Tests use isolated fixtures and fake external clients where necessary. In particular `test_real_end_to_end_publish.py` constructs actual local files but MOCKS the LLM and platform clients. Its name does not establish real upstream or buyer delivery success.
 - Core API method/path pairs are checked for duplicate registration. No pytest skip, constant-true assertion or swallowed test exception was found in the test scan.
@@ -87,3 +87,11 @@ A separate single-candidate discovery analysis was explicitly run on actual oppo
 - Actual products=0, publish_runs=0, deliveries=0. No simulated product, approval, order, shipment or buyer transmission was inserted to turn this into a pass.
 
 Sanitized summaries are in this document. Full local reports and the business-data backup remain under ignored `data/dga001-acceptance/`; the native report is `digital-goods-real-rebuild-20261021-181417.json` in the user's temporary directory.
+
+## GitHub review and CI
+
+- Draft PR: https://github.com/HelloMrDuan/digital-goods-agent-engine/pull/3
+- Base: feat/v1.2-opportunity-agent-engine (#2); #1 and #2 remain open. No merge/force push.
+- Initial implementation commit: 4a955322f80fbe9545699fbed551dbce39311686.
+- Initial PR CI run: https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39584268222 — SUCCESS. Job 119169154886 logs verified 258 passed, compile/frontend/tracked-only archive/upload all successful.
+- Final review additionally guards changed prices/approval snapshots, missing historical proof and changed Etsy shop identities from reusing an old successful listing. Three new regression cases raise the final local suite to 261 passed. Updated-head CI is checked separately before handoff.

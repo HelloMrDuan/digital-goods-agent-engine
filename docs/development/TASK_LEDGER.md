@@ -50,4 +50,8 @@ Do not close DGA-001 or start DGA-002 merely because tests pass. Actual buyer fi
 
 ### Review handoff
 
-Status: BLOCKED on positive real BUILD/package/platform acceptance. Final local full suite 258 passed (one upstream deprecation warning), compile/frontend/PowerShell parser passed. PR/CI references are appended after the real remote runs complete.
+Status: BLOCKED on positive real BUILD/package/platform acceptance. Final local full suite 261 passed (one upstream deprecation warning), compile/frontend/PowerShell parser passed. PR/CI references are appended after the real remote runs complete.
+
+- Published initial code commit 4a955322f80fbe9545699fbed551dbce39311686 and created Draft PR #3 against #2: https://github.com/HelloMrDuan/digital-goods-agent-engine/pull/3
+- Initial PR CI 39584268222 / job 119169154886 SUCCESS; inspected raw logs (258 passed and compile/frontend/archive/upload success).
+- Final review adds three cases preventing old listing success from being reused after price/approval/shop changes or without historical proof; final local suite 261 passed. No further live LLM request is needed for these deterministic publication guards.

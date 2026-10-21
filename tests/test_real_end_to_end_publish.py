@@ -488,3 +488,26 @@ def test_gate_policy_change_invalidates_prior_approval(monkeypatch):
     monkeypatch.setattr(settings,"high_risk_threshold",5)
     assert get_gate_b(product_id)["is_current"] is False
     assert evaluate_gate_b(product_id)["decision"] == "BLOCKED"
+
+
+@pytest.mark.parametrize("change", ["price", "shop", "legacy"])
+def test_published_listing_cannot_be_reused_for_changed_approval_or_account(monkeypatch, change):
+    product_id = _ready_product()
+    monkeypatch.setattr(product_builder, "chat_json", lambda **kwargs: _artifact_response())
+    product_builder.build_product_artifact(product_id)
+    approve_product(product_id)
+    client = _FakeEtsyClient()
+    publishing.publish_to_etsy(product_id, client=client)
+    if change == "price":
+        with conn() as c:
+            c.execute("UPDATE products SET price_suggestion=30 WHERE id=?", (product_id,))
+        approve_product(product_id)
+    elif change == "shop":
+        monkeypatch.setattr(settings, "etsy_shop_id", "another-shop")
+    else:
+        with conn() as c:
+            c.execute("UPDATE publish_runs SET response_json='{}'")
+    calls_before = len(client.calls)
+    with pytest.raises(ValueError, match="reconcile"):
+        publishing.publish_to_etsy(product_id, client=client)
+    assert len(client.calls) == calls_before

@@ -185,6 +185,11 @@ def publish_to_etsy(
             raise ValueError("Etsy publish is RUNNING or UNKNOWN; reconcile the remote listing before retrying")
         previous_response = loads(previous["response_json"], {}) if previous else {}
         previous_bundle = (previous_response or {}).get("bundle_checksum")
+        if previous and previous["status"] == "SUCCESS":
+            if not previous_bundle or previous_response.get("approved_gate_snapshot_hash") != product.get("approved_gate_snapshot_hash"):
+                raise ValueError("published approval changed or legacy proof is missing; reconcile the existing listing")
+            if str(previous_response.get("shop_id") or "") != str(settings.etsy_shop_id):
+                raise ValueError("Etsy shop changed; reconcile the listing before publishing under another account")
         if previous_bundle and previous_bundle != bundle["checksum"]:
             raise ValueError("published bundle changed; reconcile the existing listing before publishing a revision")
         if previous and previous["status"] == "SUCCESS" and (previous["stage"] == "ACTIVE" or not activate):
@@ -420,6 +425,10 @@ def publish_to_xianyu(
             raise ValueError("Xianyu publish is RUNNING or UNKNOWN; reconcile the remote listing before retrying")
         previous_response = loads(previous["response_json"], {}) if previous else {}
         previous_bundle = (previous_response or {}).get("bundle_checksum")
+        if previous and previous["status"] == "SUCCESS" and (
+            not previous_bundle or previous_response.get("approved_gate_snapshot_hash") != product.get("approved_gate_snapshot_hash")
+        ):
+            raise ValueError("published approval changed or legacy proof is missing; reconcile the existing listing")
         if previous_bundle and previous_bundle != bundle["checksum"]:
             raise ValueError("published bundle changed; reconcile the existing listing before publishing a revision")
         if previous and previous["status"] == "SUCCESS":

@@ -94,4 +94,10 @@ Sanitized summaries are in this document. Full local reports and the business-da
 - Base: feat/v1.2-opportunity-agent-engine (#2); #1 and #2 remain open. No merge/force push.
 - Initial implementation commit: 4a955322f80fbe9545699fbed551dbce39311686.
 - Initial PR CI run: https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39584268222 — SUCCESS. Job 119169154886 logs verified 258 passed, compile/frontend/tracked-only archive/upload all successful.
-- Final review additionally guards changed prices/approval snapshots, missing historical proof and changed Etsy shop identities from reusing an old successful listing. Three new regression cases raise the final local suite to 261 passed. Updated-head CI is checked separately before handoff.
+- Final review additionally guards changed prices/approval snapshots, missing historical proof and changed Etsy shop identities from reusing an old successful listing. Three new regression cases raise the final local suite to 261 passed. Code-head CI is complete for a6f90bbf03947bf6eb2ccfd4df070a30f9110920 (261 passed in both push and PR runs).
+
+- Validated code commit: a6f90bbf03947bf6eb2ccfd4df070a30f9110920.
+- PR run https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39584598333 — SUCCESS; job 119170268169 logs: 261 passed, compile/frontend/source archive/upload successful.
+- Push run https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39584591237 — SUCCESS; job 119170242840 independently confirms the same 261 tests and checks.
+- All check runs for that code SHA are completed/success. PR #3 has no inline review threads. A final documentation-only commit records this evidence; its fresh CI is also verified before handoff.
+- Owned temporary acceptance servers were stopped. Original business DB counts remain 40/668/97/0 products/0 deliveries/237 ai_runs. No credentials or runtime data are tracked.

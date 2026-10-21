@@ -55,3 +55,9 @@ Status: BLOCKED on positive real BUILD/package/platform acceptance. Final local 
 - Published initial code commit 4a955322f80fbe9545699fbed551dbce39311686 and created Draft PR #3 against #2: https://github.com/HelloMrDuan/digital-goods-agent-engine/pull/3
 - Initial PR CI 39584268222 / job 119169154886 SUCCESS; inspected raw logs (258 passed and compile/frontend/archive/upload success).
 - Final review adds three cases preventing old listing success from being reused after price/approval/shop changes or without historical proof; final local suite 261 passed. No further live LLM request is needed for these deterministic publication guards.
+
+### Remote verification completed
+
+- Code commit a6f90bbf03947bf6eb2ccfd4df070a30f9110920: PR CI 39584598333 and push CI 39584591237 both SUCCESS; each raw job log confirms 261 passed plus compile/frontend/package/upload success. All code-SHA checks successful; PR #3 remains Draft with no inline review threads.
+- Final documentation-only evidence update does not change the validated business code. Temporary owned servers stopped; original runtime data and configuration preserved.
+- DGA-001 remains BLOCKED on actual BUILD/product/platform/buyer-transfer acceptance. Next task DGA-002 stays TODO until DGA-001 is accepted, as required by the task dependency.

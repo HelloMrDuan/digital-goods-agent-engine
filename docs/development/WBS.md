@@ -5,7 +5,7 @@ A task is DONE only after code, commit, PR/CI and its required real acceptance e
 
 | ID | Task | Dependencies | Status | Remaining acceptance |
 | --- | --- | --- | --- | --- |
-| DGA-001 | V1.2.x closeout and real-loop hardening | PR #2 (includes PR #1) | BLOCKED | PR/CI review; real BUILD/package/Gate B and authorized platform/order acceptance |
+| DGA-001 | V1.2.x closeout and real-loop hardening | PR #2 (includes PR #1) | BLOCKED | Code PR/CI verified; real BUILD/package/Gate B and authorized platform/order acceptance pending |
 | DGA-002 | Orders and actual digital file transfer | DGA-001 acceptance | TODO | Durable listing/order/buyer/file receipt model; reconciliation and delivery recovery |
 | DGA-003 | Product usefulness and format quality | DGA-001 acceptance | TODO | Buyer usability evaluation and actual generated products, especially workbook formulas |
 | DGA-004 | Opportunity precision and cost | DGA-001 acceptance | TODO | Evaluate real independent signals, candidate yield and costs over multiple runs |

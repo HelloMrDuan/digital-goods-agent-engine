@@ -130,6 +130,7 @@ All mutations below occurred in `data/dga001-acceptance/quality-verification.db`
 
 - Final Windows full suite: **281 passed**, no skips, one existing upstream deprecation warning. This adds 20 tests to the preceding 261-test release.
 - Python compileall (`app scripts`), Node syntax (`web/app.js`), native PowerShell acceptance-script parser and `git diff --check`: PASS.
-- Remote CI evidence for this follow-up is recorded on PR #3 after the push. DGA-001 remains BLOCKED on the previously documented real BUILD/package/platform/buyer-transfer requirements and unresolved source availability.
-- All check runs for that code SHA are completed/success. PR #3 has no inline review threads. A final documentation-only commit records this evidence; its fresh CI is also verified before handoff.
+- Follow-up code commit `a41e20c08e488249d8ff5e66fe427e01bcd1ae4f`: [PR CI 39708323897](https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39708323897) SUCCESS on 2026-10-22. Raw job 119593473737 logs confirm **281 passed**, compile/frontend/source archive/upload all successful. Final documentation-only HEAD checks are recorded on PR #3 before handoff.
+- The same code commit's [push CI 39708318939](https://github.com/HelloMrDuan/digital-goods-agent-engine/actions/runs/39708318939) also succeeded; both check runs completed/success. Raw push job 119593457381 is independently checked before handoff.
+- DGA-001 remains BLOCKED on the previously documented real BUILD/package/platform/buyer-transfer requirements and unresolved source availability. The prior 261-test release's CI references above are historical; they do not substitute for this follow-up's 281-test CI.
 - Owned temporary acceptance servers were stopped. Original business DB counts remain 40/668/97/0 products/0 deliveries/237 ai_runs. No credentials or runtime data are tracked.

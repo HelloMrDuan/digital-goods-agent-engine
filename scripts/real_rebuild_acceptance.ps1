@@ -1,11 +1,14 @@
 param(
     [string]$BaseUrl = "http://127.0.0.1:8080",
+    [string]$ApiToken = $env:API_AUTH_TOKEN,
+    [string]$ExpectedVersion = "1.4.1-dga001",
     [ValidateRange(1, 20)] [int]$Limit = 8,
     [ValidateRange(1, 8)] [int]$RefreshQueriesPerProbe = 3,
     [ValidateRange(1, 30)] [int]$PollSeconds = 3,
     [ValidateRange(30, 1800)] [int]$TimeoutSeconds = 900,
     [ValidateRange(0, 2147483647)] [int]$InspectTaskId = 0,
-    [switch]$SkipRefresh
+    [switch]$SkipRefresh,
+    [switch]$PreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,12 +17,17 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 Add-Type -AssemblyName System.Net.Http
 $script:HttpClient = New-Object System.Net.Http.HttpClient
+$script:HttpClient.Timeout = [TimeSpan]::FromSeconds(60)
 
 function Invoke-JsonApi {
     param([ValidateSet("GET", "POST")][string]$Method, [string]$Path)
     $uri = "$BaseUrl$Path"
     $httpMethod = if ($Method -eq "POST") { [System.Net.Http.HttpMethod]::Post } else { [System.Net.Http.HttpMethod]::Get }
     $request = New-Object System.Net.Http.HttpRequestMessage($httpMethod, $uri)
+    if (-not [string]::IsNullOrWhiteSpace($ApiToken)) {
+        $request.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", $ApiToken)
+    }
+    $response = $null
     if ($Method -eq "POST") {
         $request.Content = New-Object System.Net.Http.StringContent("", [System.Text.Encoding]::UTF8, "application/json")
     }
@@ -33,6 +41,7 @@ function Invoke-JsonApi {
         if ([string]::IsNullOrWhiteSpace($text)) { return $null }
         return $text | ConvertFrom-Json
     } finally {
+        if ($null -ne $response) { $response.Dispose() }
         $request.Dispose()
     }
 }
@@ -62,16 +71,28 @@ Write-Host "`n[1/6] Service identity + health" -ForegroundColor Yellow
 $openapi = Invoke-JsonApi -Method GET -Path "/openapi.json"
 $health = Invoke-JsonApi -Method GET -Path "/health"
 $health | ConvertTo-Json -Depth 10
-if ($openapi.info.version -ne "1.2.1-opportunity-agent") {
-    throw "Wrong/old service instance on $BaseUrl. Expected OpenAPI version 1.2.1-opportunity-agent, got '$($openapi.info.version)'. Restart uvicorn from the current feat/v1.2-opportunity-agent-engine checkout."
+if ($openapi.info.version -ne $ExpectedVersion -or $health.version -ne $ExpectedVersion) {
+    throw "Wrong/old service instance on $BaseUrl. Expected version $ExpectedVersion, got '$($openapi.info.version)'. Restart uvicorn from the current checkout."
 }
-if (-not $health.llm_configured -or -not $health.qiniu_configured) {
+if (-not $PreflightOnly -and $InspectTaskId -eq 0 -and (-not $health.llm_configured -or -not $health.qiniu_configured)) {
     throw "Qiniu LLM is not configured on the running service."
 }
 
 Write-Host "`n[2/6] Agent-Reach / OpenCLI Doctor" -ForegroundColor Yellow
 $doctor = Invoke-JsonApi -Method GET -Path "/api/agent-reach/doctor"
 $doctor | ConvertTo-Json -Depth 20
+$flowReadiness = Invoke-JsonApi -Method GET -Path "/api/flow/readiness"
+if ($PreflightOnly) {
+    $preflight = [ordered]@{
+        generated_at=(Get-Date).ToString("o"); mode="READ_ONLY_PREFLIGHT"; status="NOT_ACCEPTED"
+        openapi_version=$openapi.info.version; health=$health; doctor=$doctor; readiness=$flowReadiness
+        real_collection_executed=$false; paid_llm_executed=$false; platform_write_executed=$false
+    }
+    $preflightPath = Join-Path $env:TEMP ("digital-goods-preflight-{0}.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
+    $preflight | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $preflightPath -Encoding UTF8
+    Write-Host "REPORT_FILE=$preflightPath"
+    exit 0
+}
 $opencliConnected = $false
 if ($null -ne $doctor.opencli) { $opencliConnected = [bool]$doctor.opencli.connected }
 if (-not $opencliConnected -and $InspectTaskId -eq 0 -and -not $SkipRefresh) {
@@ -157,7 +178,7 @@ foreach ($item in $analysisItems) {
             )
         }
     } catch {
-        Write-Warning "Cannot read agent runs for opportunity ${oid}: $($_.Exception.Message)"
+        throw "Cannot verify agent runs for opportunity ${oid}: $($_.Exception.Message)"
     }
     foreach ($run in $runs) {
         $runRows += [pscustomobject]@{
@@ -174,10 +195,14 @@ foreach ($item in $analysisItems) {
     }
 
     $validation = $null
-    try { $validation = Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/validation" } catch { }
+    try { $validation = Invoke-JsonApi -Method GET -Path "/api/opportunities/$oid/validation" } catch {
+        throw "Cannot verify validation for opportunity ${oid}: $($_.Exception.Message)"
+    }
 
     $card = $null
-    try { $card = Invoke-JsonApi -Method GET -Path "/api/opportunity-cards/by-opportunity/$oid" } catch { }
+    try { $card = Invoke-JsonApi -Method GET -Path "/api/opportunity-cards/by-opportunity/$oid" } catch {
+        if ($item.status -ne "FAILED") { throw "Cannot verify card for opportunity ${oid}: $($_.Exception.Message)" }
+    }
 
     if ($null -ne $card) {
         $cardRows += [pscustomobject]@{
@@ -222,9 +247,9 @@ if ($runRows.Count) {
 Write-Host "`n[6/6] AI cost delta + report" -ForegroundColor Yellow
 $postCost = $null
 try { $postCost = Invoke-JsonApi -Method GET -Path "/api/ai/cost?limit=200" } catch { Write-Warning $_.Exception.Message }
-$before = if ($preCost) { To-Number $preCost.total_cost_cny } else { 0.0 }
-$after = if ($postCost) { To-Number $postCost.total_cost_cny } else { 0.0 }
-$delta = if ($InspectTaskId -gt 0) { 0.0 } else { [math]::Round($after - $before, 6) }
+$before = if ($preCost) { To-Number $preCost.total_cost_cny } else { $null }
+$after = if ($postCost) { To-Number $postCost.total_cost_cny } else { $null }
+$delta = if ($InspectTaskId -gt 0 -or $null -eq $before -or $null -eq $after) { $null } else { [math]::Round($after - $before, 6) }
 Write-Host "ai_cost_before_cny=$before ai_cost_after_cny=$after ai_cost_delta_cny=$delta"
 
 $report = [ordered]@{
@@ -233,8 +258,14 @@ $report = [ordered]@{
     rebuild_summary=$summary; rebuild_failures=$analysisFailures; opportunity_cards=$cardRows
     agent_runs=$runRows; agent_failures=$agentFailures
     ai_cost_before_cny=$before; ai_cost_after_cny=$after; ai_cost_delta_cny=$delta
+    readiness=$flowReadiness; platform_write_executed=$false; real_file_transfer_verified=$false
+    ai_budget_after=if ($postCost) { $postCost.budget } else { $null }
 }
 $reportPath = Join-Path $env:TEMP ("digital-goods-real-rebuild-{0}.json" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 $report | ConvertTo-Json -Depth 30 | Set-Content -Path $reportPath -Encoding UTF8
 Write-Host "REPORT_FILE=$reportPath" -ForegroundColor Green
-if ($task.status -eq "FAILED") { exit 2 }
+if ($task.status -ne "SUCCESS" -or $analysisFailures.Count -gt 0 -or $agentFailures.Count -gt 0 -or $null -eq $postCost) { exit 2 }
+if ($analysisItems.Count -eq 0 -or $runRows.Count -eq 0) {
+    Write-Warning "No current-task Agent execution was verified; full real-loop acceptance remains incomplete."
+    exit 3
+}

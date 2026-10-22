@@ -2,7 +2,9 @@
 
 本地自托管的数字商品需求发现与经营辅助系统。系统坚持 `REAL DATA ONLY`：业务数据只能来自真实采集，失败显示真实原因，AI 不得补造搜索量、销量、用户数或趋势。
 
-## V1.2.3 主流程
+DGA-001 当前关账状态、真实验收结果和阻塞项见 [开发验收记录](docs/development/ACCEPTANCE.md)；任务通过前不会自动进入下一阶段。
+
+## V1.4.1 主流程
 
 1. 通过 OpenCLI/Agent-Reach、RSS、GitHub、Bilibili、YouTube 等来源采集真实内容。
 2. 明确/高概率需求作为确定性 demand；高质量核心来源 discussion 可作为 `context` 进入商机候选，但不会抬高需求数量、趋势分或商业验证分。

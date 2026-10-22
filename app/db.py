@@ -530,6 +530,7 @@ def init_db() -> None:
             "intent_confidence": "REAL NOT NULL DEFAULT 0",
             "intent_weight": "REAL NOT NULL DEFAULT 0",
             "intent_reason_json": "TEXT",
+            "intent_policy_version": "TEXT NOT NULL DEFAULT ''",
         }.items():
             _ensure_column(c, "evidence", name, ddl)
         c.execute("CREATE INDEX IF NOT EXISTS idx_evidence_fingerprint ON evidence(content_fingerprint)")

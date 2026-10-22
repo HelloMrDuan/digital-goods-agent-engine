@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import hashlib
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -131,12 +133,20 @@ def _product(
             ),
         )
     product_id = int(cur.lastrowid)
+    bundle = Path(settings.db_path).parent / f"product-{product_id}.zip"
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.writestr("payroll.csv", "Employee,Hours,Rate\nInput,0,0\n")
+    checksum = hashlib.sha256(bundle.read_bytes()).hexdigest()
+    with conn() as c:
+        c.execute("""INSERT INTO product_builds(product_id,status,bundle_path,checksum,manifest_json,created_at,updated_at)
+                     VALUES(?,'SUCCESS',?,?,?,?,?)""",
+                  (product_id,str(bundle),checksum,dumps({"files":["payroll.csv"]}),now,now))
     if bind_asset:
         asset = create_source_asset(
             {
                 "source_type": "owned" if asset_ownership == "self_owned" else "web",
                 "title": "工资考勤模板源文件",
-                "local_ref": f"owned://product/{product_id}/payroll.xlsx",
+                "local_ref": str(bundle),
                 "ownership_type": asset_ownership,
                 "license_name": "Owner declaration" if asset_ownership == "self_owned" else None,
                 "commercial_use_allowed": commercial_use_allowed,

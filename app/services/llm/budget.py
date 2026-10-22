@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from ...config import settings
 from ...db import conn, now_iso
@@ -31,21 +31,17 @@ def reserve_ai_budget(provider: str, estimated_cost_cny: float) -> int:
         amount = max(0.000001, float(settings.ai_unknown_call_reserve_cny or 0.0))
     budget = max(0.0, float(settings.daily_ai_budget_cny or 0.0))
     today = datetime.now(timezone.utc).date().isoformat()
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(timespec="seconds")
 
     with conn() as c:
         c.execute("BEGIN IMMEDIATE")
         _ensure_schema(c)
-        c.execute("DELETE FROM ai_budget_reservations WHERE created_at<?", (stale_cutoff,))
         spent_row = c.execute(
             "SELECT coalesce(sum(estimated_cost_cny),0) cost FROM ai_runs "
-            "WHERE status='SUCCESS' AND substr(created_at,1,10)=?",
+            "WHERE substr(created_at,1,10)=?",
             (today,),
         ).fetchone()
         reserved_row = c.execute(
-            "SELECT coalesce(sum(reserved_cost_cny),0) cost FROM ai_budget_reservations "
-            "WHERE substr(created_at,1,10)=?",
-            (today,),
+            "SELECT coalesce(sum(reserved_cost_cny),0) cost FROM ai_budget_reservations",
         ).fetchone()
         spent = float(spent_row["cost"] or 0.0)
         reserved = float(reserved_row["cost"] or 0.0)
@@ -79,13 +75,11 @@ def budget_snapshot() -> dict[str, float]:
         _ensure_schema(c)
         spent = c.execute(
             "SELECT coalesce(sum(estimated_cost_cny),0) cost FROM ai_runs "
-            "WHERE status='SUCCESS' AND substr(created_at,1,10)=?",
+            "WHERE substr(created_at,1,10)=?",
             (today,),
         ).fetchone()
         reserved = c.execute(
-            "SELECT coalesce(sum(reserved_cost_cny),0) cost FROM ai_budget_reservations "
-            "WHERE substr(created_at,1,10)=?",
-            (today,),
+            "SELECT coalesce(sum(reserved_cost_cny),0) cost FROM ai_budget_reservations",
         ).fetchone()
     return {
         "spent_cny": float(spent["cost"] or 0.0),

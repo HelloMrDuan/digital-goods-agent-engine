@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import csv
+import ast
 import hashlib
 import json
 import re
 import zipfile
+import uuid
 from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook
 
 from ..config import settings
-from ..db import conn, dumps, loads, now_iso, row_to_dict
+from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
 from .asset_registry import create_source_asset, link_product_asset
 from .llm import chat_json
-from .opportunities import get_evidence_for_opportunity, get_opportunity
+from .opportunities import analysis_is_current, get_evidence_for_opportunity, get_opportunity
 from .product_lifecycle import get_product
+from .validation import require_current_validation
+from .paid_workflows import run_paid_once
 
 
 ARTIFACT_SYSTEM = """你是数字商品交付工程师。根据已经通过真实需求分析的商品草稿，生成真正可交付的原创数字商品内容。
@@ -46,8 +50,16 @@ _FORMAT_EXTENSIONS = {
 
 
 def _safe_relative_path(value: Any) -> Path:
-    raw = str(value or "").replace("\\", "/").strip().lstrip("/")
-    if not raw or raw.startswith(".") or ".." in raw.split("/"):
+    raw = str(value or "").replace("\\", "/")
+    # Enforce Windows-safe paths on every host, including Linux CI.
+    parts = raw.split("/")
+    reserved = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+    if (not raw or raw.startswith((".", "/")) or any(
+        not part or part in {".", ".."} or part.endswith((".", " "))
+        or any(char in part for char in ':<>"|?*')
+        or any(ord(char) < 32 for char in part)
+        or part.split(".")[0].upper() in reserved for part in parts
+    )):
         raise ValueError(f"unsafe artifact path: {value!r}")
     path = Path(raw)
     if len(path.parts) > 5:
@@ -64,6 +76,14 @@ def _write_text_file(root: Path, spec: dict[str, Any]) -> str:
         raise ValueError(f"artifact file is empty: {rel}")
     if len(content) > _MAX_FILE_CHARS:
         raise ValueError(f"artifact file too large: {rel}")
+    if rel.suffix.lower() == ".json":
+        json.loads(content)
+    elif rel.suffix.lower() == ".py":
+        ast.parse(content, filename=str(rel))
+    elif rel.suffix.lower() == ".csv":
+        rows = list(csv.reader(content.splitlines(), strict=True))
+        if len(rows) < 2 or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+            raise ValueError(f"CSV must contain a header and consistent data rows: {rel}")
     target = root / rel
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8", newline="\n")
@@ -81,7 +101,9 @@ def _write_workbook(root: Path, spec: dict[str, Any]) -> str:
     wb = Workbook()
     default = wb.active
     wb.remove(default)
-    for index, sheet in enumerate(sheets[:12]):
+    if len(sheets) > 12:
+        raise ValueError("workbook has too many sheets")
+    for index, sheet in enumerate(sheets):
         if not isinstance(sheet, dict):
             raise ValueError("workbook sheet must be an object")
         name = str(sheet.get("name") or f"Sheet{index + 1}")[:31]
@@ -92,16 +114,22 @@ def _write_workbook(root: Path, spec: dict[str, Any]) -> str:
             raise ValueError(f"workbook sheet missing columns: {name}")
         if not isinstance(rows, list):
             raise ValueError(f"workbook rows must be an array: {name}")
-        columns = [str(v) for v in columns[:_MAX_COLS_PER_SHEET]]
+        if not rows or len(rows) > _MAX_ROWS_PER_SHEET or len(columns) > _MAX_COLS_PER_SHEET:
+            raise ValueError(f"workbook needs substantive rows within size limits: {name}")
+        columns = [str(v) for v in columns]
         ws.append(columns)
         for row in rows[:_MAX_ROWS_PER_SHEET]:
             if isinstance(row, dict):
                 values = [row.get(column) for column in columns]
             elif isinstance(row, list):
-                values = list(row[: len(columns)])
+                if len(row) != len(columns):
+                    raise ValueError(f"workbook row width does not match columns: {name}")
+                values = list(row)
             else:
                 raise ValueError(f"unsupported workbook row in {name}")
             ws.append(values)
+        if not any(cell.value is not None and str(cell.value).strip() for row in ws.iter_rows(min_row=2) for cell in row):
+            raise ValueError(f"workbook has no substantive cells: {name}")
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
 
@@ -131,6 +159,12 @@ def _validate_manifest(value: dict[str, Any], expected_format: str) -> dict[str,
     workbooks = value.get("workbooks") or []
     if not isinstance(workbooks, list):
         raise ValueError("workbooks must be an array")
+    specs = files + workbooks
+    if len(specs) > _MAX_FILES or any(not isinstance(item, dict) for item in specs):
+        raise ValueError("artifact specs must be objects within file limits")
+    paths = [_safe_relative_path(item.get("path")).as_posix().casefold() for item in specs]
+    if len(set(paths)) != len(paths) or "manifest.json" in paths:
+        raise ValueError("duplicate or reserved artifact path")
     if len(files) + len(workbooks) < 2:
         raise ValueError("artifact generator must return README plus at least one primary deliverable")
 
@@ -138,19 +172,20 @@ def _validate_manifest(value: dict[str, Any], expected_format: str) -> dict[str,
     if not allowed:
         raise ValueError(f"unsupported expected artifact format: {expected_format}")
     candidate_paths = names + [str(item.get("path") or "") for item in workbooks if isinstance(item, dict)]
-    if not any(Path(path).suffix.lower() in allowed for path in candidate_paths):
+    if not any(Path(path).suffix.lower() in allowed and Path(path).name.lower() != "readme.md" for path in candidate_paths):
         raise ValueError(f"artifact generator did not produce required {expected_format} deliverable")
     return value
 
 
-def build_product_artifact(product_id: int) -> dict[str, Any]:
+def _build_product_artifact(product_id: int) -> dict[str, Any]:
     product = get_product(product_id)
     if not product:
         raise KeyError("product not found")
     opportunity = get_opportunity(int(product["opportunity_id"]))
     if not opportunity:
         raise KeyError("opportunity not found")
-    if int(opportunity.get("analysis_stale") or 0):
+    validation = require_current_validation(int(product["opportunity_id"]))
+    if not analysis_is_current(opportunity):
         raise ValueError("opportunity analysis is stale; rebuild before producing deliverables")
 
     artifact_format = str(product.get("artifact_format") or "").strip().lower()
@@ -212,14 +247,16 @@ def build_product_artifact(product_id: int) -> dict[str, Any]:
         payload=payload,
         max_new_tokens=max(2200, settings.qiniu_json_retry_max_tokens),
     )
+    if require_current_validation(int(product["opportunity_id"]))["snapshot_hash"] != validation["snapshot_hash"]:
+        raise ValueError("demand evidence changed during artifact generation")
     manifest = _validate_manifest(generated, artifact_format)
 
     base = Path(settings.artifact_dir).expanduser().resolve()
     root = base / f"product_{product_id}"
     root.mkdir(parents=True, exist_ok=True)
     build_stamp = re.sub(r"[^0-9]", "", now_iso())[:14]
-    work = root / f"build_{build_stamp}"
-    work.mkdir(parents=True, exist_ok=True)
+    work = root / f"build_{build_stamp}_{uuid.uuid4().hex}"
+    work.mkdir(parents=True, exist_ok=False)
 
     written: list[str] = []
     for spec in manifest["files"]:
@@ -247,10 +284,13 @@ def build_product_artifact(product_id: int) -> dict[str, Any]:
     }
     manifest_path.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    zip_path = root / f"{product.get('sku') or f'product-{product_id}'}.zip"
+    # Each build remains immutable; rebuilding cannot overwrite an approved package.
+    zip_path = work / f"product-{product_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(work.rglob("*")):
             if path.is_file():
+                if path == zip_path:
+                    continue
                 archive.write(path, path.relative_to(work).as_posix())
     checksum = _sha256(zip_path)
 
@@ -336,4 +376,31 @@ def latest_successful_bundle(product_id: int) -> dict[str, Any]:
     if checksum != item.get("checksum"):
         raise ValueError("generated deliverable package checksum mismatch")
     item["manifest"] = loads(item.pop("manifest_json", None), {}) or {}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if archive.testzip() is not None:
+                raise ValueError("generated deliverable package has corrupt members")
+            files = item["manifest"].get("files") or []
+            if not files or not set(files).issubset(archive.namelist()):
+                raise ValueError("generated deliverable package is missing manifest files")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("generated deliverable package is not a valid ZIP") from exc
     return item
+
+
+def build_product_artifact(product_id: int, *, force: bool = False) -> dict[str, Any]:
+    product = get_product(product_id)
+    if not product:
+        raise KeyError("product not found")
+    opportunity = get_opportunity(int(product["opportunity_id"]))
+    validation = require_current_validation(int(product["opportunity_id"]))
+    if not opportunity or not analysis_is_current(opportunity):
+        raise ValueError("opportunity analysis is stale; rebuild before producing deliverables")
+    fields = {key:product.get(key) for key in ("sku","name","category","audience","title","description","deliverables","faq","compliance_notes","artifact_format")}
+    snapshot = stable_hash("artifact-dga001-v1",dumps(fields),opportunity.get("analysis_json"),validation["snapshot_hash"])
+    result = run_paid_once("product_artifact",product_id,snapshot,lambda:_build_product_artifact(product_id),force=force)
+    if result.get("idempotent"):
+        path=Path(result["bundle_path"])
+        if not path.is_file() or _sha256(path) != result["checksum"]:
+            raise ValueError("cached artifact is missing or changed; inspect the build and explicitly force a rebuild")
+    return result

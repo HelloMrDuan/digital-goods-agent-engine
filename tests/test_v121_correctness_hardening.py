@@ -269,6 +269,7 @@ def test_rebuild_without_ai_still_runs_gate_a(monkeypatch):
     updates: list[dict] = []
 
     monkeypatch.setattr(routes_v12, "run_demand_discovery", lambda **kwargs: {
+        "status": "SUCCESS",
         "retained_recent": 4,
         "direct_demand_signals": 3,
     })
@@ -352,6 +353,7 @@ def test_rebuild_without_ai_refreshes_market_before_clustering(monkeypatch):
     updates: list[dict] = []
 
     monkeypatch.setattr(routes_v12, "run_demand_discovery", lambda **kwargs: {
+        "status": "SUCCESS",
         "retained_recent": 4,
         "direct_demand_signals": 3,
     })

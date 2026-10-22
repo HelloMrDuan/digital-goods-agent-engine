@@ -106,9 +106,9 @@ def _analysis_task_finish(task_id: int, result: dict[str, Any] | None = None, er
             )
 
 
-def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int) -> dict[str, Any]:
+def _run_rebuild_opportunity(opportunity_id: int, analysis_task_id: int, force: bool = False) -> dict[str, Any]:
     try:
-        result = analyze_one(opportunity_id)
+        result = analyze_one(opportunity_id, force=True) if force else analyze_one(opportunity_id)
         _analysis_task_finish(analysis_task_id, result=result)
         return {"opportunity_id": opportunity_id, "status": "SUCCESS", "result": result}
     except Exception as exc:
@@ -373,6 +373,10 @@ def _run_rebuild(
 
         _update_rebuild(task_id, status="RUNNING", progress=20, stage="重建候选", message="正在从最新真实需求与已有市场情报重建并匹配商机候选")
         cluster_result = build_from_unlinked_evidence()
+        refresh_incomplete = bool(
+            (discovery_result and discovery_result.get("status") != "SUCCESS")
+            or int(market_refresh_result.get("failed") or 0) > 0
+        )
 
         _update_rebuild(
             task_id,
@@ -393,7 +397,7 @@ def _run_rebuild(
             }
             _update_rebuild(
                 task_id,
-                status="SUCCESS",
+                status="PARTIAL" if refresh_incomplete else "SUCCESS",
                 progress=100,
                 stage="完成",
                 message=(
@@ -426,7 +430,7 @@ def _run_rebuild(
             analysis_task_ids = {opportunity_id: _analysis_task_start(opportunity_id) for opportunity_id in ids}
             with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="opportunity-agent") as pool:
                 future_map = {
-                    pool.submit(_run_rebuild_opportunity, opportunity_id, analysis_task_ids[opportunity_id]): opportunity_id
+                    pool.submit(_run_rebuild_opportunity, opportunity_id, analysis_task_ids[opportunity_id], reanalyze_current): opportunity_id
                     for opportunity_id in ids
                 }
                 processed = 0
@@ -468,6 +472,8 @@ def _run_rebuild(
             status = "PARTIAL"
         else:
             status = "FAILED"
+        if status == "SUCCESS" and refresh_incomplete:
+            status = "PARTIAL"
         result_by_id = {int(item["opportunity_id"]): item for item in results}
         ordered_results = [result_by_id[opportunity_id] for opportunity_id in ids if opportunity_id in result_by_id]
         payload = {

@@ -5,12 +5,13 @@ import secrets
 from typing import Any
 
 from ..config import settings
-from ..db import conn, dumps, now_iso
-from .opportunities import get_evidence_for_opportunity, get_opportunity
+from ..db import conn, dumps, now_iso, stable_hash
+from .opportunities import analysis_is_current, get_evidence_for_opportunity, get_opportunity
 from .llm import chat_json as provider_chat_json
 from .opportunity_agent import run_opportunity_agent_workflow
 from .sensenova import generate_product
 from .validation import require_current_validation
+from .paid_workflows import run_paid_once
 
 
 def _apply_commercial_decision_guard(opportunity_id: int, result: dict[str, Any]) -> dict[str, Any]:
@@ -57,7 +58,7 @@ def _apply_commercial_decision_guard(opportunity_id: int, result: dict[str, Any]
     return card
 
 
-def analyze_one(opportunity_id: int) -> dict[str, Any]:
+def analyze_one(opportunity_id: int, *, force: bool = False) -> dict[str, Any]:
     """Run the V1.2 evidence-first multi-Agent workflow.
 
     Commercial validation is still calculated and included in the card, but it no longer
@@ -65,7 +66,7 @@ def analyze_one(opportunity_id: int) -> dict[str, Any]:
     candidate and safely return WATCH/DROP instead of silently discarding it before AI.
     Product generation remains protected by the deterministic validation gate below.
     """
-    result = run_opportunity_agent_workflow(opportunity_id)
+    result = run_opportunity_agent_workflow(opportunity_id, force=True) if force else run_opportunity_agent_workflow(opportunity_id)
     card = _apply_commercial_decision_guard(opportunity_id, result)
     risk_score = float(card.get("risk_score") or 0)
     status = "REJECTED_RISK" if risk_score >= settings.high_risk_threshold else "ANALYZED"
@@ -120,14 +121,14 @@ def _validate_product_draft(product: dict[str, Any]) -> dict[str, Any]:
     return product
 
 
-def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
+def _product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
     opp = get_opportunity(opportunity_id)
     if not opp:
         raise KeyError("opportunity not found")
     # Product generation is a consequential action, so it stays behind the deterministic
     # current-snapshot commercial validation gate even though discovery analysis is broader.
     require_current_validation(opportunity_id)
-    if opp.get("overall_score") is None or int(opp.get("analysis_stale") or 0):
+    if not analysis_is_current(opp):
         raise ValueError("opportunity must be analyzed first")
     if int(opp.get("overall_score") or 0) < settings.min_score_for_product:
         raise ValueError(f"overall score below MIN_SCORE_FOR_PRODUCT={settings.min_score_for_product}")
@@ -177,3 +178,14 @@ def product_from_opportunity(opportunity_id: int) -> dict[str, Any]:
         pid = int(cur.lastrowid)
         c.execute("UPDATE opportunities SET status='PRODUCT_DRAFTED',updated_at=? WHERE id=?", (now, opportunity_id))
     return {"product_id": pid, "sku": sku, "draft": product}
+
+
+def product_from_opportunity(opportunity_id: int, *, force: bool = False) -> dict[str, Any]:
+    opportunity=get_opportunity(opportunity_id)
+    if not opportunity:
+        raise KeyError("opportunity not found")
+    validation=require_current_validation(opportunity_id)
+    if not analysis_is_current(opportunity):
+        raise ValueError("opportunity must be analyzed first")
+    snapshot=stable_hash("product-dga001-v1",opportunity.get("analysis_json"),validation["snapshot_hash"])
+    return run_paid_once("product_draft",opportunity_id,snapshot,lambda:_product_from_opportunity(opportunity_id),force=force)

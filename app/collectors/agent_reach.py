@@ -5,15 +5,29 @@ import json
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import yaml
 import httpx
 
 from .base import CollectedItem, CollectorError
 from ..config import settings
+from ..security import redact_error
+
+
+def _url_item_id(platform: str, url: str | None) -> str | None:
+    parts = urlsplit(str(url or ""))
+    if platform == "xiaohongshu" and parts.hostname in {"www.xiaohongshu.com", "xiaohongshu.com"}:
+        match = re.match(r"/(?:explore|search_result)/([A-Za-z0-9]+)", parts.path)
+    elif platform == "reddit" and parts.hostname in {"reddit.com", "www.reddit.com", "old.reddit.com"}:
+        match = re.search(r"/comments/([A-Za-z0-9]+)", parts.path)
+    else:
+        match = None
+    return match.group(1) if match else None
 
 
 def _decode_cli_output(value: bytes | str | None) -> str:
@@ -51,11 +65,22 @@ def _resolve_cli_command(cmd: list[str]) -> list[str]:
         raise CollectorError("empty CLI command")
     resolved = shutil.which(cmd[0])
     if resolved:
-        # Windows npm global commands are exposed as .cmd shims.
-        # subprocess/CreateProcess cannot execute .cmd directly
-        # from an argv list, while PowerShell can.
         if resolved.lower().endswith((".cmd", ".bat")):
-            return ["cmd", "/c", resolved, *cmd[1:]]
+            # cmd /c interprets & in signed URLs as another command. Resolve npm's
+            # Node entry point instead; URLs and queries remain literal argv bytes.
+            shim = Path(resolved)
+            try:
+                source = shim.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise CollectorError("Cannot read Windows CLI shim") from exc
+            match = re.search(r'"%dp0%[\\/]([^"\r\n]+\.(?:mjs|cjs|js))"', source, re.I)
+            if match:
+                entry = (shim.parent / match.group(1).replace("\\", "/")).resolve()
+                local_node = shim.parent / "node.exe"
+                node = str(local_node) if local_node.is_file() else shutil.which("node")
+                if node and entry.is_file() and entry.is_relative_to(shim.parent.resolve()):
+                    return [node, str(entry), *cmd[1:]]
+            raise CollectorError("Cannot resolve Windows CLI shim to a direct Node entry point")
         return [resolved, *cmd[1:]]
     return list(cmd)
 
@@ -328,6 +353,7 @@ def _normalize(platform: str, original: dict[str, Any]) -> CollectedItem | None:
 
     item_id = _first(raw, "id", "item_id", "itemId", "note_id", "noteId", "post_id", "postId", "video_id", "videoId", "aweme_id", "mid", "bvid", "aid")
     url = _first(raw, "url", "link", "web_url", "share_url", "note_url", "permalink", "webpage_url")
+    item_id = item_id or _url_item_id(platform, str(url) if url else None)
     if platform == "xiaohongshu" and not url and item_id:
         token = _first(raw, "xsec_token", "xsecToken")
         url = f"https://www.xiaohongshu.com/explore/{item_id}"
@@ -481,16 +507,25 @@ def _comment_item(platform: str, parent: CollectedItem, raw: dict[str, Any]) -> 
     if not text:
         return None
     # OpenCLI may emit placeholders such as "[+46 more replies]". Keep them out at collector level.
-    if re.fullmatch(r"\s*\[?\+\d+ more repl(?:y|ies)\]?\s*", text, flags=re.I):
+    if re.fullmatch(r"\s*\[?\+\d+ more (?:repl(?:y|ies)|top-level comments)\]?\s*", text, flags=re.I):
         return None
     author = _first(raw, "author", "user", "nickname", "username", "user_name")
     if isinstance(author, dict):
         author = _first(author, "name", "nickname", "username", "user_name")
     raw_id = _first(raw, "id", "comment_id", "commentId", "cid", "rpid")
-    sid = str(raw_id) if raw_id not in (None, "") else _derived_comment_id(platform, parent.source_item_id, str(author) if author else None, text)
+    from ..evidence_identity import account_identity
+    account, _ = account_identity(platform, str(author) if author else None, raw)
+    sid = str(raw_id) if raw_id not in (None, "") else _derived_comment_id(platform, parent.source_item_id, account, text)
     published = _first(raw, "published_at", "created_at", "createdAt", "created_utc", "time", "timestamp")
-    time_quality = "source" if published not in (None, "") else "inherited_thread"
-    if published in (None, ""):
+    time_quality = "source"
+    try:
+        if str(published or "").isdigit():
+            number = float(published)
+            datetime.fromtimestamp(number / 1000 if number > 10_000_000_000 else number, timezone.utc)
+        else:
+            datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+    except (ValueError, TypeError, OverflowError, OSError):
+        time_quality = "inherited_thread"
         published = parent.published_at
     score = _first(raw, "score", "likes", "like_count", "liked_count")
     engagement = {"score": score} if score not in (None, "") else {}
@@ -592,30 +627,74 @@ def _enrich_opencli(platform: str, parents: list[CollectedItem], detail_limit: i
     is already working. Xiaohongshu comments require the full signed search URL; Reddit read uses
     the real post id. Failures on one thread do not fabricate or replace data.
     """
-    if not shutil.which("opencli") or detail_limit <= 0 or comments_limit <= 0:
+    if not shutil.which("opencli") or detail_limit <= 0:
         return []
+    from ..services.intent import classify_intent
     out: list[CollectedItem] = []
-    for parent in parents[:detail_limit]:
+    selected = sorted(parents, key=lambda item: -classify_intent(item.title, item.content).demand_weight)[:detail_limit]
+    for parent in selected:
+        parent.source_item_id = parent.source_item_id or _url_item_id(platform, parent.source_url)
+        metadata: dict[str, Any] = {"observed_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        parent.raw = {**parent.raw, "_enrichment": metadata}
+        timeout = max(10, int(settings.demand_detail_timeout_seconds))
+        raw_comments: list[dict[str, Any]] = []
         try:
             if platform == "xiaohongshu":
-                # Verified OpenCLI contract: comments requires the full signed URL including xsec_token.
                 if not parent.source_url or "xsec_token=" not in parent.source_url:
+                    metadata.update(detail_status="NOT_AVAILABLE", comments_status="NOT_AVAILABLE", error="signed source URL is unavailable")
                     continue
-                body = _run(["opencli", "xiaohongshu", "comments", parent.source_url, "-f", "yaml"], timeout=180)
+                body = _run(["opencli", "xiaohongshu", "note", parent.source_url, "-f", "json"], timeout=timeout)
+                rows = _flatten_candidate_items(body)
+                detail = {str(row["field"]): row.get("value") for row in rows if "field" in row}
+                if "content" not in detail and "desc" not in detail and "description" not in detail:
+                    raise CollectorError("Xiaohongshu note returned no body field")
+                content = _first(detail, "content", "desc", "description")
+                parent.raw["_detail"] = detail
+                if content:
+                    parent.content = str(content)
+                    parent.title = str(detail.get("title") or parent.title)
+                    parent.author = str(detail.get("author") or parent.author or "") or None
+                metadata["detail_status"] = "SUCCESS" if content else "EMPTY"
             elif platform == "reddit":
                 if not parent.source_item_id:
+                    metadata.update(detail_status="NOT_AVAILABLE", comments_status="NOT_AVAILABLE", error="source post ID is unavailable")
                     continue
-                body = _run(["opencli", "reddit", "read", parent.source_item_id, "-f", "yaml"], timeout=180)
+                body = _run(["opencli", "reddit", "read", parent.source_item_id, "--limit", str(max(1, comments_limit)), "--depth", "2", "--max-length", "10000", "-f", "json"], timeout=timeout)
+                rows = _flatten_candidate_items(body)
+                roots = [row for row in rows if str(row.get("type") or "").upper() == "POST"]
+                if len(roots) != 1:
+                    raise CollectorError("Reddit read did not return exactly one POST root")
+                root = roots[0]
+                if parent.author and root.get("author") and parent.author.strip().lower() != str(root["author"]).strip().lower():
+                    raise CollectorError("Reddit read author does not match the source post")
+                parent.raw["_detail"] = root
+                content = _first(root, "selftext", "body")
+                if content is None:
+                    # OpenCLI's POST text is title + blank line + selftext.
+                    # A root containing only a title cannot supply missing body text.
+                    _, separator, body_text = str(root.get("text") or "").partition("\n\n")
+                    content = body_text if separator else None
+                truncated = "[truncated]" in str(content or "")
+                metadata["body_truncated"] = truncated
+                if content and (not truncated or not parent.content or len(str(content)) > len(parent.content)):
+                    parent.content = str(content)
+                metadata["detail_status"] = "SUCCESS" if content else "EMPTY"
+                raw_comments = [row for row in rows if str(row.get("type") or "").upper().startswith("L")]
             else:
                 continue
-            raws = _flatten_candidate_items(body)
+        except Exception as exc:
+            metadata.update(detail_status="FAILED", detail_error=redact_error(exc))
+        if comments_limit <= 0:
+            metadata["comments_status"] = "NOT_REQUESTED"
+            continue
+        try:
+            if platform == "xiaohongshu":
+                body = _run(["opencli", "xiaohongshu", "comments", str(parent.source_url), "--limit", str(min(50, comments_limit)), "--with-replies", "true", "-f", "json"], timeout=timeout)
+                raw_comments = _flatten_candidate_items(body)
+            elif metadata.get("detail_status") == "FAILED":
+                raise CollectorError("comments unavailable because Reddit read failed")
             taken = 0
-            for raw in raws:
-                if not isinstance(raw, dict):
-                    continue
-                # Reddit read returns the root as type=POST followed by L0/L1/... comments.
-                if platform == "reddit" and str(raw.get("type") or "").upper() == "POST":
-                    continue
+            for raw in raw_comments:
                 ci = _comment_item(platform, parent, raw)
                 if ci is None:
                     continue
@@ -624,9 +703,9 @@ def _enrich_opencli(platform: str, parents: list[CollectedItem], detail_limit: i
                 taken += 1
                 if taken >= comments_limit:
                     break
-        except Exception:
-            # Enrichment is best-effort real-data collection. Search evidence remains valid; no mock fallback.
-            continue
+            metadata.update(comments_status="SUCCESS" if taken else "EMPTY", comments_retained=taken)
+        except Exception as exc:
+            metadata.update(comments_status="FAILED", comments_error=redact_error(exc))
     return out
 
 

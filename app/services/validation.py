@@ -5,10 +5,11 @@ from typing import Any
 
 from ..config import settings
 from ..db import conn, dumps, loads, now_iso, row_to_dict, stable_hash
+from ..evidence_identity import evidence_assessment
 from .opportunities import get_opportunity
 
 
-POLICY_VERSION = "commercial-validation-v1-real-demand"
+POLICY_VERSION = "commercial-validation-v2-body-source-accounts"
 
 
 def _parse_datetime(value: Any) -> datetime | None:
@@ -36,7 +37,7 @@ def _validation_rows(opportunity_id: int) -> list[dict[str, Any]]:
         rows = c.execute(
             """SELECT e.id,e.platform,e.author,e.published_at,e.published_time_quality,
                       e.evidence_quality_score,e.content_fingerprint,e.canonical_key,e.raw_hash,
-                      e.intent_class,e.intent_confidence,e.intent_weight,e.content_kind
+                      e.intent_class,e.intent_confidence,e.intent_weight,e.content_kind,e.title,e.content,e.raw_json
                FROM opportunity_evidence oe
                JOIN evidence e ON e.id=oe.evidence_id
                WHERE oe.opportunity_id=? AND oe.relation_type='demand'
@@ -52,6 +53,8 @@ def current_snapshot(opportunity_id: int) -> tuple[str, list[dict[str, Any]]]:
     if not opportunity:
         raise KeyError("opportunity not found")
     rows = _validation_rows(opportunity_id)
+    current_time = datetime.now(timezone.utc)
+    recent_cutoff = current_time - timedelta(days=30)
     evidence_state = [
         (
             row.get("id"),
@@ -59,31 +62,35 @@ def current_snapshot(opportunity_id: int) -> tuple[str, list[dict[str, Any]]]:
             row.get("intent_class"),
             row.get("intent_confidence"),
             row.get("intent_weight"),
+            row.get("author"), row.get("platform"), row.get("published_at"),
+            row.get("published_time_quality"), row.get("evidence_quality_score"),
+            evidence_assessment(row)["body_present"], evidence_assessment(row)["account_key"],
+            bool((published := _parse_datetime(row.get("published_at"))) and recent_cutoff <= published <= current_time),
         )
         for row in rows
     ]
     snapshot_hash = stable_hash(
         POLICY_VERSION,
         opportunity.get("cluster_signature"),
+        opportunity.get("cluster_active"),
+        settings.commercial_validation_min_signals,
+        settings.commercial_validation_min_authors,
+        settings.commercial_validation_min_quality,
+        settings.commercial_validation_min_timestamp_coverage,
+        settings.commercial_validation_min_score,
         dumps(evidence_state),
     )
     return snapshot_hash, rows
 
 
 def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    # The same request text from two independent real authors is two demand signals.
-    # Repeated observations from the same author/content remain one signal.
-    signal_keys = set()
-    for row in rows:
-        fingerprint = str(row.get("content_fingerprint") or row.get("canonical_key") or row.get("id"))
-        author = str(row.get("author") or "").strip().lower()
-        platform = str(row.get("platform") or "").strip().lower()
-        signal_keys.add(f"{platform}:{author}:{fingerprint}" if author else fingerprint)
-    authors = {
-        f"{row.get('platform')}:{str(row.get('author')).strip().lower()}"
-        for row in rows
-        if row.get("author") and str(row.get("author")).strip()
-    }
+    observed = rows
+    assessments = {int(row["id"]): evidence_assessment(row) for row in rows}
+    # Search titles and display names remain leads, but cannot establish independent demand.
+    rows = [row for row in rows if assessments[int(row["id"])]["body_present"]
+            and assessments[int(row["id"])]["stable_source_account"]]
+    authors = {assessments[int(row["id"])]["account_key"] for row in rows}
+    signal_keys = authors
     platforms = {str(row.get("platform")) for row in rows if row.get("platform")}
     explicit_count = sum(row.get("intent_class") == "explicit_demand" for row in rows)
     probable_count = sum(row.get("intent_class") == "probable_demand" for row in rows)
@@ -96,13 +103,14 @@ def _metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         time_quality = row.get("published_time_quality")
         if time_quality == "source":
             timestamp_points += 1.0
-        elif time_quality == "inherited_thread":
-            timestamp_points += 0.4
         published = _parse_datetime(row.get("published_at"))
-        if published and cutoff <= published <= datetime.now(timezone.utc):
+        if time_quality == "source" and published and cutoff <= published <= datetime.now(timezone.utc):
             recent_30d += 1
     return {
         "real_demand_count": len(rows),
+        "observed_demand_count": len(observed),
+        "title_only_or_missing_body_count": sum(not item["body_present"] for item in assessments.values()),
+        "unverified_account_count": sum(not item["stable_source_account"] for item in assessments.values()),
         "effective_signal_count": len(signal_keys),
         "unique_authors": len(authors),
         "platform_count": len(platforms),
@@ -147,7 +155,6 @@ def validate_opportunity(opportunity_id: int) -> dict[str, Any]:
         reason_codes.append("no_explicit_demand")
     if (
         metrics["unique_authors"] < settings.commercial_validation_min_authors
-        and metrics["platform_count"] < 2
     ):
         reason_codes.append("insufficient_author_or_platform_diversity")
     if metrics["average_evidence_quality"] < settings.commercial_validation_min_quality:
@@ -176,7 +183,7 @@ def validate_opportunity(opportunity_id: int) -> dict[str, Any]:
             "min_score": settings.commercial_validation_min_score,
         },
         "created_at": created_at,
-        "data_policy": "deterministic gate over stored real demand evidence; no AI call and no synthetic metrics",
+        "data_policy": "deterministic gate; one signal per source account with body text; source accounts do not prove distinct natural persons or willingness to pay; inherited thread dates cannot prove recent comments",
     }
     with conn() as c:
         c.execute(

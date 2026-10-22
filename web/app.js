@@ -352,7 +352,23 @@ async function approveProduct(id) { await mutate(`/api/products/${id}/approve`, 
 async function buildArtifact(id) { await mutate(`/api/products/${id}/build-artifact`, "真实商品包已生成"); }
 async function publishEtsy(id) { await mutate(`/api/products/${id}/publish/etsy`, "Etsy 商品已发布"); }
 async function publishXianyu(id) { await mutate(`/api/products/${id}/publish/xianyu`, "闲鱼商品已发布"); }
-function downloadArtifact(id) { window.open(`/api/products/${id}/artifact/download`, "_blank"); }
+async function downloadArtifact(id) {
+  try {
+    const response = await fetch(`/api/products/${id}/artifact/download`, {
+      headers: state.apiToken ? { Authorization: `Bearer ${state.apiToken}` } : {},
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || `HTTP ${response.status}`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `product-${id}.zip`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { showToast(error.message, true); }
+}
 
 async function analyzeOpportunity(id) {
   try {

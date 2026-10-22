@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 
 from .collectors import agent_reach_doctor, rsshub_doctor
 from .config import BASE_DIR, settings
+from .version import VERSION
+from .security import redact_error
 from .db import conn, dumps, init_db, loads, now_iso, row_to_dict
 from .models import DeliveryIn, SourceAssetCreate, SourceAssetUpdate, SourceCreate, SourceUpdate
 from .services.analyze import analyze_one, product_from_opportunity
@@ -30,6 +32,7 @@ from .services.market_intel import list_market_intel, market_intel_for_opportuni
 from .services.product_builder import build_product_artifact, latest_successful_bundle, list_product_builds
 from .services.publishing import etsy_status, list_publish_runs, publish_to_etsy, publish_to_xianyu, xianyu_status
 from .services.xianyu_top import xianyu_order_query, xianyu_virtual_delivery
+from .services.llm.budget import budget_snapshot
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -64,6 +67,7 @@ def home():
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
+        "version": VERSION,
         "mode": "REAL_DATA_ONLY",
         "mock_data": False,
         "mock_ai": False,
@@ -187,7 +191,7 @@ def dashboard() -> dict[str, Any]:
             "market_high_sales": c.execute("SELECT COUNT(*) c FROM market_intel_items WHERE sales_verified=1 AND sales_score>=?", (settings.market_intel_high_sales_score,)).fetchone()["c"],
             "market_hot_and_selling": c.execute("SELECT COUNT(*) c FROM market_intel_items WHERE heat_score>=? AND sales_verified=1 AND sales_score>=?", (settings.market_intel_high_heat_score, settings.market_intel_high_sales_score)).fetchone()["c"],
         }
-        spend = c.execute("SELECT coalesce(sum(estimated_cost_cny),0) s FROM ai_runs WHERE status='SUCCESS' AND substr(created_at,1,10)=?", (today,)).fetchone()["s"]
+        spend = c.execute("SELECT coalesce(sum(estimated_cost_cny),0) s FROM ai_runs WHERE substr(created_at,1,10)=?", (today,)).fetchone()["s"]
         top = c.execute("SELECT id,title,category,evidence_count,effective_signal_count,explicit_demand_count,probable_demand_count,comment_demand_count,platform_count,current_7d,previous_7d,growth_7d_pct,acceleration_pct,trend_score,trend_confidence,trusted_trend_score,data_quality_score,validation_status,validation_score,overall_score,suggested_product,status FROM opportunities WHERE cluster_active=1 ORDER BY coalesce(trusted_trend_score,0) DESC,coalesce(trend_score,0) DESC,coalesce(overall_score,-1) DESC LIMIT 8").fetchall()
         source_health = c.execute("SELECT id,name,platform,status,last_item_count,last_success_at,last_error,failure_streak,empty_streak,next_retry_at,avg_duration_ms FROM sources ORDER BY status DESC,id LIMIT 12").fetchall()
         recent_runs = c.execute("SELECT cr.*,s.name source_name,s.platform FROM collection_runs cr JOIN sources s ON s.id=cr.source_id ORDER BY cr.id DESC LIMIT 10").fetchall()
@@ -219,7 +223,7 @@ def _run_analysis_task(task_id: int, opportunity_id: int):
             c.execute("UPDATE analysis_tasks SET status='SUCCESS',progress=100,stage='完成',message='分析完成',result_json=?,updated_at=? WHERE id=?", (dumps(result), now_iso(), task_id))
     except Exception as exc:
         with conn() as c:
-            c.execute("UPDATE analysis_tasks SET status='FAILED',progress=100,message=?,error=?,updated_at=? WHERE id=?", (str(exc), str(exc), now_iso(), task_id))
+            c.execute("UPDATE analysis_tasks SET status='FAILED',progress=100,message=?,error=?,updated_at=? WHERE id=?", (redact_error(exc), redact_error(exc), now_iso(), task_id))
 
 
 @app.post("/api/opportunities/{opportunity_id}/analyze/start")
@@ -292,7 +296,7 @@ def sources_bootstrap():
     try:
         activation = _activate_p0_from_real_login()
     except Exception as exc:
-        activation = {"activated": 0, "eligible": 0, "ready": False, "reason": str(exc)}
+        activation = {"activated": 0, "eligible": 0, "ready": False, "reason": redact_error(exc)}
     result["p0_activation"] = activation
     return result
 
@@ -363,7 +367,7 @@ def sources_create(body: SourceCreate):
         sid = create_source(body.model_dump())
         return {"id": sid}
     except Exception as exc:
-        if "UNIQUE constraint failed" in str(exc):
+        if "UNIQUE constraint failed" in redact_error(exc):
             raise HTTPException(409, "source name already exists")
         raise
 
@@ -408,7 +412,7 @@ def sources_collect(source_id: int, limit: int | None = Query(default=None, ge=1
     except KeyError:
         raise HTTPException(404, "source not found")
     except Exception as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, redact_error(exc))
 
 
 def _collect_source_batch(sources: list[dict[str, Any]], scope: str, force: bool = False) -> dict[str, Any]:
@@ -423,7 +427,7 @@ def _collect_source_batch(sources: list[dict[str, Any]], scope: str, force: bool
         except Exception as exc:
             results.append({
                 "source_id": source["id"], "source_name": source.get("name"), "platform": source.get("platform"),
-                "priority": source.get("priority"), "status": "FAILED", "error": str(exc),
+                "priority": source.get("priority"), "status": "FAILED", "error": redact_error(exc),
             })
     cluster_run = None
     if any(x.get("status") in {"SUCCESS", "EMPTY"} for x in results):
@@ -509,7 +513,7 @@ def market_intel_collect(force: bool = True):
                 "source_name": source.get("name"),
                 "platform": source.get("platform"),
                 "status": "FAILED",
-                "error": str(exc),
+                "error": redact_error(exc),
             })
     return {
         "processed": len(results),
@@ -552,6 +556,7 @@ def scheduler_run_now():
 
 @app.get("/api/evidence")
 def evidence_list(platform: str | None = None, source_id: int | None = None, intent_class: str | None = None, content_kind: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    from .evidence_identity import evidence_assessment
     sql = "SELECT DISTINCT e.* FROM evidence e"
     where = []
     params: list[Any] = []
@@ -588,6 +593,7 @@ def evidence_list(platform: str | None = None, source_id: int | None = None, int
         d = row_to_dict(r) or {}
         d["engagement"] = loads(d.pop("engagement_json", None), {})
         d["intent_reason"] = loads(d.pop("intent_reason_json", None), [])
+        d["content_quality"] = evidence_assessment(d)
         d.pop("raw_json", None)
         d["source_matches"] = by_e.get(int(d["id"]),[])
         out.append(d)
@@ -596,6 +602,7 @@ def evidence_list(platform: str | None = None, source_id: int | None = None, int
 
 @app.get("/api/evidence/{evidence_id}")
 def evidence_detail(evidence_id: int):
+    from .evidence_identity import evidence_assessment
     with conn() as c:
         row = c.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone()
         links = c.execute("""SELECT s.id source_id,s.name source_name,s.platform source_platform,s.query,s.config_json,es.first_seen_at,es.last_seen_at,es.observation_count
@@ -606,6 +613,7 @@ def evidence_detail(evidence_id: int):
     d = row_to_dict(row) or {}
     d["engagement"] = loads(d.pop("engagement_json", None), {})
     d["raw"] = loads(d.pop("raw_json", None), {})
+    d["content_quality"] = evidence_assessment(d)
     d["intent_reason"] = loads(d.pop("intent_reason_json", None), [])
     d["source_matches"] = []
     for r in links:
@@ -633,7 +641,7 @@ def opportunities_list(status: str | None = None, cross_source_only: bool = Fals
         try:
             item["gate_a"] = get_gate_a(int(item["id"]))
         except Exception as exc:
-            item["gate_a"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
+            item["gate_a"] = {"decision": "REVIEW_REQUIRED", "error": redact_error(exc)}
     return rows
 
 
@@ -683,7 +691,7 @@ def opportunity_validation_run(opportunity_id: int):
     except KeyError:
         raise HTTPException(404, "opportunity not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.post("/api/opportunities/batch/validate")
@@ -692,13 +700,13 @@ def opportunities_validate_batch(limit: int = Query(default=100, ge=1, le=500)):
 
 
 @app.post("/api/opportunities/{opportunity_id}/analyze")
-def opportunity_analyze(opportunity_id: int):
+def opportunity_analyze(opportunity_id: int, force: bool = False):
     try:
-        return analyze_one(opportunity_id)
+        return analyze_one(opportunity_id, force=True) if force else analyze_one(opportunity_id)
     except KeyError:
         raise HTTPException(404, "opportunity not found")
     except Exception as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.post("/api/opportunities/batch/analyze-new")
@@ -711,18 +719,18 @@ def opportunities_analyze_new():
         try:
             results.append(analyze_one(oid))
         except Exception as exc:
-            results.append({"id": oid, "error": str(exc)})
+            results.append({"id": oid, "error": redact_error(exc)})
     return {"processed": len(results), "results": results}
 
 
 @app.post("/api/products/from-opportunity/{opportunity_id}")
-def products_generate(opportunity_id: int):
+def products_generate(opportunity_id: int, force: bool = False):
     try:
-        return product_from_opportunity(opportunity_id)
+        return product_from_opportunity(opportunity_id, force=force)
     except KeyError:
         raise HTTPException(404, "opportunity not found")
     except Exception as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.get("/api/source-assets")
@@ -735,7 +743,7 @@ def source_asset_create(body: SourceAssetCreate):
     try:
         return create_source_asset(body.model_dump())
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.get("/api/source-assets/{asset_id}")
@@ -753,7 +761,7 @@ def source_asset_update(asset_id: int, body: SourceAssetUpdate):
     except KeyError:
         raise HTTPException(404, "source asset not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.get("/api/products/{product_id}/assets")
@@ -769,9 +777,9 @@ def product_asset_link(product_id: int, asset_id: int, role: str = Query(default
     try:
         return link_product_asset(product_id, asset_id, role)
     except KeyError as exc:
-        raise HTTPException(404, str(exc))
+        raise HTTPException(404, redact_error(exc))
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.delete("/api/products/{product_id}/assets/{asset_id}")
@@ -802,11 +810,11 @@ def products_list(limit: int = Query(default=100, ge=1, le=500)):
         try:
             product["gate_b"] = get_gate_b(int(row["id"]))
         except Exception as exc:
-            product["gate_b"] = {"decision": "REVIEW_REQUIRED", "is_current": False, "error": str(exc)}
+            product["gate_b"] = {"decision": "REVIEW_REQUIRED", "is_current": False, "error": redact_error(exc)}
         try:
             product["license_readiness"] = product_asset_readiness(int(row["id"]))
         except Exception as exc:
-            product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
+            product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": redact_error(exc)}
         product["builds"] = list_product_builds(int(row["id"]), 1)
         product["publish_runs"] = list_publish_runs(int(row["id"]), 1)
         out.append(product)
@@ -827,22 +835,22 @@ def product_detail(product_id: int):
         product["license_readiness"] = product_asset_readiness(product_id)
     except Exception as exc:
         product["assets"] = []
-        product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": str(exc)}
+        product["license_readiness"] = {"decision": "REVIEW_REQUIRED", "error": redact_error(exc)}
     product["builds"] = list_product_builds(product_id, 20)
     product["publish_runs"] = list_publish_runs(product_id, 20)
     return product
 
 
 @app.post("/api/products/{product_id}/build-artifact")
-def product_build_artifact(product_id: int):
+def product_build_artifact(product_id: int, force: bool = False):
     try:
-        return build_product_artifact(product_id)
+        return build_product_artifact(product_id, force=force)
     except KeyError:
         raise HTTPException(404, "product not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
     except Exception as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, redact_error(exc))
 
 
 @app.get("/api/products/{product_id}/builds")
@@ -857,7 +865,7 @@ def product_artifact_download(product_id: int):
     try:
         build = latest_successful_bundle(product_id)
     except ValueError as exc:
-        raise HTTPException(404, str(exc))
+        raise HTTPException(404, redact_error(exc))
     path = Path(str(build["bundle_path"]))
     return FileResponse(path, media_type="application/zip", filename=path.name)
 
@@ -900,12 +908,12 @@ def product_publish_etsy(
     except KeyError:
         raise HTTPException(404, "product not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        detail = redact_error(exc.response.text[:2000]) if exc.response is not None else redact_error(exc)
         raise HTTPException(502, f"Etsy API error: {detail}")
     except Exception as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, redact_error(exc))
 
 
 @app.post("/api/products/{product_id}/publish/xianyu")
@@ -920,12 +928,12 @@ def product_publish_xianyu(
     except KeyError:
         raise HTTPException(404, "product not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        detail = redact_error(exc.response.text[:2000]) if exc.response is not None else redact_error(exc)
         raise HTTPException(502, f"Xianyu bridge error: {detail}")
     except Exception as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, redact_error(exc))
 
 
 @app.get("/api/xianyu/orders/{biz_order_id}")
@@ -933,12 +941,12 @@ def xianyu_order_get(biz_order_id: str):
     try:
         return xianyu_order_query(biz_order_id)
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        detail = redact_error(exc.response.text[:2000]) if exc.response is not None else redact_error(exc)
         raise HTTPException(502, f"Xianyu TOP error: {detail}")
     except Exception as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, redact_error(exc))
 
 
 @app.post("/api/xianyu/orders/{biz_order_id}/virtual-delivery")
@@ -951,12 +959,12 @@ def xianyu_order_virtual_delivery(
     except KeyError:
         raise HTTPException(404, "product not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:2000] if exc.response is not None else str(exc)
+        detail = redact_error(exc.response.text[:2000]) if exc.response is not None else redact_error(exc)
         raise HTTPException(502, f"Xianyu TOP error: {detail}")
     except Exception as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, redact_error(exc))
 
 
 @app.get("/api/products/{product_id}/gate-b")
@@ -982,15 +990,21 @@ def product_approve(product_id: int):
     except KeyError:
         raise HTTPException(404, "product not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
 
 @app.get("/api/ai/cost")
 def ai_cost(limit: int = Query(default=100, ge=1, le=500)):
     with conn() as c:
         rows = c.execute("SELECT * FROM ai_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        total = c.execute("SELECT coalesce(sum(estimated_cost_cny),0) s FROM ai_runs WHERE status='SUCCESS'").fetchone()["s"]
-    return {"total_cost_cny": round(float(total or 0), 6), "daily_budget_cny": settings.daily_ai_budget_cny, "runs": [row_to_dict(r) for r in rows]}
+        total = c.execute("SELECT coalesce(sum(estimated_cost_cny),0) s FROM ai_runs").fetchone()["s"]
+    return {
+        "total_cost_cny": round(float(total or 0), 6),
+        "daily_budget_cny": settings.daily_ai_budget_cny,
+        "budget": budget_snapshot(),
+        "cost_semantics": "provider usage cost estimates, including failed outputs; unresolved usage remains reserved, not claimed as free",
+        "runs": [row_to_dict(r) for r in rows],
+    }
 
 
 @app.get("/api/deliveries")
@@ -1005,15 +1019,19 @@ def delivery_create(body: DeliveryIn):
     except KeyError:
         raise HTTPException(404, "product not found")
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, redact_error(exc))
 
     now = now_iso()
     resource = dict(body.resource or {})
     if body.delivery_uri and "uri" not in resource:
         resource["uri"] = body.delivery_uri
-    delivered = bool(body.delivery_uri or resource) and body.delivery_type != "manual_review"
-    status = "DELIVERED" if delivered else "PENDING"
-    delivered_at = now if delivered else None
+    # Registering a resource/link proves neither payment nor transfer to a buyer.
+    # Official marketplace fulfillment must use its verified order workflow.
+    if body.platform.strip().lower() in {"xianyu", "etsy"}:
+        raise HTTPException(400, "marketplace delivery requires a verified platform order workflow")
+    resource["file_transferred"] = False
+    status = "PENDING"
+    delivered_at = None
     with conn() as c:
         try:
             cur = c.execute(
@@ -1026,7 +1044,7 @@ def delivery_create(body: DeliveryIn):
                 ),
             )
         except Exception as exc:
-            if "UNIQUE constraint failed" in str(exc):
+            if "UNIQUE constraint failed" in redact_error(exc):
                 raise HTTPException(409, "order already exists")
             raise
     return {
